@@ -99,4 +99,4 @@ async def clerk_auth_middleware(request: Request, call_next):
 
 
 # Mount your Sphinx docs as static files at "/"
-app.mount("/", StaticFiles(directory="docs", html=True), name="docs")
+app.mount("/", StaticFiles(directory="main", html=True), name="main")
