@@ -1,5 +1,8 @@
-fastapi
+fastapi[standard]==0.115.8 # Includes, e.g., python-multipart
 uvicorn
+jinja2
+aiofiles
 python-decouple
-clerk_backend_api
-httpx
+clerk-backend-api==1.8.0
+httpx==0.28.1
+starlette==0.45.3

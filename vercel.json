@@ -1,14 +1,14 @@
 {
   "builds": [
       {
-          "src": "HW5/main.py",
+          "src": "main.py",
           "use": "@vercel/python"
       }
   ],
   "routes": [
       {
           "src": "/(.*)",
-          "dest": "HW5/main.py"
+          "dest": "main.py"
       }
   ]
 }  
