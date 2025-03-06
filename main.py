@@ -29,7 +29,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.middleware("http")
 async def clerk_auth_middleware(request: Request, call_next):
     # Allow preflight OPTIONS
@@ -46,8 +45,8 @@ async def clerk_auth_middleware(request: Request, call_next):
 
     # Convert FastAPI request -> httpx.Request
     client_request = httpx.Request(
-        method=request.method, 
-        url=str(request.url), 
+        method=request.method,
+        url=str(request.url),
         headers=dict(request.headers)
     )
 
@@ -80,21 +79,9 @@ async def clerk_auth_middleware(request: Request, call_next):
     if not auth_state.is_signed_in:
         return RedirectResponse(url="/login.html")
 
-    # Fetch user info from Clerk
-    user_id = auth_state.payload.get("sub")
-    user = clerk.users.get(user_id=user_id)
-
-    # ---------------------------------------------------------------------
-    #   ALLOWED EMAIL CHECK
-    # ---------------------------------------------------------------------
-    if not (hasattr(user, "email_address") and user.email_address.endswith("@uchicago.edu")):
-        return RedirectResponse(url="/login.html")
-    # ---------------------------------------------------------------------
-
     # If everything is okay, proceed
     response = await call_next(request)
     return response
-
 
 # Mount your Sphinx docs as static files at "/"
 app.mount("/", StaticFiles(directory="./main", html=True), name="main")
