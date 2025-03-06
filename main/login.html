@@ -68,20 +68,24 @@ Clerk Publishable Key and Frontend API URL -->
 
     if (Clerk.user) {
       // Extract the email address from Clerk.user.
-      const email = (Clerk.user.emailAddresses && Clerk.user.emailAddresses[0] && Clerk.user.emailAddresses[0].emailAddress) || "Unknown Email";
+      const email = (Clerk.user.emailAddresses &&
+                    Clerk.user.emailAddresses[0] &&
+                    Clerk.user.emailAddresses[0].emailAddress) || "Unknown Email";
       
-      if (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true) {
+      // Check if the email is from @uchicago.edu or if the public metadata already flags them as a customer.
+      if ((email.endsWith("@uchicago.edu")) ||
+          (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
         statusMessage = `Logged in as ${email}: Authorized`;
-        button = `<br><a class="view-content-button" href="index.html">View Content</a>`
+        button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
       } else {
         statusMessage = `Logged in as ${email}: Not authorized`;
-        button = ``
+        button = ``;
       }
       content = `<div id="user-button"></div>`;
     } else {
       statusMessage = "Not logged in";
       content = `<div id="sign-in"></div>`;
-      button = ``
+      button = ``;
     }
 
     // Render the UI along with our status message and add a red "View Content" button linking to "index.html"
