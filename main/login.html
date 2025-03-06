@@ -76,7 +76,8 @@
         if (email.toLowerCase().endsWith("@uchicago.edu") ||
             (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
           statusMessage = `Logged in as ${email}: Authorized`;
-          button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
+          // Updated the link to point to '/' so that index.html is loaded as the default document.
+          button = `<br><a class="view-content-button" href="/">View Content</a>`;
         } else {
           statusMessage = `Logged in as ${email}: Not authorized`;
           button = ``;
@@ -88,7 +89,7 @@
         button = ``;
       }
 
-      // Render the UI along with our status message and add a red "View Content" button linking to "index.html"
+      // Render the UI along with our status message and add the "View Content" button.
       document.getElementById('app').innerHTML = `<p>${statusMessage}</p>` + content + button;
 
       if (Clerk.user) {
