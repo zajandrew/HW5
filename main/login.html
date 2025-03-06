@@ -74,7 +74,7 @@ Clerk Publishable Key and Frontend API URL -->
       
       // Check if the email is from @uchicago.edu or if the public metadata already flags them as a customer.
       if ((email.endsWith("@uchicago.edu")) ||
-          (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
+          (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === false)) {
         statusMessage = `Logged in as ${email}: Authorized`;
         button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
       } else {
