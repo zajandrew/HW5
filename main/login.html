@@ -1,103 +1,102 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Login Page</title>
-  <style>
-    /* Reset and center the content vertically and horizontally */
-    html, body {
-      height: 100%;
-      margin: 0;
-      padding: 0;
-    }
-    .login-container {
-      width: 100%;
-      text-align: center;
-      margin-top: 20px;
-      padding: 20px;
-    }
-    /* Position the user button in the top-right corner */
-    #user-button {
-      position: fixed;
-      top: 10px;
-      right: 10px;
-      z-index: 9999;
-      padding: 20px;
-    }
-    /* Style for the "View Content" button */
-    .view-content-button {
-      display: inline-block;
-      background-color: #e63946; /* Modern red color */
-      color: #ffffff;
-      padding: 10px 20px;
-      font-size: 16px;
-      border-radius: 4px;
-      text-decoration: none;
-      margin-top: 10px;
-    }
-    /* Ensure the sign-in div is horizontally centered */
-    #sign-in {
-      margin: 0 auto;
-      display: block;
-      width: fit-content;
-    }
-  </style>
+    <title>Login Page</title>
+    <style>
+        /* Reset and center the content vertically and horizontally */
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        .login-container {
+            width: 100%;
+            text-align: center;
+            margin-top: 20px;
+            padding: 20px;
+          }
+          /* Position the user button in the top-right corner */
+          #user-button {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            z-index: 9999;
+            padding: 20px;
+        }
+        /* Style for the "View Content" button */
+        .view-content-button {
+            display: inline-block;
+            background-color: #e63946; /* Modern red color */
+            color: #ffffff;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 4px;
+            text-decoration: none;
+            margin-top: 10px;
+        }
+        /* Ensure the sign-in div is horizontally centered */
+        #sign-in {
+            margin: 0 auto;
+            display: block;
+            width: fit-content;
+        }
+    </style>
 </head>
 <body>
-  <div class="login-container">
-    <h1>Please login</h1>
-    <p>You are viewing the login.html file. Once you have logged in, you may visit the content <a href="/">here</a>.</p>
-    <div id="app"></div>
-  </div>
+    <div class="login-container">
+        <h1>Please login</h1>
+        <p>You are viewing the login.html file. Once you have logged in, you may visit the content <a href="/">here</a>.</p>
+        <div id="app"></div>
+      </div>
 
-  <!-- Initialize Clerk with your Clerk Publishable Key and Frontend API URL -->
-  <script
-    async
-    crossorigin="anonymous"
-    data-clerk-publishable-key="pk_test_ZWFnZXItZmF3bi01LmNsZXJrLmFjY291bnRzLmRldiQ"
-    src="https://eager-fawn-5.clerk.accounts.dev/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
-    type="text/javascript"
-  ></script>
+<!-- Initialize Clerk with your
+Clerk Publishable Key and Frontend API URL -->
+<script
+  async
+  crossorigin="anonymous"
+  data-clerk-publishable-key="pk_test_ZWFnZXItZmF3bi01LmNsZXJrLmFjY291bnRzLmRldiQ"
+  src="https://eager-fawn-5.clerk.accounts.dev/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
+  type="text/javascript"
+></script>
 
-  <script>
-    window.addEventListener('load', async function () {
-      await Clerk.load();
+<script>
+  window.addEventListener('load', async function () {
+    await Clerk.load()
 
-      let content = "";
-      let statusMessage = "";
-      let button = "";
+    let content = "";
+    let statusMessage = "";
 
-      if (Clerk.user) {
-        // Extract the email address from Clerk.user.
-        const email = (Clerk.user.emailAddresses &&
-                       Clerk.user.emailAddresses[0] &&
-                       Clerk.user.emailAddresses[0].emailAddress) || "Unknown Email";
-        
-        // Check if the email is from @uchicago.edu (case-insensitive) or if the public metadata flags them as a customer.
-        if (email.toLowerCase().endsWith("@uchicago.edu") ||
-            (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
-          statusMessage = `Logged in as ${email}: Authorized`;
-          // Updated the link to point to '/' so that index.html is loaded as the default document.
-          button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
-        } else {
-          statusMessage = `Logged in as ${email}: Not authorized`;
-          button = ``;
-        }
-        content = `<div id="user-button"></div>`;
+    if (Clerk.user) {
+      // Extract the email address from Clerk.user.
+      const email = (Clerk.user.emailAddresses &&
+                    Clerk.user.emailAddresses[0] &&
+                    Clerk.user.emailAddresses[0].emailAddress) || "Unknown Email";
+      
+      // Check if the email is from @uchicago.edu or if the public metadata already flags them as a customer.
+      if ((email.endsWith("@uchicago.edu")) ||
+          (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === false)) {
+        statusMessage = Logged in as ${email}: Authorized;
+        button = <br><a class="view-content-button" href="index.html">View Content</a>;
       } else {
-        statusMessage = "Not logged in";
-        content = `<div id="sign-in"></div>`;
-        button = ``;
+        statusMessage = Logged in as ${email}: Not authorized;
+        button = `;
       }
+      content = <div id="user-button"></div>;
+    } else {
+      statusMessage = "Not logged in";
+      content = <div id="sign-in"></div>;
+      button = `;
+    }
 
-      // Render the UI along with our status message and add the "View Content" button.
-      document.getElementById('app').innerHTML = `<p>${statusMessage}</p>` + content + button;
+    // Render the UI along with our status message and add a red "View Content" button linking to "index.html"
+    document.getElementById('app').innerHTML = <p>${statusMessage}</p> + content + button;
 
-      if (Clerk.user) {
-        Clerk.mountUserButton(document.getElementById('user-button'));
-      } else {
-        Clerk.mountSignIn(document.getElementById('sign-in'));
-      }
-    });
-  </script>
+    if (Clerk.user) {
+      Clerk.mountUserButton(document.getElementById('user-button'))
+    } else {
+      Clerk.mountSignIn(document.getElementById('sign-in'))
+    }
+  })
+</script>
 </body>
 </html>
