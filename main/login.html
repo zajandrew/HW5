@@ -77,7 +77,7 @@
             (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
           statusMessage = `Logged in as ${email}: Authorized`;
           // Updated the link to point to '/' so that index.html is loaded as the default document.
-          button = `<br><a class="view-content-button" href="/">View Content</a>`;
+          button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
         } else {
           statusMessage = `Logged in as ${email}: Not authorized`;
           button = ``;
