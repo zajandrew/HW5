@@ -76,7 +76,7 @@ Clerk Publishable Key and Frontend API URL -->
         if (email.toLowerCase().endsWith("@uchicago.edu") ||
             (Clerk.user.publicMetadata && Clerk.user.publicMetadata.isCustomer === true)) {
           statusMessage = `Logged in as ${email}: Authorized`;
-          button = `<br><a class="view-content-button" href="index.html">View Content</a>`;
+          button = `<br><a class="view-content-button" href="index_auth.html">View Content</a>`;
         } else {
           statusMessage = `Logged in as ${email}: Not authorized`;
           button = ``;
