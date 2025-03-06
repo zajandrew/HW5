@@ -87,9 +87,7 @@ async def clerk_auth_middleware(request: Request, call_next):
     # ---------------------------------------------------------------------
     #   ALLOWED EMAIL CHECK
     # ---------------------------------------------------------------------
-    allowed_emails = ["classmate@example.com"]
-    # If user.email_address does not exist or is not in the allowed list => redirect
-    if not hasattr(user, "email_address") or user.email_address not in allowed_emails:
+    if not (hasattr(user, "email_address") and user.email_address.endswith("@uchicago.edu")):
         return RedirectResponse(url="/login.html")
     # ---------------------------------------------------------------------
 
