@@ -1,28 +1,19 @@
 from zoneinfo import ZoneInfo
 
-PATH_DATA = x
-PATH_ENH  = x
-PATH_MOD  = x
-PATH_OUT  = x
+# ========= Session =========
+TRADING_HOURS = ("10:00", "22:10")  # slice intraday when building features (UTC-naive index)
+CHI = ZoneInfo("America/Chicago")
 
-TRADING_HOURS = ("10:00", "22:10")
-DECISION_FREQ = 'D'   # 'D' or 'H'
-
-# === Add sub-2Y short end if you have these mids in your parquet ===
-# If your files only have 1Y/2Y+, keep those. Add/remove as your columns allow.
+# ========= Instruments (explicit) =========
+# Provide your exact mapping (instrument root WITHOUT "_mid" -> tenor years).
 TENOR_YEARS = {
-    "USOSFR0.5Y BGN Curncy": 0.5,   # e.g., 6M OIS mid column name example
-    "USOSFR0.75Y BGN Curncy": 0.75, # 9M (if present)
+    # Example — replace with your real set (incl. sub-2y if you want them):
     "USOSFR1 BGN Curncy": 1.0,
-    "USOSFR1.5 BGN Curncy": 1.5,    # 18M (if present)
     "USOSFR2 BGN Curncy": 2.0,
     "USOSFR3 BGN Curncy": 3.0,
     "USOSFR4 BGN Curncy": 4.0,
     "USOSFR5 BGN Curncy": 5.0,
-    "USOSFR6 BGN Curncy": 6.0,
     "USOSFR7 BGN Curncy": 7.0,
-    "USOSFR8 BGN Curncy": 8.0,
-    "USOSFR9 BGN Curncy": 9.0,
     "USOSFR10 BGN Curncy": 10.0,
     "USOSFR12 BGN Curncy": 12.0,
     "USOSFR15 BGN Curncy": 15.0,
@@ -30,55 +21,60 @@ TENOR_YEARS = {
     "USOSFR25 BGN Curncy": 25.0,
     "USOSFR30 BGN Curncy": 30.0,
     "USOSFR40 BGN Curncy": 40.0,
+    # Include short end if present, e.g.:
+    # "USOSFR0.5Y BGN Curncy": 0.5,
+    # "USOSFR1.5 BGN Curncy": 1.5,
 }
-MID_COLS = [f"{bbg}_mid" for bbg in TENOR_YEARS.keys()]
 
-# Buckets (now include sub-2Y)
+# ========= Feature (builder) settings =========
+# PCA trained off rolling DAILY CLOSE panel; applied intraday (per day).
+PCA_LOOKBACK_DAYS = 126
+PCA_COMPONENTS    = 3
+
+# Intraday EWMA for residual std (per day, resets daily)
+EWMA_LAMBDA       = 0.97
+SIGMA_FLOOR       = 1e-4      # in % units (~0.01bp) to avoid huge z at open
+WARMUP_MIN_OBS    = 5         # ignore first N ticks per tenor for z (NaN z during warmup)
+
+# ========= Backtest decision layer =========
+DECISION_FREQ = 'D'           # 'D' (daily) or 'H' (hourly) — used ONLY by the backtest
+
+# Cheap–rich thresholds (restored)
+Z_ENTRY = 1.25                # enter when cheap-rich z-spread >= Z_ENTRY
+Z_EXIT  = 0.35                # take profit when |z-spread| <= Z_EXIT
+Z_STOP  = 2.00                # stop if divergence since entry >= Z_STOP
+MAX_HOLD_DAYS = 10            # max holding period for a pair
+
+# ========= Risk & selection (unchanged from upgraded backtest) =========
+# Buckets across the curve. Adjust if you add sub-2y.
 BUCKETS = {
-    "short":  (0.4, 1.9),  # 6M–<2Y (adjust to actual)
+    "short":  (0.4, 1.9),     # 6M–<2Y
     "front":  (2.0, 3.0),
     "belly":  (3.1, 9.0),
     "long":   (10.0, 40.0),
 }
-MIN_SEP_YEARS = 1.0  # allow closer pairs if they’re in different buckets
+MIN_SEP_YEARS = 1.0           # min tenor separation between pair legs
 
-# PCA & z-thresholds
-PCA_LOOKBACK_DAYS = 126
-PCA_COMPONENTS = 3
-Z_ENTRY = 1.25
-Z_EXIT  = 0.35
-Z_STOP  = 2.0
-MAX_HOLD_DAYS = 10
+MAX_CONCURRENT_PAIRS = 3      # max pairs open at any decision time
+PER_BUCKET_DV01_CAP  = 1.0    # proxy units per bucket
+TOTAL_DV01_CAP       = 3.0    # proxy units total across curve
+FRONT_END_DV01_CAP   = 1.0    # aggregate cap for 'short' bucket
 
-# ===== New: multi-pair + caps + gating =====
-MAX_CONCURRENT_PAIRS = 3                 # allow several pairs at once
-PER_BUCKET_DV01_CAP  = 1.0               # proxy units
-TOTAL_DV01_CAP       = 3.0               # proxy units
-FRONT_END_DV01_CAP   = 1.0               # cap agg DV01 in 'short' bucket
-
-FLY_GATE_ENABLE      = True
-FLY_DEFS = [          # choose flies we check for alignment (use what exists in data)
-    (1.0, 3.0, 5.0),  # 1s3s5s
-    (2.0, 5.0, 10.0)  # 2s5s10s (classic)
-]
-FLY_Z_MIN            = 0.3    # require fly z magnitude to not contradict leg’s z
-FLY_ALIGN_MODE       = "loose"  # "loose" (only reject if opposite sign) or "strict" (must agree)
-
-# De-risk short end around events (optional soft gate)
-SHORT_END_EXTRA_Z    = 0.3     # add to Z_ENTRY if either leg is in 'short' bucket
-
-CHI = ZoneInfo("America/Chicago")
-
-
-
-
-import os, sys, json, numpy as np, pandas as pd
+# Fly-alignment gating (kept; no calendar). Turn off if you prefer.
+FLY_GATE_ENABLE = True
+FLY_DEFS        = [(1.0, 3.0, 5.0), (2.0, 5.0, 10.0)]
+FLY_Z_MIN       = 0.3
+FLY_ALIGN_MODE  = "loose"     # "loose" (reject opposite sign) | "strict" (must agree)
+SHORT_END_EXTRA_Z = 0.3       # extra Z_ENTRY if a leg is in 'short' bucket
+        
+import os, sys, re, json, numpy as np, pandas as pd
 from pathlib import Path
 from scipy.interpolate import CubicSpline
 
 from cr_config import (
-    PATH_DATA, PATH_ENH, PATH_MOD, MID_COLS, TENOR_YEARS, TRADING_HOURS,
-    PCA_LOOKBACK_DAYS, PCA_COMPONENTS
+    PATH_DATA, PATH_ENH, PATH_MOD, TRADING_HOURS,
+    TENOR_YEARS, PCA_LOOKBACK_DAYS, PCA_COMPONENTS,
+    EWMA_LAMBDA, SIGMA_FLOOR, WARMUP_MIN_OBS
 )
 
 os.makedirs(PATH_ENH, exist_ok=True)
@@ -86,242 +82,295 @@ os.makedirs(PATH_MOD, exist_ok=True)
 
 DAILY_LEVELS_PATH = Path(PATH_MOD) / "daily_levels.parquet"
 
-def _ensure_datetime_index(df):
+# -----------------------
+# Utilities & guards
+# -----------------------
+MID_SUFFIX = "_mid"
+RE_USOSFR  = re.compile(r"USOSFR(\d+(\.\d+)?)[A-Z]*\sBGN\sCurncy", re.IGNORECASE)
+# Accepts e.g. "USOSFR5 BGN Curncy", "USOSFR1.5 BGN Curncy", "USOSFR10Y BGN Curncy"
+
+def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=False, errors="coerce")
-    # enforce UTC-naive to match your current infra
     if df.index.tz is not None:
         df.index = df.index.tz_convert("UTC").tz_localize(None)
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df
+    return df[~df.index.duplicated(keep="last")].sort_index()
 
-def _load_month_parquet(yymm: str) -> pd.DataFrame:
+def _detect_mid_cols(df: pd.DataFrame) -> list[str]:
+    # prefer explicit TENOR_YEARS keys; else pick *_mid columns
+    explicit = [f"{k}{MID_SUFFIX}" for k in TENOR_YEARS.keys() if f"{k}{MID_SUFFIX}" in df.columns]
+    if explicit:
+        return explicit
+    return [c for c in df.columns if c.endswith(MID_SUFFIX)]
+
+def _instrument_root(col: str) -> str:
+    return col[:-len(MID_SUFFIX)] if col.endswith(MID_SUFFIX) else col
+
+def _tenor_from_name(name: str) -> float | None:
+    # Prefer explicit map
+    if name in TENOR_YEARS:
+        return float(TENOR_YEARS[name])
+    # Regex fallback for USOSFR...
+    m = RE_USOSFR.match(name)
+    if m:
+        return float(m.group(1))
+    return None
+
+def _load_month(yymm: str) -> pd.DataFrame:
     p = Path(PATH_DATA) / f"{yymm}_features.parquet"
     if not p.exists():
         raise FileNotFoundError(f"Missing {p}")
-    df = pd.read_parquet(p, columns=[c for c in MID_COLS if c])
-    df = _ensure_datetime_index(df)
+    df = pd.read_parquet(p)
+    df = _ensure_dt_index(df)
     if TRADING_HOURS:
         df = df.between_time(*TRADING_HOURS)
     return df
 
 def _wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
-    # columns: "<BBG>_mid"
+    cols = _detect_mid_cols(df_wide)
     rows = []
-    for col in df_wide.columns:
-        if not col.endswith("_mid"):
+    for col in cols:
+        root = _instrument_root(col)
+        tenor = _tenor_from_name(root)
+        if tenor is None:
+            continue  # skip unknown instruments safely
+        tmp = df_wide[[col]].rename(columns={col: "rate"}).dropna(subset=["rate"])
+        if tmp.empty:
             continue
-        bbg = col[:-4]
-        if bbg not in TENOR_YEARS:
-            continue
-        t = TENOR_YEARS[bbg]
-        tmp = df_wide[[col]].rename(columns={col: "rate"})
-        tmp["tenor_yrs"] = t
+        tmp["tenor_yrs"] = tenor
         rows.append(tmp)
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["ts","tenor_yrs","rate"])
     out = pd.concat(rows, axis=0)
     out = out.reset_index().rename(columns={"index": "ts"})
-    return out[["ts","tenor_yrs","rate"]]
+    # ensure numeric tenor, sort
+    out["tenor_yrs"] = out["tenor_yrs"].astype(float)
+    return out[["ts","tenor_yrs","rate"]].sort_values(["ts","tenor_yrs"])
 
-def _fit_spline_snapshot(df_t: pd.DataFrame) -> CubicSpline:
-    x = df_t["tenor_yrs"].values
-    y = df_t["rate"].values
-    idx = np.argsort(x)
-    return CubicSpline(x[idx], y[idx], bc_type="natural")
-
-def _apply_spline(df_snap):
-    cs = _fit_spline_snapshot(df_snap)
-    m = cs(df_snap["tenor_yrs"].values)
-    eps = df_snap["rate"].values - m
-    return m, eps
-
-def _ewma_std(x: np.ndarray, lam=0.97):
-    v = 0.0; out=[]
-    for xi in x:
-        v = lam*v + (1-lam)*xi*xi
-        out.append(np.sqrt(max(v,1e-12)))
-    return np.array(out)
-
-def _update_daily_panel(daily_panel: pd.DataFrame, new_daily: pd.DataFrame) -> pd.DataFrame:
-    # daily_panel: index=date, columns=str(tenor_yrs), values=rate (close)
-    if daily_panel is None or daily_panel.empty:
-        return new_daily
-    out = pd.concat([daily_panel, new_daily], axis=0)
-    out = out[~out.index.duplicated(keep="last")].sort_index()
+def _ewma_std(x: np.ndarray, lam=0.97) -> np.ndarray:
+    v = 0.0; out = np.empty_like(x, dtype=float)
+    for i, xi in enumerate(x):
+        v = lam * v + (1 - lam) * xi * xi
+        out[i] = np.sqrt(max(v, 1e-12))
     return out
 
-def _save_daily_panel(panel: pd.DataFrame):
-    panel.to_parquet(DAILY_LEVELS_PATH)
+def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
+    # df_snap: rows at a single timestamp across tenors; contains ts/tenor_yrs/rate
+    sub = df_snap.dropna(subset=["rate"]).copy()
+    out = df_snap.copy()
+    out["model_spline"] = np.nan
+    out["eps_spline"]   = np.nan
+    if sub.shape[0] < 2:
+        return out  # cannot fit
+    x = sub["tenor_yrs"].values
+    y = sub["rate"].values
+    idx = np.argsort(x)
+    if sub.shape[0] == 2:
+        # linear fallback
+        x0, x1 = x[idx][0], x[idx][1]
+        y0, y1 = y[idx][0], y[idx][1]
+        m = y0 + (y1 - y0) * (sub["tenor_yrs"].values - x0) / (x1 - x0)
+    else:
+        try:
+            cs = CubicSpline(x[idx], y[idx], bc_type="natural")
+            m = cs(sub["tenor_yrs"].values)
+        except Exception:
+            # fallback to linear fit across sorted points
+            x_sorted, y_sorted = x[idx], y[idx]
+            coef = np.polyfit(x_sorted, y_sorted, 1)
+            m = np.polyval(coef, sub["tenor_yrs"].values)
+    eps = sub["rate"].values - m
+    # merge back by index alignment
+    out.loc[sub.index, "model_spline"] = m
+    out.loc[sub.index, "eps_spline"]   = eps
+    return out
 
 def _load_daily_panel() -> pd.DataFrame:
     if DAILY_LEVELS_PATH.exists():
         return pd.read_parquet(DAILY_LEVELS_PATH)
     return pd.DataFrame()
 
-def _train_pca(dfx_levels: pd.DataFrame, asof_date: pd.Timestamp, lookback_days=126, K=3):
-    # dfx_levels: index=date, columns=str(tenor_yrs), % levels
+def _save_daily_panel(panel: pd.DataFrame):
+    panel.to_parquet(DAILY_LEVELS_PATH)
+
+def _train_pca_daily(dfx_levels: pd.DataFrame, asof_date: pd.Timestamp,
+                     lookback_days=126, K=3) -> dict | None:
+    # dfx_levels: index=date, columns=str(tenor), values=levels in %
     hist = dfx_levels[dfx_levels.index < asof_date].iloc[-lookback_days:]
-    if hist.shape[0] < lookback_days//2:
-        return None  # not enough history
+    if hist.shape[0] < max(20, lookback_days // 4):
+        return None
     dX = hist.diff().dropna()
+    if dX.shape[0] < 5:
+        return None
     C = np.cov(dX.values.T)
     eigvals, eigvecs = np.linalg.eigh(C)
     order = np.argsort(eigvals)[::-1]
     V = eigvecs[:, order[:K]]
     mu = hist.mean().values
     cols = list(hist.columns)
-    model = {"mu": mu, "V": V, "cols": cols}
-    return model
+    return {"mu": mu, "V": V, "cols": cols}
 
-def _write_pca_model(date_key: str, model: dict):
-    path = Path(PATH_MOD) / f"pca_{date_key}.npz"
-    np.savez_compressed(path, mu=model["mu"], V=model["V"], cols=np.array(model["cols"], dtype="U"))
+def _pca_write(date_key: str, model: dict):
+    npz = Path(PATH_MOD) / f"pca_{date_key}.npz"
+    np.savez_compressed(npz, mu=model["mu"], V=model["V"], cols=np.array(model["cols"], dtype="U"))
 
-def _read_pca_model(date_key: str):
-    path = Path(PATH_MOD) / f"pca_{date_key}.npz"
-    if not path.exists():
+def _pca_read(date_key: str) -> dict | None:
+    npz = Path(PATH_MOD) / f"pca_{date_key}.npz"
+    if not npz.exists():
         return None
-    z = np.load(path, allow_pickle=False)
+    z = np.load(npz, allow_pickle=False)
     return {"mu": z["mu"], "V": z["V"], "cols": list(z["cols"])}
 
-def _pca_fair_value(levels_row: pd.Series, model: dict) -> pd.Series:
+def _pca_fair_row(levels_row: pd.Series, model: dict) -> pd.Series:
+    # levels_row: index=str(tenor), one row (levels in %)
     x = levels_row.reindex(model["cols"]).values
-    mu = model["mu"]; V = model["V"]
+    mu, V = model["mu"], model["V"]
     coeffs = (x - mu) @ V
-    x_hat = mu + coeffs @ V.T
-    return pd.Series(x_hat, index=model["cols"])
+    xhat = mu + coeffs @ V.T
+    return pd.Series(xhat, index=model["cols"])
 
-def build_month(yymm: str, combine=True, lam=0.97, w=0.5):
+# -----------------------
+# Main builder
+# -----------------------
+def build_month_guarded(yymm: str, lam=EWMA_LAMBDA, w=0.5,
+                        pca_presence_frac=0.6) -> None:
     """
-    combine=True -> write enhanced monthly parquet with z_spline, z_pca, z_comb per tick.
-    We freeze a PCA model per decision day (daily close), apply across that day's ticks.
+    Writes PATH_ENH/<yymm>_enh.parquet with guarded spline & PCA z's per tick.
+    PCA model: one per decision day, applied to all ticks that day.
     """
-    df_wide = _load_month_parquet(yymm)
+    df_wide = _load_month(yymm)
     if df_wide.empty:
-        print(f"[{yymm}] empty month slice")
+        print(f"[{yymm}] empty month after trading hours slice.")
         return
 
-    # Long panel per tick
     df_long = _wide_to_long(df_wide)
     if df_long.empty:
-        print(f"[{yymm}] no OIS mid cols available")
+        print(f"[{yymm}] no recognizable *_mid columns / tenor map.")
         return
 
-    # Build daily close levels (for PCA)
-    # pivot per day close
+    # Build / update daily close panel (levels, %)
     df_long["date"] = pd.to_datetime(df_long["ts"]).dt.floor("D")
     daily_close = (
         df_long.sort_values("ts")
                .groupby(["date","tenor_yrs"])
                .tail(1)
                .pivot(index="date", columns="tenor_yrs", values="rate")
-               .rename_axis(None, axis=1)
     )
-    daily_close.columns = [f"{c:.1f}" for c in daily_close.columns]
+    daily_close.columns = [f"{c:.3f}" for c in daily_close.columns]  # stable str columns
 
-    # Load and update persistent daily panel
     panel = _load_daily_panel()
-    panel = _update_daily_panel(panel, daily_close)
+    panel = pd.concat([panel, daily_close], axis=0) if not panel.empty else daily_close.copy()
+    panel = panel[~panel.index.duplicated(keep="last")].sort_index()
     _save_daily_panel(panel)
 
-    # Precompute rolling EWMA std of spline and (later) pca residuals within the month
-    # We'll build outputs day by day to bind the correct frozen PCA.
-    out_rows = []
-
-    # Prebuild list of decision dates in this month
+    out_days = []
     dates = sorted(daily_close.index.unique())
 
     for d in dates:
         date_key = pd.Timestamp(d).strftime("%Y-%m-%d")
-        # try loading PCA; if missing, (re)train
-        pca_model = _read_pca_model(date_key)
+        # PCA: read or train
+        pca_model = _pca_read(date_key)
         if pca_model is None:
-            pca_model = _train_pca(panel, asof_date=pd.Timestamp(d))
+            pca_model = _train_pca_daily(panel, asof_date=pd.Timestamp(d),
+                                         lookback_days=PCA_LOOKBACK_DAYS, K=PCA_COMPONENTS)
             if pca_model is not None:
-                _write_pca_model(date_key, pca_model)
+                _pca_write(date_key, pca_model)
 
-        # subset all ticks of this date
         day_slice = df_long[df_long["date"] == d].copy()
         if day_slice.empty:
             continue
 
-        # ----- Spline residuals per tick (cross-sectional) -----
-        # do it snapshot-by-snapshot
-        def _one(ts, sub):
-            m, e = _apply_spline(sub)
-            sub = sub.copy()
-            sub["model_spline"] = m
-            sub["eps_spline"] = e
-            return sub
+        # ---------- Spline per timestamp with guards ----------
+        frames = []
+        for ts, snap in day_slice.groupby("ts", sort=True):
+            frames.append(_spline_fit_safe(snap))
+        day_splined = pd.concat(frames, axis=0).sort_values(["ts","tenor_yrs"])
 
-        day_splits = [g for _, g in day_slice.groupby("ts")]
-        day_splined = pd.concat([_one(None, g) for g in day_splits], axis=0)
-
-        # EWMA std for spline residuals per tenor (within month to keep memory bounded)
-        day_splined = day_splined.sort_values("ts")
+        # EWMA per-tenor for eps_spline (intraday only), sigma floor + warmup
         day_splined["eps_spline_ewstd"] = (
-            day_splined.groupby("tenor_yrs")["eps_spline"]
-            .apply(lambda s: pd.Series(_ewma_std(s.values, lam=lam), index=s.index))
-            .values
+            day_splined.groupby("tenor_yrs", group_keys=False)["eps_spline"]
+                       .apply(lambda s: pd.Series(_ewma_std(s.fillna(0.0).values, lam=lam), index=s.index))
         )
-        day_splined["z_spline"] = day_splined["eps_spline"] / day_splined["eps_spline_ewstd"].replace(0.0, np.nan)
+        day_splined["eps_spline_ewstd"] = day_splined["eps_spline_ewstd"].clip(lower=SIGMA_FLOOR)
 
-        # ----- PCA fair value (frozen per day) -----
+        def _z_with_warmup(g: pd.DataFrame, col_eps: str, col_std: str) -> pd.Series:
+            idx = np.arange(len(g))
+            z = g[col_eps] / g[col_std]
+            z[idx < WARMUP_MIN_OBS] = np.nan
+            return z
+
+        day_splined["z_spline"] = (
+            day_splined.groupby("tenor_yrs", group_keys=False)
+                       .apply(lambda g: _z_with_warmup(g, "eps_spline", "eps_spline_ewstd"))
+        )
+
+        # ---------- PCA residuals (if available) with presence guard ----------
         if pca_model is not None:
-            # build level vector per tick snapshot, project, residual
-            def _pca_apply_block(df_block):
-                # df_block: one timestamp across tenors
+            def _pca_apply_block(df_block: pd.DataFrame) -> pd.DataFrame:
                 lv = df_block.pivot(index=None, columns="tenor_yrs", values="rate")
-                lv.columns = [f"{c:.1f}" for c in lv.columns]
+                lv.columns = [f"{c:.3f}" for c in lv.columns]
+                present = lv.columns.intersection(pca_model["cols"])
+                if len(present) / max(1, len(pca_model["cols"])) < pca_presence_frac:
+                    out = df_block.copy()
+                    out["model_pca"] = np.nan
+                    out["eps_pca"]   = np.nan
+                    return out
                 lv_row = lv.iloc[0]
-                xhat = _pca_fair_value(lv_row, pca_model)  # index=model['cols']
-                # map back to rows
-                df_block = df_block.copy()
-                df_block["model_pca"] = df_block["tenor_yrs"].apply(lambda t: xhat.get(f"{t:.1f}", np.nan))
-                df_block["eps_pca"] = df_block["rate"] - df_block["model_pca"]
-                return df_block
+                xhat = _pca_fair_row(lv_row, pca_model)
+                out = df_block.copy()
+                out["model_pca"] = out["tenor_yrs"].apply(lambda t: xhat.get(f"{t:.3f}", np.nan))
+                out["eps_pca"]   = out["rate"] - out["model_pca"]
+                return out
 
-            day_pca = pd.concat([_pca_apply_block(g) for _, g in day_splined.groupby("ts")], axis=0)
-            # EWMA std for pca residuals
-            day_pca = day_pca.sort_values("ts")
+            blocks = []
+            for ts, snap in day_splined.groupby("ts", sort=True):
+                blocks.append(_pca_apply_block(snap))
+            day_pca = pd.concat(blocks, axis=0).sort_values(["ts","tenor_yrs"])
+
             day_pca["eps_pca_ewstd"] = (
-                day_pca.groupby("tenor_yrs")["eps_pca"]
-                .apply(lambda s: pd.Series(_ewma_std(s.values, lam=lam), index=s.index))
-                .values
+                day_pca.groupby("tenor_yrs", group_keys=False)["eps_pca"]
+                       .apply(lambda s: pd.Series(_ewma_std(s.fillna(0.0).values, lam=lam), index=s.index))
             )
-            day_pca["z_pca"] = day_pca["eps_pca"] / day_pca["eps_pca_ewstd"].replace(0.0, np.nan)
+            day_pca["eps_pca_ewstd"] = day_pca["eps_pca_ewstd"].clip(lower=SIGMA_FLOOR)
+            day_pca["z_pca"] = (
+                day_pca.groupby("tenor_yrs", group_keys=False)
+                       .apply(lambda g: _z_with_warmup(g, "eps_pca", "eps_pca_ewstd"))
+            )
         else:
             day_pca = day_splined.copy()
             day_pca["model_pca"] = np.nan
-            day_pca["eps_pca"] = np.nan
+            day_pca["eps_pca"]   = np.nan
             day_pca["eps_pca_ewstd"] = np.nan
-            day_pca["z_pca"] = np.nan
+            day_pca["z_pca"]     = np.nan
 
-        # combine
+        # ---------- blend & collect ----------
         day_pca["z_comb"] = 0.5 * day_pca["z_spline"].astype(float) + 0.5 * day_pca["z_pca"].astype(float)
-        out_rows.append(day_pca)
+        out_days.append(day_pca)
 
-    enh = pd.concat(out_rows, axis=0) if out_rows else pd.DataFrame()
+    enh = pd.concat(out_days, axis=0) if out_days else pd.DataFrame()
     if enh.empty:
-        print(f"[{yymm}] no enhanced rows produced (insufficient PCA history?)")
+        print(f"[{yymm}] produced no enhanced rows (insufficient PCA history or empty).")
         return
 
-    enh = enh[["ts","tenor_yrs","rate",
-               "model_spline","eps_spline","z_spline",
-               "model_pca","eps_pca","z_pca","z_comb"]].sort_values(["ts","tenor_yrs"])
-
+    enh = enh.sort_values(["ts","tenor_yrs"])[[
+        "ts","tenor_yrs","rate",
+        "model_spline","eps_spline","eps_spline_ewstd","z_spline",
+        "model_pca","eps_pca","eps_pca_ewstd","z_pca",
+        "z_comb"
+    ]]
     out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
     enh.to_parquet(out_path)
     print(f"[{yymm}] wrote enhanced -> {out_path}")
 
+# -----------------------
+# CLI
+# -----------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python build_features_ois.py 2501 [2502 2503 ...]")
+        print("Usage: python build_features_ois_guarded.py 2501 [2502 2503 ...]")
         sys.exit(1)
     for yymm in sys.argv[1:]:
-        build_month(yymm)
-        
+        build_month_guarded(yymm)
         
 import os, sys, numpy as np, pandas as pd
 from pathlib import Path
