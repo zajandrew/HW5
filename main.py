@@ -1,3 +1,125 @@
+
+def _process_one_day(day_df: pd.DataFrame, pca_model: dict | None,
+                     lam: float, pca_presence_frac: float) -> pd.DataFrame:
+    """
+    day_df: long frame for ONE date with columns ['ts','tenor_yrs','rate', ...]
+    returns: enhanced day frame with spline/pca/z columns for that date
+
+    Notes:
+      - Robust per-tick spline via _spline_fit_safe
+      - EWMA std via numba (_ewma_std_nb)
+      - PCA residuals without pivot(); handles duplicate tenors and partial coverage
+      - RangeIndex used throughout to avoid label-alignment issues
+      - Prints per-day progress and elapsed time
+    """
+    import time
+    day_key = pd.to_datetime(day_df["ts"].iloc[0]).floor("D")
+    n_ts    = int(day_df["ts"].nunique())
+    n_tenor = int(day_df["tenor_yrs"].nunique())
+    print(f"[DAY  ] {day_key.date()} | ticks: {n_ts:,} | tenors: {n_tenor} | PCA:{'yes' if pca_model else 'no'} ...", flush=True)
+    t0 = time.perf_counter()
+
+    # ---------- A) Spline per timestamp ----------
+    frames = []
+    for _, snap in day_df.groupby("ts", sort=True):
+        frames.append(_spline_fit_safe(snap))
+
+    day_splined = (
+        pd.concat(frames, axis=0, ignore_index=True)
+          .sort_values(["ts","tenor_yrs"])
+          .reset_index(drop=True)
+    )
+
+    # EWMA per-tenor (Numba) + warmup-aware z
+    day_splined["eps_spline_ewstd"] = (
+        day_splined.groupby("tenor_yrs")["eps_spline"]
+                   .transform(lambda s: _ewma_std_nb(s.fillna(0.0).to_numpy(), lam))
+    ).clip(lower=SIGMA_FLOOR)
+
+    cnt = day_splined.groupby("tenor_yrs").cumcount().to_numpy()
+    z = (day_splined["eps_spline"].to_numpy() /
+         day_splined["eps_spline_ewstd"].to_numpy())
+    z[cnt < WARMUP_MIN_OBS] = np.nan
+    day_splined["z_spline"] = z
+
+    # ---------- B) PCA residuals per timestamp (if model available) ----------
+    if pca_model is not None:
+        # PCA model expects tenor keys like "0.500", "2.000", ...
+        def _k(t) -> str:
+            return f"{float(t):.3f}"
+
+        def _pca_apply_block(df_block: pd.DataFrame) -> pd.DataFrame:
+            # One timestamp slice: columns ['ts','tenor_yrs','rate',...]
+            # 1) collapse duplicate tenors (keep last), build a 1-row levels vector
+            dfb = (df_block[["tenor_yrs","rate"]]
+                   .dropna()
+                   .sort_values("tenor_yrs")
+                   .drop_duplicates("tenor_yrs", keep="last"))
+            out = df_block.copy()
+
+            if dfb.empty or not pca_model.get("cols"):
+                out["model_pca"] = np.nan
+                out["eps_pca"]   = np.nan
+                return out
+
+            s = pd.Series(dfb["rate"].to_numpy(),
+                          index=[_k(t) for t in dfb["tenor_yrs"].to_numpy()])
+
+            model_cols = pca_model["cols"]
+            present = [c for c in s.index if c in model_cols]
+            coverage = len(present) / float(len(model_cols))
+            if coverage < pca_presence_frac:
+                # not enough instruments available to apply the model robustly
+                out["model_pca"] = np.nan
+                out["eps_pca"]   = np.nan
+                return out
+
+            # 2) Build a complete levels row on model grid:
+            #    start from mu (ensures no NaNs) and overwrite with observed levels
+            base = pd.Series(pca_model["mu"], index=model_cols)
+            base.update(s)  # overwrite only where observed
+
+            # 3) Fair reconstruction on model grid, then map back to each row’s tenor
+            xhat = _pca_fair_row(base, pca_model)  # Series indexed by model_cols
+
+            out["model_pca"] = out["tenor_yrs"].apply(lambda t: xhat.get(_k(t), np.nan))
+            out["eps_pca"]   = out["rate"] - out["model_pca"]
+            return out
+
+        blocks = []
+        for _, snap in day_splined.groupby("ts", sort=True):
+            blocks.append(_pca_apply_block(snap))
+
+        day_pca = (
+            pd.concat(blocks, axis=0, ignore_index=True)
+              .sort_values(["ts","tenor_yrs"])
+              .reset_index(drop=True)
+        )
+
+        day_pca["eps_pca_ewstd"] = (
+            day_pca.groupby("tenor_yrs")["eps_pca"]
+                   .transform(lambda s: _ewma_std_nb(s.fillna(0.0).to_numpy(), lam))
+        ).clip(lower=SIGMA_FLOOR)
+
+        cnt_p = day_pca.groupby("tenor_yrs").cumcount().to_numpy()
+        z_p = (day_pca["eps_pca"].to_numpy() /
+               day_pca["eps_pca_ewstd"].to_numpy())
+        z_p[cnt_p < WARMUP_MIN_OBS] = np.nan
+        day_pca["z_pca"] = z_p
+    else:
+        day_pca = day_splined.copy()
+        day_pca["model_pca"] = np.nan
+        day_pca["eps_pca"]   = np.nan
+        day_pca["eps_pca_ewstd"] = np.nan
+        day_pca["z_pca"]     = np.nan
+
+    # Blended z
+    day_pca["z_comb"] = 0.5 * day_pca["z_spline"].astype(float) + 0.5 * day_pca["z_pca"].astype(float)
+
+    dt = time.perf_counter() - t0
+    print(f"[DONE ] {day_key.date()} | rows: {day_pca.shape[0]:,} | {dt:0.2f}s", flush=True)
+    return day_pca
+
 # feature_creation.py
 # Guarded, parallelized feature builder with Numba EWMA
 # - Handles 0.0 → NaN
