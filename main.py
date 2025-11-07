@@ -1,5 +1,67 @@
 def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
     """
+    df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate.
+    Robust to:
+      - duplicate timestamp index labels
+      - duplicate tenors at the same timestamp
+      - only 2 unique tenors (linear fallback)
+      - identical 2x tenor (flat fallback)
+    Uses positional assignment only (no label alignment).
+    """
+    # Work on a copy with a fresh integer index to avoid any label alignment entirely
+    out = df_snap.reset_index(drop=True).copy()
+    out["model_spline"] = np.nan
+    out["eps_spline"]   = np.nan
+
+    # Subset with valid rates
+    sub = out.dropna(subset=["rate"]).copy()
+    if sub.shape[0] < 2:
+        return out  # not enough points to fit
+
+    # Aggregate duplicates by tenor before fitting
+    sub_uni = (
+        sub.groupby("tenor_yrs", as_index=False, sort=True)["rate"]
+           .mean()
+           .sort_values("tenor_yrs")
+           .reset_index(drop=True)
+    )
+    x = sub_uni["tenor_yrs"].to_numpy()
+    y = sub_uni["rate"].to_numpy()
+    if x.size < 2:
+        return out
+
+    # Build evaluator
+    if x.size == 2:
+        if np.isclose(x[1] - x[0], 0.0):
+            ybar = float(np.mean(y))
+            def f_eval(z): 
+                z = np.asarray(z, float); return np.full_like(z, ybar)
+        else:
+            m = (y[1] - y[0]) / (x[1] - x[0]); b = y[0] - m * x[0]
+            def f_eval(z): 
+                z = np.asarray(z, float); return m * z + b
+    else:
+        try:
+            cs = CubicSpline(x, y, bc_type="natural")
+            def f_eval(z): return cs(np.asarray(z, float))
+        except Exception:
+            coef = np.polyfit(x, y, 1)
+            def f_eval(z): 
+                z = np.asarray(z, float); return np.polyval(coef, z)
+
+    # Evaluate at each original row’s tenor (positional)
+    tenors_all = sub["tenor_yrs"].to_numpy()
+    m_vals  = f_eval(tenors_all)
+    eps_vals = sub["rate"].to_numpy() - m_vals
+
+    # Pure positional assignment via iloc (no alignment, no reindexing)
+    pos = sub.index.to_numpy()                      # integer positions inside 'out'
+    out.iloc[pos, out.columns.get_loc("model_spline")] = m_vals
+    out.iloc[pos, out.columns.get_loc("eps_spline")]   = eps_vals
+    return out
+
+def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
+    """
     df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate
     Handles duplicate tenors safely and writes spline results
     using pure positional (iloc) assignment to avoid alignment errors.
