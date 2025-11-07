@@ -13,6 +13,68 @@ def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
         return out  # cannot fit anything
 
     # ---- deduplicate by tenor (aggregate mean rate) ----
+    sub_uni = (
+        sub.groupby("tenor_yrs", as_index=False, sort=True)["rate"]
+           .mean()
+           .sort_values("tenor_yrs")
+           .reset_index(drop=True)
+    )
+    x = sub_uni["tenor_yrs"].to_numpy()
+    y = sub_uni["rate"].to_numpy()
+
+    if x.size < 2:
+        return out  # still not enough unique points
+
+    # ---- fit curve on unique points ----
+    if x.size == 2:
+        # linear fallback; guard for identical x’s
+        if np.isclose(x[1] - x[0], 0.0):
+            ybar = float(np.mean(y))
+            def f_eval(z): 
+                z = np.asarray(z, dtype=float)
+                return np.full_like(z, ybar)
+        else:
+            m = (y[1] - y[0]) / (x[1] - x[0])
+            b = y[0] - m * x[0]
+            def f_eval(z):
+                z = np.asarray(z, dtype=float)
+                return m * z + b
+    else:
+        try:
+            cs = CubicSpline(x, y, bc_type="natural")
+            def f_eval(z):
+                return cs(np.asarray(z, dtype=float))
+        except Exception:
+            coef = np.polyfit(x, y, 1)
+            def f_eval(z):
+                z = np.asarray(z, dtype=float)
+                return np.polyval(coef, z)
+
+    # ---- evaluate at every original row’s tenor and assign (ndarray RHS!) ----
+    tenors_all = sub["tenor_yrs"].to_numpy()
+    m_vals  = f_eval(tenors_all)                       # ndarray
+    eps_vals = sub["rate"].to_numpy() - m_vals        # ndarray
+
+    # Using ndarray RHS prevents pandas from trying to align by (possibly duplicated) index labels.
+    out.loc[sub.index, "model_spline"] = m_vals
+    out.loc[sub.index, "eps_spline"]   = eps_vals
+    return out
+
+def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate
+    Handles duplicate tenors by aggregating before fitting; writes results
+    back aligned to the original (possibly duplicated) rows.
+    """
+    out = df_snap.copy()
+    out["model_spline"] = np.nan
+    out["eps_spline"]   = np.nan
+
+    sub = df_snap.dropna(subset=["rate"]).copy()
+    if sub.shape[0] < 2:
+        return out  # cannot fit anything
+
+    # ---- deduplicate by tenor (aggregate mean rate) ----
     # keep a small view for fitting
     sub_uni = (
         sub.groupby("tenor_yrs", as_index=False, sort=True)["rate"]
