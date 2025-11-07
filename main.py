@@ -1,3 +1,62 @@
+def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate
+    Handles duplicate tenors by aggregating before fitting; writes results
+    back aligned to the original (possibly duplicated) rows.
+    """
+    out = df_snap.copy()
+    out["model_spline"] = np.nan
+    out["eps_spline"]   = np.nan
+
+    sub = df_snap.dropna(subset=["rate"]).copy()
+    if sub.shape[0] < 2:
+        return out  # cannot fit anything
+
+    # ---- deduplicate by tenor (aggregate mean rate) ----
+    # keep a small view for fitting
+    sub_uni = (
+        sub.groupby("tenor_yrs", as_index=False, sort=True)["rate"]
+           .mean()
+           .sort_values("tenor_yrs")
+           .reset_index(drop=True)
+    )
+    x = sub_uni["tenor_yrs"].values
+    y = sub_uni["rate"].values
+
+    if len(x) < 2:
+        return out  # still not enough unique points
+
+    # ---- fit curve on unique points ----
+    if len(x) == 2:
+        # linear fallback; guard for identical x’s
+        if np.isclose(x[1] - x[0], 0.0):
+            # identical tenor twice → just use the average y as flat curve
+            def f_eval(z): 
+                return np.full_like(z, fill_value=np.mean(y), dtype=float)
+        else:
+            m = (y[1] - y[0]) / (x[1] - x[0])
+            b = y[0] - m * x[0]
+            def f_eval(z): 
+                return m * np.asarray(z, dtype=float) + b
+    else:
+        try:
+            cs = CubicSpline(x, y, bc_type="natural")
+            def f_eval(z):
+                return cs(np.asarray(z, dtype=float))
+        except Exception:
+            # robust linear fallback on unique points
+            coef = np.polyfit(x, y, 1)
+            def f_eval(z):
+                return np.polyval(coef, np.asarray(z, dtype=float))
+
+    # ---- evaluate at every original row’s tenor and assign ----
+    m_all = pd.Series(f_eval(sub["tenor_yrs"].values), index=sub.index)
+    eps_all = sub["rate"] - m_all
+
+    out.loc[sub.index, "model_spline"] = m_all
+    out.loc[sub.index, "eps_spline"]   = eps_all
+    return out
+
  from zoneinfo import ZoneInfo
 
 # ========= Session =========
