@@ -1,6 +1,62 @@
 def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
     """
     df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate
+    Handles duplicate tenors safely and writes spline results
+    using pure positional (iloc) assignment to avoid alignment errors.
+    """
+    out = df_snap.copy()
+    out["model_spline"] = np.nan
+    out["eps_spline"]   = np.nan
+
+    sub = df_snap.dropna(subset=["rate"]).copy()
+    if sub.shape[0] < 2:
+        return out  # cannot fit anything
+
+    # ----- deduplicate by tenor -----
+    sub_uni = (
+        sub.groupby("tenor_yrs", as_index=False, sort=True)["rate"]
+           .mean()
+           .sort_values("tenor_yrs")
+           .reset_index(drop=True)
+    )
+    x = sub_uni["tenor_yrs"].to_numpy()
+    y = sub_uni["rate"].to_numpy()
+    if x.size < 2:
+        return out
+
+    # ----- fit curve -----
+    if x.size == 2:
+        if np.isclose(x[1] - x[0], 0.0):
+            ybar = float(np.mean(y))
+            def f_eval(z): return np.full_like(z, ybar, dtype=float)
+        else:
+            m = (y[1] - y[0]) / (x[1] - x[0])
+            b = y[0] - m * x[0]
+            def f_eval(z): return m * np.asarray(z, float) + b
+    else:
+        try:
+            cs = CubicSpline(x, y, bc_type="natural")
+            def f_eval(z): return cs(np.asarray(z, float))
+        except Exception:
+            coef = np.polyfit(x, y, 1)
+            def f_eval(z): return np.polyval(coef, np.asarray(z, float))
+
+    # ----- evaluate at each original tenor -----
+    tenors_all = sub["tenor_yrs"].to_numpy()
+    m_vals  = f_eval(tenors_all)
+    eps_vals = sub["rate"].to_numpy() - m_vals
+
+    # ----- pure positional assignment (no alignment) -----
+    idx_pos = out.index.get_indexer(sub.index)
+    col_model = out.columns.get_loc("model_spline")
+    col_eps   = out.columns.get_loc("eps_spline")
+    out.iloc[idx_pos, col_model] = m_vals
+    out.iloc[idx_pos, col_eps]   = eps_vals
+    return out
+
+def _spline_fit_safe(df_snap: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_snap: rows for one timestamp; columns: ts, tenor_yrs, rate
     Handles duplicate tenors by aggregating before fitting; writes results
     back aligned to the original (possibly duplicated) rows.
     """
