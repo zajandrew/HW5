@@ -1,4 +1,82 @@
 
+# ---- QuantLib calendar helpers ----
+def _get_us_calendar(market_name: str):
+    try:
+        import QuantLib as ql
+    except ImportError:
+        raise ImportError("QuantLib not installed. `pip install QuantLib` (or quantlib-python)")
+
+    m = market_name.lower()
+    # Map string -> QuantLib enum
+    if   m in ("federalreserve","fed","frb"): market = ql.UnitedStates(ql.UnitedStates.FederalReserve)
+    elif m in ("settlement","usd","us_settlement"): market = ql.UnitedStates(ql.UnitedStates.Settlement)
+    elif m in ("nyse","exchange"): market = ql.UnitedStates(ql.UnitedStates.NYSE)
+    elif m in ("governmentbond","govt","govbond"): market = ql.UnitedStates(ql.UnitedStates.GovernmentBond)
+    elif m in ("nerc",): market = ql.UnitedStates(ql.UnitedStates.NERC)
+    else: raise ValueError(f"Unknown US market '{market_name}'")
+    return market
+
+def _filter_by_calendar(df: pd.DataFrame, *, market_name: str, tz_local: str) -> pd.DataFrame:
+    """
+    Keep only rows whose local DATE (in tz_local) is a QuantLib business day.
+    Works on a tz-naive UTC DatetimeIndex (what we use everywhere).
+    """
+    if df.empty: return df
+    import numpy as np
+    import pytz
+    cal = _get_us_calendar(market_name)
+    # Convert UTC index -> local date (e.g., America/New_York)
+    idx_utc = pd.DatetimeIndex(df.index, tz="UTC")
+    idx_local = idx_utc.tz_convert(tz_local)
+    local_dates = idx_local.normalize()  # midnight-local dates
+
+    # Vectorized business-day mask using QuantLib
+    # (QuantLib expects ql.Date(year, month, day))
+    try:
+        import QuantLib as ql
+        y = local_dates.year.to_numpy()
+        m = local_dates.month.to_numpy()
+        d = local_dates.day.to_numpy()
+        mask = np.fromiter(
+            (cal.isBusinessDay(ql.Date(int(yy), int(mm), int(dd))) for yy, mm, dd in zip(y, m, d)),
+            dtype=bool,
+            count=len(local_dates)
+        )
+    except Exception:
+        # Fallback: simple Mon–Fri if QuantLib not available at runtime
+        mask = local_dates.dayofweek.to_series().isin([0,1,2,3,4]).to_numpy()
+
+    # Apply mask on original df (UTC-naive index preserved)
+    return df.iloc[mask]
+    
+def _load_month(yymm: str) -> pd.DataFrame:
+    p = Path(PATH_DATA) / f"{yymm}_features.parquet"
+    if not p.exists():
+        raise FileNotFoundError(f"Missing {p}")
+    df = pd.read_parquet(p, engine="pyarrow")
+
+    # 1) ensure UTC-naive DateTimeIndex + dedupe + sort
+    df = _ensure_dt_index(df)
+
+    # 2) (optional) calendar filter BEFORE trading-hours slice to remove whole days
+    if USE_QL_CALENDAR:
+        try:
+            df = _filter_by_calendar(df, market_name=QL_US_MARKET, tz_local=CAL_TZ)
+        except Exception as e:
+            print(f"[CAL] Warning: calendar filter failed ({e}); falling back to raw data.")
+
+    # 3) intraday trading hours (still in UTC)
+    if TRADING_HOURS:
+        df = df.between_time(*TRADING_HOURS)
+
+    # 4) zero→NaN cleanup
+    if ZERO_AS_NAN:
+        # to_numeric warning fix: use errors='coerce' explicitly
+        df = df.apply(pd.to_numeric, errors="ignore")
+        df = df.mask(df == 0.0)
+
+    return df
+
 def _process_one_day(day_df: pd.DataFrame, pca_model: dict | None,
                      lam: float, pca_presence_frac: float) -> pd.DataFrame:
     """
