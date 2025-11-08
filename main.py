@@ -1,4 +1,141 @@
-    # ---- parallel process days (safe with retry) ----
+def build_month_guarded(
+    yymm: str,
+    lam=EWMA_LAMBDA,
+    pca_presence_frac: float = 0.6,
+    n_jobs: int | None = None,
+) -> None:
+    """
+    Writes PATH_ENH/<yymm>_enh.parquet with guarded spline & PCA z's per tick.
+    - Trains/loads a PCA model per decision day (serial, once per day)
+    - Processes each day in parallel with joblib (safe queue + retry on failure)
+    - Prints progress & timing
+    """
+    import time
+    t0 = time.perf_counter()
+
+    # ---- load & reshape month ----
+    df_wide = _load_month(yymm)
+    if df_wide.empty:
+        print(f"[{yymm}] empty month after trading hours slice.")
+        return
+
+    df_long = _wide_to_long(df_wide)
+    if df_long.empty:
+        print(f"[{yymm}] no recognizable *_mid columns / tenor map.")
+        return
+
+    # ---- daily close panel for PCA training ----
+    df_long["date"] = pd.to_datetime(df_long["ts"]).dt.floor("D")
+    daily_close = (
+        df_long.sort_values("ts")
+               .groupby(["date", "tenor_yrs"])
+               .tail(1)
+               .pivot(index="date", columns="tenor_yrs", values="rate")
+               .sort_index()
+    )
+    daily_close.columns = [f"{c:.3f}" for c in daily_close.columns]
+
+    panel = _load_daily_panel()
+    panel = pd.concat([panel, daily_close], axis=0) if not panel.empty else daily_close.copy()
+    panel = panel[~panel.index.duplicated(keep="last")].sort_index()
+    _save_daily_panel(panel)
+
+    dates = sorted(daily_close.index.unique())
+    if n_jobs is None:
+        n_jobs = max(1, min(os.cpu_count() - 1, len(dates)))
+    print(f"[{yymm}] days: {len(dates)} | jobs: {n_jobs} | rows(long): {df_long.shape[0]:,}")
+
+    # ---- ensure PCA model exists for each day (serial) ----
+    for d in dates:
+        date_key = pd.Timestamp(d).strftime("%Y-%m-%d")
+        if _pca_read(date_key) is None:
+            model = _train_pca_daily(
+                panel,
+                asof_date=pd.Timestamp(d),
+                lookback_days=PCA_LOOKBACK_DAYS,
+                K=PCA_COMPONENTS,
+            )
+            if model is not None:
+                _pca_write(date_key, model)
+
+    # ---- prepare day slices ----
+    day_slices = [(d, df_long[df_long["date"] == d].copy()) for d in dates if not df_long[df_long["date"] == d].empty]
+
+    # ---- parallel process days (safe queue + retry) ----
+    from joblib import Parallel, delayed
+
+    def _work(item):
+        d, day_df = item
+        date_key = pd.Timestamp(d).strftime("%Y-%m-%d")
+        model = _pca_read(date_key)  # may be None if insufficient history
+        return _process_one_day(day_df, model, lam, pca_presence_frac)
+
+    def _work_safe(item):
+        d, day_df = item
+        try:
+            res = _work(item)
+            return (d, res, None)
+        except Exception:
+            import traceback
+            return (d, None, traceback.format_exc())
+
+    triples = Parallel(
+        n_jobs=n_jobs,
+        backend="loky",
+        prefer="processes",
+        pre_dispatch=n_jobs,  # keep queue small to reduce memory pressure on Windows
+        batch_size=1,         # one day per batch
+        verbose=0,
+    )(delayed(_work_safe)(item) for item in day_slices)
+
+    ok = [(d, df) for (d, df, err) in triples if err is None]
+    bad = [(d, err) for (d, df, err) in triples if err is not None]
+
+    if bad:
+        failed_days = [pd.Timestamp(d).date().isoformat() for d, _ in bad]
+        print(f"[WARN] {len(bad)} day(s) failed in parallel; retrying serially: {failed_days}")
+        for d, err in bad:
+            print(f"\n[TRACEBACK] day={pd.Timestamp(d).date()}\n{err}")
+        # retry failed days serially
+        for d, _ in bad:
+            slice_df = df_long[df_long["date"] == d].copy()
+            try:
+                res = _work((d, slice_df))
+                ok.append((d, res))
+            except Exception:
+                import traceback
+                print(f"[ERROR] day {pd.Timestamp(d).date()} failed again:\n{traceback.format_exc()}")
+
+    # collect results in chronological order
+    results = [res for d, res in sorted(ok, key=lambda t: t[0])]
+    enh = pd.concat(results, axis=0, ignore_index=True) if results else pd.DataFrame()
+    if enh.empty:
+        print(f"[{yymm}] produced no enhanced rows (insufficient PCA history or empty).")
+        return
+
+    # ---- finalize & write ----
+    enh = enh.sort_values(["ts", "tenor_yrs"])[[
+        "ts", "tenor_yrs", "rate",
+        "model_spline", "eps_spline", "eps_spline_ewstd", "z_spline",
+        "model_pca", "eps_pca", "eps_pca_ewstd", "z_pca",
+        "z_comb",
+    ]]
+    out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    enh.to_parquet(out_path, engine="pyarrow")
+
+    # optional integrity check: did we produce one or more rows for each day?
+    got_days = pd.to_datetime(enh["ts"]).normalize().nunique()
+    if got_days != len(dates):
+        print(f"[WARN] {yymm}: output has {got_days}/{len(dates)} distinct days.")
+        missing = sorted(set(pd.to_datetime(dates).date()) -
+                         set(pd.to_datetime(enh["ts"]).dt.normalize().dt.date.unique()))
+        if missing:
+            print(f"[WARN] missing days: {missing}")
+
+    dt = time.perf_counter() - t0
+    print(f"[{yymm}] wrote enhanced -> {out_path} | rows: {enh.shape[0]:,} | {dt:0.2f}s")
+    
+            # ---- parallel process days (safe with retry) ----
     if n_jobs is None:
         n_jobs = max(1, min(os.cpu_count() - 1, len(dates)))
 
