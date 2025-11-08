@@ -1,3 +1,57 @@
+    # ---- parallel process days (safe with retry) ----
+    if n_jobs is None:
+        n_jobs = max(1, min(os.cpu_count() - 1, len(dates)))
+
+    def _work(item):
+        d, day_df = item
+        date_key = pd.Timestamp(d).strftime("%Y-%m-%d")
+        model = _pca_read(date_key)  # may be None if insufficient history
+        return _process_one_day(day_df, model, lam, pca_presence_frac)
+
+    def _work_safe(item):
+        d, day_df = item
+        try:
+            res = _work(item)
+            return (d, res, None)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            return (d, None, tb)
+
+    # keep the dispatch queue small on Windows to reduce memory pressure
+    triples = Parallel(
+        n_jobs=n_jobs,
+        backend="loky",
+        prefer="processes",
+        pre_dispatch=n_jobs,   # don't queue up too many jobs
+        batch_size=1,          # one day per batch
+        verbose=0,
+    )(delayed(_work_safe)(item) for item in day_slices)
+
+    # separate successes and failures
+    ok = [(d, df) for (d, df, err) in triples if err is None]
+    bad = [(d, err) for (d, df, err) in triples if err is not None]
+
+    if bad:
+        failed_days = [pd.Timestamp(d).date().isoformat() for d, _ in bad]
+        print(f"[WARN] {len(bad)} day(s) failed in parallel; retrying serially: {failed_days}")
+        for d, err in bad:
+            # optional: show the traceback now, so you keep a record
+            print(f"\n[TRACEBACK] day={pd.Timestamp(d).date()}\n{err}")
+
+        # retry failed days serially with fresh slices (keeps memory low)
+        for d, _ in bad:
+            slice_df = df_long[df_long["date"] == d].copy()
+            try:
+                res = _work((d, slice_df))
+                ok.append((d, res))
+            except Exception as e:
+                import traceback
+                print(f"[ERROR] day {pd.Timestamp(d).date()} failed again:\n{traceback.format_exc()}")
+
+    # collect results in original date order
+    results = [res for d, res in sorted(ok, key=lambda t: t[0])]
+
 
 # ---- QuantLib calendar helpers ----
 def _get_us_calendar(market_name: str):
