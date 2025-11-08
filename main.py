@@ -1,3 +1,15 @@
+    # optional integrity check: did we produce one or more rows for each day?
+    ts_ser = pd.to_datetime(enh["ts"], errors="coerce")
+    got_days = ts_ser.dt.normalize().nunique()
+
+    if got_days != len(dates):
+        print(f"[WARN] {yymm}: output has {got_days}/{len(dates)} distinct days.")
+        out_days_set = set(ts_ser.dt.normalize().dt.date.unique())
+        dates_set = set(pd.to_datetime(dates).date)  # DatetimeIndex -> ndarray of dates
+        missing = sorted(dates_set - out_days_set)
+        if missing:
+            print(f"[WARN] missing days: {missing}")
+
 def build_month_guarded(
     yymm: str,
     lam=EWMA_LAMBDA,
