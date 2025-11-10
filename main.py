@@ -1,3 +1,16 @@
+import pandas as pd, numpy as np
+df = pd.read_parquet(r"C:\Users\zajohns\OneDrive - US Bank\Desktop\AI Hedging\RV Strategy\CR_Sandbox\enhanced\2304_enh.parquet")
+print(df.head())
+print(df.describe(include='all'))
+print(df['z_comb'].isna().mean())  # should be near 0
+print(df['tenor_yrs'].unique())    # should show your tenor list
+
+import matplotlib.pyplot as plt
+snap = df[df['ts'].dt.date.astype(str) == '2023-04-10']
+plt.scatter(snap['tenor_yrs'], snap['rate'], s=10, label='rates')
+plt.plot(snap['tenor_yrs'], snap['z_comb'], color='red', label='z_comb')
+plt.legend(); plt.show()
+
 def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
     """
     Robust application of a previously-fitted PCA model to one decision bucket.
