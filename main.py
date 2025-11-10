@@ -1,3 +1,234 @@
+# diag_selector.py
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+from cr_config import (
+    PATH_ENH, PATH_OUT, DECISION_FREQ, MIN_SEP_YEARS,
+    Z_ENTRY, SHORT_END_EXTRA_Z,
+    BUCKETS,
+    FLY_GATE_ENABLE, FLY_DEFS, FLY_Z_MIN, FLY_ALIGN_MODE,
+    PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP,
+)
+
+# ---------- helpers ----------
+def _to_float(x, default=np.nan):
+    try:
+        if isinstance(x, (pd.Series, pd.Index)):
+            return float(x.iloc[0]) if len(x) else default
+        return float(x)
+    except Exception:
+        return default
+
+def pv01_proxy(tenor_yrs, rate_pct):
+    return tenor_yrs / max(1e-6, 1.0 + 0.01 * rate_pct)
+
+def assign_bucket(tenor):
+    for name, (lo, hi) in BUCKETS.items():
+        if (tenor >= lo) and (tenor <= hi):
+            return name
+    return "other"
+
+def compute_fly_z(snap_last: pd.DataFrame, a: float, b: float, c: float) -> float | None:
+    def getz(T):
+        r = snap_last.loc[snap_last["tenor_yrs"] == T]
+        if r.empty: return np.nan
+        return _to_float(r.iloc[0]["z_comb"])
+    za, zb, zc = getz(a), getz(b), getz(c)
+    if np.isnan([za,zb,zc]).any(): return None
+    shape = 0.5*(za+zc)-zb
+    xs = snap_last["z_comb"].astype(float).to_numpy()
+    sd = np.nanstd(xs, ddof=1) if xs.size>1 else 1.0
+    if not np.isfinite(sd) or sd<=0: sd=1.0
+    return shape / sd
+
+def fly_alignment_ok(leg_tenor: float, leg_sign_z: int, snap_last: pd.DataFrame) -> bool:
+    if not FLY_GATE_ENABLE: return True
+    for (a,b,c) in FLY_DEFS:
+        fz = compute_fly_z(snap_last, a,b,c)
+        if fz is None: continue
+        if abs(fz) < FLY_Z_MIN: continue
+        if FLY_ALIGN_MODE == "strict" and np.sign(fz) != np.sign(leg_sign_z):
+            return False
+        if FLY_ALIGN_MODE == "loose" and (np.sign(fz) * np.sign(leg_sign_z) < 0):
+            return False
+    return True
+
+# ---------- core diagnostics ----------
+def analyze_month(yymm: str) -> pd.DataFrame:
+    p = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    if not p.exists():
+        raise FileNotFoundError(f"Missing enhanced file: {p}")
+
+    df = pd.read_parquet(p)
+    if df.empty:
+        print(f"[{yymm}] empty enhanced file.")
+        return pd.DataFrame()
+
+    need = {"ts","tenor_yrs","rate","z_comb"}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"{p} missing columns: {miss}")
+
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    if DECISION_FREQ.upper() == "D":
+        df["decision_ts"] = df["ts"].dt.floor("D")
+    elif DECISION_FREQ.upper() == "H":
+        df["decision_ts"] = df["ts"].dt.floor("H")
+    else:
+        raise ValueError("DECISION_FREQ must be 'D' or 'H'")
+
+    # results per decision bucket
+    rows = []
+    for dts, snap in df.groupby("decision_ts", sort=True):
+        # last tick per tenor in bucket
+        snap_last = (snap.sort_values("ts")
+                         .groupby("tenor_yrs", as_index=False)
+                         .tail(1)
+                         .reset_index(drop=True))
+        rec = {
+            "decision_ts": dts,
+            "n_tenors": int(snap_last.shape[0]),
+            "z_min": np.nan, "z_p50": np.nan, "z_p90": np.nan, "z_max": np.nan,
+            "z_range": np.nan,
+            "stage": "init",                     # where it failed (or 'ok')
+            "cand_pairs": 0, "cand_after_fly": 0,
+            "caps_feasible": np.nan,             # can any one neutral pair pass caps?
+            "why": ""
+        }
+
+        if snap_last.empty:
+            rec["stage"] = "no_data"
+            rows.append(rec); continue
+
+        # basic distrib
+        z = snap_last["z_comb"].astype(float).to_numpy()
+        rec["z_min"] = np.nanmin(z) if z.size else np.nan
+        rec["z_p50"] = np.nanpercentile(z, 50) if z.size else np.nan
+        rec["z_p90"] = np.nanpercentile(z, 90) if z.size else np.nan
+        rec["z_max"] = np.nanmax(z) if z.size else np.nan
+        rec["z_range"] = (rec["z_max"] - rec["z_min"]) if (np.isfinite(rec["z_max"]) and np.isfinite(rec["z_min"])) else np.nan
+
+        # tenor separation quick check
+        ten = snap_last["tenor_yrs"].astype(float).sort_values().to_numpy()
+        if len(ten) < 2:
+            rec["stage"] = "too_few_tenors"; rows.append(rec); continue
+        sep_ok = (np.max(np.diff(ten)) >= MIN_SEP_YEARS) or (np.max(ten) - np.min(ten) >= MIN_SEP_YEARS)
+        if not sep_ok:
+            rec["stage"] = "sep_blocker"; rows.append(rec); continue
+
+        # entry threshold feasibility (ignoring fly and caps)
+        if not (np.isfinite(rec["z_range"]) and rec["z_range"] >= Z_ENTRY):
+            rec["stage"] = "z_bar_not_met"  # global cross-sec bar already too low
+            rows.append(rec); continue
+
+        # enumerate candidate pairs (extremes) & test fly
+        sig = snap_last[["tenor_yrs","rate","z_comb"]].dropna().sort_values("z_comb")
+        L = len(sig)
+        cand = 0; cand_fly = 0
+        fly_kill = 0
+        # also test minimal caps feasibility using the strongest pair (max zdisp)
+        best_caps_feasible = False
+
+        for k_low in range(min(6, L)):
+            rich = sig.iloc[k_low]
+            for k_hi in range(1, min(10, L)+1):
+                cheap = sig.iloc[-k_hi]
+                t_i = _to_float(cheap["tenor_yrs"]); t_j = _to_float(rich["tenor_yrs"])
+                if abs(t_i - t_j) < MIN_SEP_YEARS:
+                    continue
+                zdisp = _to_float(cheap["z_comb"]) - _to_float(rich["z_comb"])
+                if not np.isfinite(zdisp) or (zdisp < Z_ENTRY):
+                    continue
+                cand += 1
+
+                # fly
+                ok_i = fly_alignment_ok(t_i, +1, snap_last)
+                ok_j = fly_alignment_ok(t_j, -1, snap_last)
+                if not (ok_i and ok_j):
+                    fly_kill += 1
+                    continue
+                cand_fly += 1
+
+                # quick caps feasibility for THIS pair:
+                r_i = _to_float(cheap["rate"]); r_j = _to_float(rich["rate"])
+                pv_i = pv01_proxy(t_i, r_i)
+                pv_j = pv01_proxy(t_j, r_j)
+                w_i = 1.0
+                w_j = - w_i * pv_i / max(1e-9, pv_j)
+
+                b_i = assign_bucket(t_i); b_j = assign_bucket(t_j)
+                dv_i = abs(w_i) * pv_i; dv_j = abs(w_j) * pv_j
+
+                per_bucket_ok = True
+                if b_i in BUCKETS and (dv_i > PER_BUCKET_DV01_CAP): per_bucket_ok = False
+                if b_j in BUCKETS and (dv_j > PER_BUCKET_DV01_CAP): per_bucket_ok = False
+
+                front_end_used = (dv_i if b_i=="short" else 0.0) + (dv_j if b_j=="short" else 0.0)
+                fe_ok = front_end_used <= FRONT_END_DV01_CAP
+                total_ok = (dv_i + dv_j) <= TOTAL_DV01_CAP
+
+                pair_ok = per_bucket_ok and fe_ok and total_ok
+
+                # extra short-end hurdle check (for info)
+                if (b_i=="short" or b_j=="short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
+                    pair_ok = False
+
+                best_caps_feasible = best_caps_feasible or pair_ok
+
+        rec["cand_pairs"] = cand
+        rec["cand_after_fly"] = cand_fly
+        rec["caps_feasible"] = bool(best_caps_feasible)
+
+        # Decide final stage tag
+        if cand == 0:
+            rec["stage"] = "no_pair_meets_threshold"
+        elif cand_fly == 0:
+            rec["stage"] = "fly_blocker"
+        elif not best_caps_feasible:
+            rec["stage"] = "caps_blocker"
+        else:
+            rec["stage"] = "ok"
+
+        rows.append(rec)
+
+    out = pd.DataFrame(rows).sort_values("decision_ts")
+    # write both CSV + TXT month summary
+    csv_path = Path(PATH_OUT) / f"diag_selector_{yymm}.csv"
+    out.to_csv(csv_path, index=False)
+
+    # Text summary
+    def pct(x): return f"{100.0*x:.1f}%"
+    summary = out["stage"].value_counts(dropna=False).to_dict()
+    zr = out["z_range"].describe(percentiles=[.5,.9]).to_dict()
+    ok = int((out["stage"]=="ok").sum())
+    msg = []
+    msg.append(f"[DIAG] {yymm}")
+    msg.append(f"path: {p}")
+    msg.append(f"decisions: {out.shape[0]}")
+    msg.append(f"z_range min/p50/p90/max: "
+               f"{zr.get('min',np.nan):.4f}/"
+               f"{zr.get('50%',np.nan):.4f}/"
+               f"{zr.get('90%',np.nan):.4f}/"
+               f"{zr.get('max',np.nan):.4f}")
+    msg.append(f"stages: {summary}")
+    msg.append(f"ok_decisions: {ok}")
+    txt_path = Path(PATH_OUT) / f"diag_selector_{yymm}.txt"
+    with open(txt_path, "w") as f:
+        f.write("\n".join(msg) + "\n")
+    print("\n".join(msg))
+    print(f"[SAVE] {csv_path}")
+    print(f"[SAVE] {txt_path}")
+    return out
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python diag_selector.py 2304 [2305 2306 ...]")
+        sys.exit(1)
+    for y in sys.argv[1:]:
+        analyze_month(y)
+
 # cr_config.py
 from zoneinfo import ZoneInfo
 from pathlib import Path
