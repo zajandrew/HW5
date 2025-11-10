@@ -1,4 +1,207 @@
-    # optional integrity check: did we produce one or more rows for each day?
+def run_month(
+    yymm: str,
+    decision_freq: str = DECISION_FREQ,   # 'D' or 'H'
+    *,
+    plot: bool = False,                   # disable heavy plotting by default
+    heatmap: bool = False,                # disable big heatmap by default
+    verbose: bool = True
+):
+    from pathlib import Path
+    import pandas as pd
+    import numpy as np
+
+    p = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    if not p.exists():
+        raise FileNotFoundError(f"Missing {p}. Run feature creation first.")
+
+    df = pd.read_parquet(p)
+    if df.empty:
+        if verbose: print(f"[WARN] {yymm}: enhanced parquet is empty.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # time keys
+    df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
+    if decision_freq == 'D':
+        df["decision_ts"] = df["ts"].dt.floor("D")
+    elif decision_freq == 'H':
+        df["decision_ts"] = df["ts"].dt.floor("H")
+    else:
+        raise ValueError("decision_freq must be 'D' or 'H'.")
+
+    # optional (big) heatmap — gated
+    if heatmap:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            _heat = (df.pivot_table(index="ts", columns="tenor_yrs",
+                                    values="z_comb", aggfunc="last")
+                       .sort_index())
+            if not _heat.empty:
+                plt.figure()
+                plt.imshow(_heat.T, aspect="auto", origin="lower")
+                plt.title(f"z_comb heatmap {yymm}")
+                plt.xlabel("time idx"); plt.ylabel("tenor (yrs)")
+                plt.colorbar()
+                plt.savefig(Path(PATH_OUT) / f"z_heatmap_{yymm}.png",
+                            dpi=120, bbox_inches="tight")
+                plt.close()
+        except Exception as e:
+            if verbose: print(f"[WARN] heatmap skipped for {yymm}: {e}")
+
+    open_positions: list[PairPos] = []
+    ledger_rows: list[dict] = []
+    closed_rows: list[dict] = []
+
+    # main loop
+    for dts, snap in df.groupby("decision_ts", sort=True):
+        # last observed tick per tenor up to this decision timestamp (no look-ahead)
+        snap_last = snap.sort_values("ts").groupby("tenor_yrs").tail(1)
+        if snap_last.empty:
+            continue
+
+        # ---- mark & exit existing positions ----
+        still_open = []
+        for pos in open_positions:
+            zsp = pos.mark(snap_last)
+            if abs(zsp) <= Z_EXIT:
+                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "reversion"
+            elif abs(zsp - pos.entry_zspread) >= Z_STOP:
+                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "stop"
+            elif pos.days_held >= MAX_HOLD_DAYS:
+                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "max_hold"
+            else:
+                # light aging by decision frequency
+                if decision_freq == 'D':
+                    pos.days_held += 1
+
+            # always append a 'mark' to the ledger
+            ledger_rows.append({
+                "decision_ts": dts,
+                "event": "mark",
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "w_i": pos.w_i, "w_j": pos.w_j,
+                "pnl": pos.pnl, "z_spread": zsp,
+                "conv_proxy": pos.conv_pnl_proxy,
+                "open_ts": pos.open_ts, "closed": pos.closed,
+                "exit_reason": pos.exit_reason,
+                "entry_zspread": pos.entry_zspread
+            })
+
+            if pos.closed:
+                closed_rows.append({
+                    "open_ts": pos.open_ts,
+                    "close_ts": pos.close_ts,
+                    "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                    "w_i": pos.w_i, "w_j": pos.w_j,
+                    "entry_zspread": pos.entry_zspread,
+                    "pnl": pos.pnl, "days_held": pos.days_held,
+                    "conv_proxy": pos.conv_pnl_proxy
+                })
+            else:
+                still_open.append(pos)
+        open_positions = still_open
+
+        # ---- entries (greedy under caps) ----
+        selected = choose_pairs_under_caps(
+            snap_last=snap_last,
+            max_pairs=max(0, MAX_CONCURRENT_PAIRS - len(open_positions)),
+            per_bucket_cap=PER_BUCKET_DV01_CAP,
+            total_cap=TOTAL_DV01_CAP,
+            front_end_cap=FRONT_END_DV01_CAP,
+            extra_z_entry=0.0
+        )
+
+        for (cheap, rich, w_i, w_j) in selected:
+            # short-end requires extra dispersion if configured
+            if assign_bucket(cheap["tenor_yrs"]) == "short" or assign_bucket(rich["tenor_yrs"]) == "short":
+                if float(cheap["z_comb"] - rich["z_comb"]) < (Z_ENTRY + SHORT_END_EXTRA_Z):
+                    continue
+
+            pos = PairPos(open_ts=dts, cheap=cheap, rich=rich, w_i=w_i, w_j=w_j)
+            open_positions.append(pos)
+
+            ledger_rows.append({
+                "decision_ts": dts,
+                "event": "open",
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "w_i": pos.w_i, "w_j": pos.w_j,
+                "entry_zspread": pos.entry_zspread
+            })
+
+    # -------- outputs (schema-safe) --------
+    pos_df = pd.DataFrame(closed_rows)
+
+    LEDGER_COLS = [
+        "decision_ts","event","tenor_i","tenor_j","w_i","w_j",
+        "pnl","z_spread","conv_proxy","open_ts","closed","exit_reason","entry_zspread"
+    ]
+    ledger = pd.DataFrame(ledger_rows)
+    # ensure all expected columns exist and order them
+    for c in LEDGER_COLS:
+        if c not in ledger.columns:
+            ledger[c] = pd.NA
+    ledger = ledger[LEDGER_COLS]
+
+    # daily PnL (guarded)
+    if not ledger.empty and "pnl" in ledger.columns:
+        marks = ledger.loc[ledger["event"] == "mark"].copy()
+        if not marks.empty:
+            gkey = pd.to_datetime(marks["decision_ts"], errors="coerce").dt.floor("D")
+            pnl_by_day = (marks.groupby(gkey, dropna=True)["pnl"]
+                          .sum()
+                          .rename("daily_pnl").to_frame().reset_index())
+            pnl_by_day = pnl_by_day.rename(columns={"decision_ts": "date", "index": "date"})
+            pnl_by_day["date"] = pd.to_datetime(pnl_by_day["date"])
+        else:
+            pnl_by_day = pd.DataFrame(columns=["date","daily_pnl"])
+    else:
+        pnl_by_day = pd.DataFrame(columns=["date","daily_pnl"])
+
+    # optional monthly PnL plot
+    if plot and not pnl_by_day.empty:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            pnl_by_day = pnl_by_day.sort_values("date")
+            pnl_by_day["cum"] = pnl_by_day["daily_pnl"].cumsum()
+            plt.figure()
+            plt.plot(pnl_by_day["date"], pnl_by_day["cum"])
+            plt.title(f"Cumulative PnL proxy {yymm}")
+            plt.xlabel("Date"); plt.ylabel("Cum PnL")
+            out_png = Path(PATH_OUT) / f"pnl_curve_{yymm}.png"
+            plt.savefig(out_png, dpi=120, bbox_inches="tight")
+            plt.close()
+        except Exception as e:
+            if verbose: print(f"[WARN] plot skipped for {yymm}: {e}")
+
+    return pos_df, ledger, pnl_by_day
+    
+def run_all(yymms, *, decision_freq: str = DECISION_FREQ, plot=False, heatmap=False, verbose=True):
+    import pandas as pd
+
+    all_pos, all_ledger, all_byday = [], [], []
+    if verbose: print(f"[INFO] months: {len(yymms)} -> {yymms}", flush=True)
+
+    for yymm in yymms:
+        if verbose: print(f"[RUN] month {yymm}", flush=True)
+        p, l, b = run_month(yymm, decision_freq=decision_freq, plot=plot, heatmap=heatmap, verbose=verbose)
+        if p is not None and not p.empty: all_pos.append(p)
+        if l is not None and not l.empty: all_ledger.append(l)
+        if b is not None and not b.empty: all_byday.append(b.assign(yymm=yymm))
+        if verbose:
+            print(f"[DONE] {yymm} | pos={0 if p is None else len(p)} "
+                  f"ledger={0 if l is None else len(l)} "
+                  f"byday={0 if b is None else len(b)}", flush=True)
+
+    pos   = pd.concat(all_pos,   ignore_index=True) if all_pos   else pd.DataFrame()
+    led   = pd.concat(all_ledger,ignore_index=True) if all_ledger else pd.DataFrame()
+    byday = pd.concat(all_byday, ignore_index=True) if all_byday else pd.DataFrame()
+    return pos, led, byday
+    
+            # optional integrity check: did we produce one or more rows for each day?
     ts_ser = pd.to_datetime(enh["ts"], errors="coerce")
     got_days = ts_ser.dt.normalize().nunique()
 
