@@ -3,10 +3,10 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # ========= Paths =========
-PATH_DATA   = r"C:/Users/zajohns/OneDrive - US Bank/Desktop/AI Hedging/downloads/Features_CPU"   # raw monthly wide parquet
-PATH_ENH    = r"C:/Users/zajohns/OneDrive - US Bank/Desktop/AI Hedging/RV Strategy/CR_Sandbox/enhanced"
-PATH_MODELS = r"C:/Users/zajohns/OneDrive - US Bank/Desktop/AI Hedging/RV Strategy/CR_Sandbox/models"
-PATH_OUT    = r"C:/Users/zajohns/OneDrive - US Bank/Desktop/AI Hedging/RV Strategy/CR_Sandbox/out"
+PATH_DATA   = "x"
+PATH_ENH    = "x"
+PATH_MODELS = "x"
+PATH_OUT    = "x"
 
 Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
 Path(PATH_MODELS).mkdir(parents=True, exist_ok=True)
