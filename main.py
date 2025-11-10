@@ -1,4 +1,197 @@
 
+# ---------- calendar helpers (QuantLib with safe fallback) ----------
+def _get_ql_calendar():
+    """
+    Try to build a QuantLib UnitedStates calendar using QL_US_MARKET.
+    Fallback: None (we'll use simple Mon–Fri filter).
+    """
+    if not USE_QL_CALENDAR:
+        return None
+    try:
+        import QuantLib as ql
+    except Exception:
+        print("[CAL] QuantLib not available; falling back to weekday filter.")
+        return None
+
+    try:
+        # Map market name to QuantLib enum, default to FederalReserve
+        market = getattr(getattr(__import__('QuantLib').QuantLib.UnitedStates),
+                         str(QL_US_MARKET), None)
+        if market is None:
+            print(f"[CAL] Unknown QL_US_MARKET='{QL_US_MARKET}', using FederalReserve.")
+            market = __import__('QuantLib').QuantLib.UnitedStates.FederalReserve
+        cal = __import__('QuantLib').QuantLib.UnitedStates(market)
+        return cal
+    except Exception as e:
+        print(f"[CAL] Failed to init QuantLib calendar: {e}; using weekday filter.")
+        return None
+
+def _valid_business_dates_ql(cal, start_date, end_date):
+    """
+    Return a Python set of local dates (datetime.date) that are business days
+    per QuantLib calendar between [start_date, end_date].
+    """
+    import QuantLib as ql
+    valid = set()
+    d = ql.Date(start_date.day, start_date.month, start_date.year)
+    e = ql.Date(end_date.day,   end_date.month,   end_date.year)
+    while d <= e:
+        if cal.isBusinessDay(d):
+            py = ql.Date(d).to_date()
+            valid.add(py)
+        d = d + 1
+    return valid
+
+def _valid_business_dates_simple(start_date, end_date):
+    """Mon–Fri simple filter as a fallback."""
+    idx = pd.date_range(start=start_date, end=end_date, freq="D")
+    return set([d.date() for d in idx if d.weekday() < 5])
+
+def _apply_calendar_and_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter df to valid business days (QuantLib if available, else Mon–Fri),
+    and then to session hours in CAL_TZ (e.g., 'America/New_York').
+    Convert back to UTC-naive 'ts' for downstream.
+    Assumes df has a 'ts' column in UTC or naive-UTC.
+    """
+    if df.empty:
+        return df
+
+    tz_local = ZoneInfo(CAL_TZ) if CAL_TZ else ZoneInfo("UTC")
+
+    # Ensure ts is timezone-aware (UTC)
+    ts = pd.to_datetime(df["ts"], errors="coerce")
+    if ts.dt.tz is None:
+        ts = ts.dt.tz_localize("UTC")
+    else:
+        ts = ts.dt.tz_convert("UTC")
+    df = df.copy()
+    df["ts"] = ts
+
+    # Convert to local market TZ to decide business dates and hours
+    df["ts_local"] = df["ts"].dt.tz_convert(tz_local)
+
+    # Build valid business-day set
+    start_loc = df["ts_local"].min().date()
+    end_loc   = df["ts_local"].max().date()
+
+    cal = _get_ql_calendar()
+    if cal is not None:
+        valid_dates = _valid_business_dates_ql(cal, start_loc, end_loc)
+        print(f"[CAL] QuantLib calendar active ({QL_US_MARKET}); days={len(valid_dates)}")
+    else:
+        valid_dates = _valid_business_dates_simple(start_loc, end_loc)
+        print(f"[CAL] Simple Mon–Fri filter active; days={len(valid_dates)}")
+
+    # Filter to business days
+    df = df[df["ts_local"].dt.date.isin(valid_dates)]
+    if df.empty:
+        # nothing to do
+        return df.drop(columns=["ts_local"])
+
+    # Apply session window in local time (if provided)
+    if TRADING_HOURS and len(TRADING_HOURS) == 2:
+        # Regular between_time expects DatetimeIndex in local tz
+        tmp = df.set_index("ts_local").sort_index()
+        try:
+            tmp = tmp.between_time(TRADING_HOURS[0], TRADING_HOURS[1])
+        except Exception as e:
+            print(f"[CAL] between_time failed ({e}); skipping session filter.")
+        df = tmp.reset_index()
+
+    # Convert back to UTC-naive for downstream (keeps everything consistent)
+    ts_utc = df["ts_local"].dt.tz_convert("UTC")
+    df["ts"] = pd.to_datetime(ts_utc.dt.tz_localize(None))
+
+    return df.drop(columns=["ts_local"])
+    
+def build_month(yymm: str) -> None:
+    in_path  = Path(PATH_DATA) / f"{yymm}.parquet"
+    out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Missing raw month file: {in_path}")
+
+    # ----- Load wide & normalize timestamps -----
+    df_wide = pd.read_parquet(in_path)
+    df_wide = _to_ts_index(df_wide)
+    df_wide = df_wide.sort_values('ts')
+    # drop duplicated ticks (keep last)
+    df_wide = df_wide[~df_wide['ts'].duplicated(keep='last')]
+
+    # ----- Calendar + session-hours (QuantLib if available, else Mon–Fri) -----
+    pre_rows = len(df_wide)
+    df_wide = _apply_calendar_and_hours(df_wide)
+    post_rows = len(df_wide)
+    if pre_rows > 0:
+        print(f"[CAL] kept {post_rows:,}/{pre_rows:,} rows ({(post_rows/pre_rows*100):.2f}%) after calendar+hours")
+
+    # ----- Clean zeros -> NaN & numeric coercion -----
+    df_wide = _zeros_to_nan(df_wide)
+
+    # ----- Wide -> Long using your tenor map -----
+    df_long = _melt_long(df_wide, TENOR_YEARS)
+
+    # ----- Decision buckets (D/H) -----
+    df_long['decision_ts'] = _decision_key(df_long['ts'], DECISION_FREQ)
+
+    buckets = list(df_long['decision_ts'].dropna().unique())
+    buckets.sort()
+
+    # ----- Parallelism -----
+    if 'N_JOBS' in globals() and isinstance(N_JOBS, int):
+        if N_JOBS == 0:
+            import multiprocessing as mp
+            jobs = max(1, min((mp.cpu_count() // 2), 8))
+        else:
+            jobs = int(N_JOBS)
+    else:
+        jobs = 1
+
+    lookback_buckets = _effective_pca_lookback()
+
+    print(f"[{_now()}] [MONTH] {yymm} | buckets={len(buckets)} freq={DECISION_FREQ} "
+          f"| jobs={jobs} | PCA={'on' if PCA_ENABLE else 'off'} "
+          f"| lookback={lookback_buckets} | comps={PCA_COMPONENTS}")
+
+    if len(buckets) == 0:
+        print(f"[WARN] {yymm}: no buckets found.")
+        pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']).to_parquet(out_path, index=False)
+        print(f"[SAVE] {out_path}")
+        return
+
+    def _one_bucket(dts):
+        snap = df_long[df_long['decision_ts'] == dts]
+        t0 = time.time()
+        out = _process_bucket(
+            dts=dts,
+            df_bucket=snap,
+            df_all=df_long[['ts','tenor_yrs','rate','decision_ts']],
+            lookback_buckets=lookback_buckets,
+            pca_enable=PCA_ENABLE,
+            pca_n_comps=int(PCA_COMPONENTS),
+            yymm=yymm
+        )
+        dt = time.time() - t0
+        print(f"[BUCKET] {yymm} {dts} rows:{len(snap):,} tenors:{snap['tenor_yrs'].nunique()} "
+              f"PCA:{'yes' if out['z_pca'].notna().any() else 'no '} t={dt:.2f}s")
+        return out
+
+    parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one_bucket)(dts) for dts in buckets)
+    out = (pd.concat(parts, ignore_index=True)
+           if parts else pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']))
+    out = out.sort_values(['ts','tenor_yrs']).reset_index(drop=True)
+
+    # ----- Month diagnostics & save -----
+    zr = pd.to_numeric(out['z_comb'], errors='coerce')
+    z_valid_pct = float(np.isfinite(zr).mean() * 100.0) if not out.empty else 0.0
+    med_ten = out.groupby('ts')['tenor_yrs'].nunique().median() if not out.empty else 0
+    print(f"[DONE] {yymm} rows:{len(out):,} tenors_med:{med_ten:.1f} z_valid%:{z_valid_pct:.2f}")
+
+    out.to_parquet(out_path, index=False)
+    print(f"[SAVE] {out_path}")
+
 # feature_creation.py
 from __future__ import annotations
 import os, time
