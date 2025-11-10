@@ -87,7 +87,8 @@ from cr_config import (
     FLY_WINDOW_YEARS,    # neighborhood half-width (years)
     FLY_SKIP_SHORT_UNDER,# skip gate if leg tenor < this
     FLY_ALLOW_BIG_ZDISP, # allow waiver when dispersion big
-    FLY_BIG_ZDISP_MARGIN # size above Z_ENTRY to waive
+    FLY_BIG_ZDISP_MARGIN, # size above Z_ENTRY to waive
+    FLY_TENOR_TOL_YEARS
 )
 
 # ---------- helpers ----------
@@ -108,24 +109,25 @@ def assign_bucket(tenor):
             return name
     return "other"
 
+# 1) add tolerant getter (top-level, near compute_fly_z)
+def _get_z_at_tenor(snap_last: pd.DataFrame, tenor: float, tol: float = FLY_TENOR_TOL_YEARS) -> float | None:
+    s = snap_last[["tenor_yrs", "z_comb"]].dropna()
+    if s.empty: return None
+    s = s.assign(_dist=(s["tenor_yrs"] - float(tenor)).abs())
+    row = s.loc[s["_dist"].idxmin()]
+    return float(row["z_comb"]) if row["_dist"] <= tol else None
+
 def compute_fly_z(snap_last: pd.DataFrame, a: float, b: float, c: float) -> float | None:
-    """
-    On each snapshot, compute simple fly z = [0.5*(z_a+z_c) - z_b] / cross-sec std(z)
-    using z_comb (NOT levels). Return None if any leg missing.
-    """
     try:
-        rows = {
-            a: snap_last.loc[snap_last["tenor_yrs"] == a, "z_comb"],
-            b: snap_last.loc[snap_last["tenor_yrs"] == b, "z_comb"],
-            c: snap_last.loc[snap_last["tenor_yrs"] == c, "z_comb"],
-        }
-        if any(r.empty for r in rows.values()):
+        z_a = _get_z_at_tenor(snap_last, a)
+        z_b = _get_z_at_tenor(snap_last, b)
+        z_c = _get_z_at_tenor(snap_last, c)
+        if any(v is None for v in (z_a, z_b, z_c)):
             return None
-        z_a, z_b, z_c = float(rows[a].iloc[0]), float(rows[b].iloc[0]), float(rows[c].iloc[0])
-        xs = snap_last["z_comb"].astype(float).values
+        xs = snap_last["z_comb"].astype(float).to_numpy()
         sd = np.nanstd(xs, ddof=1) if xs.size > 1 else 1.0
-        sd = sd if sd > 0 else 1.0
-        fly = 0.5 * (z_a + z_c) - z_b
+        sd = sd if (np.isfinite(sd) and sd > 0) else 1.0
+        fly = 0.5*(z_a + z_c) - z_b
         return fly / sd
     except Exception:
         return None
@@ -183,10 +185,10 @@ def fly_alignment_ok(
         return True
     if FLY_MODE == "loose":
         # Block on ANY contradiction
-        return contradictions == 0
+        return contradictions <= 1
     if FLY_MODE == "tolerant":
         # Block only if enough contradictions
-        return contradictions < int(FLY_REQUIRE_COUNT)
+        return contradictions <= int(FLY_REQUIRE_COUNT)
     if FLY_MODE == "strict":
         # Require all checked flies to agree (no positive contradiction allowed)
         return contradictions == 0
@@ -1237,12 +1239,10 @@ def fly_alignment_ok(
     # Big dispersion waiver
     if (FLY_ALLOW_BIG_ZDISP and (zdisp_for_pair is not None) and
         (float(zdisp_for_pair) >= float(Z_ENTRY) + float(FLY_BIG_ZDISP_MARGIN))):
-        _FLY_DBG["waived_bigz"] += 1
         return True
 
     # Skip short end
     if (FLY_SKIP_SHORT_UNDER is not None) and (leg_tenor < float(FLY_SKIP_SHORT_UNDER)):
-        _FLY_DBG["skipped_short"] += 1
         return True
 
     triplets = FLY_DEFS
@@ -1250,7 +1250,6 @@ def fly_alignment_ok(
         W = float(FLY_WINDOW_YEARS)
         triplets = [(a,b,c) for (a,b,c) in FLY_DEFS if abs(float(b) - float(leg_tenor)) <= W]
         if not triplets:
-            _FLY_DBG["empty_neighborhood"] += 1
             return True
 
     contradictions = 0
