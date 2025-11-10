@@ -1,3 +1,73 @@
+def _melt_long(df_wide: pd.DataFrame, tenormap: Dict[str, float]) -> pd.DataFrame:
+    """
+    Select columns present in TENOR_YEARS (tolerant to '_mid' suffix and spacing),
+    melt to long: ['ts','tenor_yrs','rate'].
+    """
+    # Build reverse lookup: normalized name -> tenor
+    def norm(s: str) -> str:
+        s = str(s).strip()
+        if s.endswith("_mid"):
+            s = s[:-4]
+        return " ".join(s.split())  # collapse whitespace
+
+    tenormap_norm = {norm(k): v for k, v in tenormap.items()}
+
+    # Find actual cols that map to a tenor
+    cand = []
+    for c in df_wide.columns:
+        if c == "ts":
+            continue
+        nc = norm(c)
+        if nc in tenormap_norm:
+            cand.append((c, tenormap_norm[nc]))
+
+    if not cand:
+        # helpful debug
+        sample_cols = [c for c in df_wide.columns if c != "ts"][:20]
+        raise ValueError(
+            "No overlapping tickers between input file and TENOR_YEARS.\n"
+            f"Example file columns: {sample_cols}\n"
+            f"Example tenor keys: {list(tenormap.keys())[:20]}\n"
+            "If your file columns include suffixes like '_mid', the normalizer above should handle them.\n"
+            "Otherwise, adjust TENOR_YEARS keys to match."
+        )
+
+    # Build a DataFrame with only matched columns and a tenor map for those columns
+    use_cols = ["ts"] + [c for c, _ in cand]
+    df_sel = df_wide[use_cols].copy()
+
+    col_to_tenor = {c: t for c, t in cand}
+    long = df_sel.melt(id_vars="ts", var_name="instrument", value_name="rate")
+    long["tenor_yrs"] = long["instrument"].map(col_to_tenor).astype(float)
+
+    # Ensure numeric & clean
+    long["rate"] = pd.to_numeric(long["rate"], errors="coerce")
+    long = long.dropna(subset=["ts", "tenor_yrs", "rate"])
+    return long[["ts", "tenor_yrs", "rate"]]
+    
+def _get_ql_calendar():
+    if not USE_QL_CALENDAR:
+        return None
+    try:
+        import QuantLib as ql
+    except Exception:
+        print("[CAL] QuantLib not available; falling back to weekday filter.")
+        return None
+
+    try:
+        # Map your string to the Market enum safely (fallback to FederalReserve or NYSE)
+        mkt_enum = getattr(ql.UnitedStates.Market, str(QL_US_MARKET), None)
+        if mkt_enum is None:
+            # older wheels might not have FederalReserve; fall back to NYSE
+            fallback = getattr(ql.UnitedStates.Market, "FederalReserve",
+                               ql.UnitedStates.Market.NYSE)
+            print(f"[CAL] Unknown QL_US_MARKET='{QL_US_MARKET}', using {fallback}.")
+            mkt_enum = fallback
+        cal = ql.UnitedStates(mkt_enum)
+        return cal
+    except Exception as e:
+        print(f"[CAL] Failed to init QuantLib calendar: {e}; using weekday filter.")
+        return None
 
 # ---------- calendar helpers (QuantLib with safe fallback) ----------
 def _get_ql_calendar():
