@@ -1,46 +1,66 @@
-# ==== Cheap–Rich Daily Variant Sweeper ====
+# === Robust Cheap–Rich parameter sweeper (Daily cadence) ===
 # Put this in the same folder as cr_config.py and portfolio_test.py
+
+from __future__ import annotations
 from pathlib import Path
-import importlib, numpy as np, pandas as pd, matplotlib.pyplot as plt
+import itertools, random, importlib, json
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+
 import cr_config as cfg
 import portfolio_test as pt
 
-# --- months to test ---
-YYMMS = ["2304"]   # e.g., ["2304","2305"]
+# ------------------ USER INPUTS ------------------
+YYMMS = ["2304","2305"]         # <- choose several months for robustness
+RANDOMIZE   = True              # shuffle the variant order (nice if you interrupt)
+MAX_VARIANTS = 120              # cap to keep runtime reasonable
+SAVE_PREFIX = "sweep_results"   # files saved to PATH_OUT/<prefix>.parquet/.csv
+# -------------------------------------------------
 
-def _reload_all():
-    importlib.reload(cfg); importlib.reload(pt)
+# ---- Parameter grids (edit freely) ----
+GRID_FLY_MODE           = ["off", "loose", "tolerant", "strict"]
+GRID_FLY_ALLOW_BIG      = [False, True]
+GRID_FLY_BIG_MARGIN     = [0.4, 0.6]           # only when allow_big=True
+GRID_FLY_Z_MIN          = [0.3, 0.4, 0.6]
+GRID_FLY_WINDOW         = [1.0, 1.5, 2.5]
+GRID_FLY_NEIGH_ONLY     = [True]               # add False if you want global checks
+GRID_FLY_SKIP_SHORT     = [1.0, 2.0]           # yrs; 2.0 = skip <2y
+GRID_FLY_REQUIRE_COUNT  = [1, 2]               # for tolerant mode only
 
+GRID_Z_ENTRY            = [0.75, 0.9, 1.05]    # higher = fewer, higher-conviction
+GRID_Z_EXIT             = [0.35, 0.40, 0.45]   # lower = take profit sooner
+GRID_MAX_HOLD_DAYS      = [7, 10]
+GRID_SHORT_END_EXTRA_Z  = [0.20, 0.30, 0.40]
+# --------------------------------------
+
+# ---------- Safe reload & metrics ----------
 def _reload_pt_only():
     importlib.reload(pt)
 
-def _set_cfg(**kw):
-    for k, v in kw.items():
-        if hasattr(cfg, k):
-            setattr(cfg, k, v)
-
-# snapshot original config (so each variant starts clean)
 ORIG = {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
 
-def _apply_variant(overrides: dict):
-    # restore from ORIG in-memory (do NOT reload cfg from disk)
+def _apply_variant(v: dict):
+    # restore original config in-memory (do NOT reload cfg from disk)
     for k, val in ORIG.items():
-        try:
-            setattr(cfg, k, val)
-        except Exception:
-            pass
+        try: setattr(cfg, k, val)
+        except: pass
     # apply overrides in-memory
-    _set_cfg(**overrides)
-    # now reload portfolio_test so it re-imports constants from the mutated cfg object
+    for k, val in v.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, val)
+    # force portfolio_test to re-import constants from mutated cfg
     _reload_pt_only()
 
-def _metrics(pos, led, by):
+def _metrics(pos, led, by) -> dict:
     m = {}
-    n = len(pos) if pos is not None else 0
-    m["trades"] = int(n)
+    n = int(len(pos)) if pos is not None else 0
+    m["trades"] = n
     m["avg_pnl_per_trade"] = float(pos["pnl"].mean()) if n else np.nan
-    for r in ["reversion","max_hold","stop"]:
-        m[f"exit_{r}"] = int(pos["exit_reason"].value_counts().get(r,0)) if n else 0
+    if n:
+        c = pos["exit_reason"].value_counts()
+        for r in ["reversion","max_hold","stop"]:
+            m[f"exit_{r}"] = int(c.get(r, 0))
+    else:
+        m["exit_reversion"] = m["exit_max_hold"] = m["exit_stop"] = 0
     if by is not None and len(by):
         s = by.sort_values("bucket")["pnl"].astype(float).cumsum()
         m["cum_pnl"] = float(s.iloc[-1])
@@ -48,57 +68,91 @@ def _metrics(pos, led, by):
         m["max_drawdown"] = float(dd.max())
         pnl = by["pnl"].astype(float)
         m["pnl_mean"] = float(pnl.mean())
-        m["pnl_std"]  = float(pnl.std(ddof=1)) if len(pnl)>1 else np.nan
-        m["mean_over_std"] = float(m["pnl_mean"]/m["pnl_std"]) if m["pnl_std"] not in (0.0,np.nan) else np.nan
+        m["pnl_std"]  = float(pnl.std(ddof=1)) if len(pnl) > 1 else np.nan
+        m["mean_over_std"] = float(m["pnl_mean"]/m["pnl_std"]) if (m["pnl_std"] and not np.isnan(m["pnl_std"])) else np.nan
     else:
         m.update({"cum_pnl":0.0,"max_drawdown":0.0,"pnl_mean":np.nan,"pnl_std":np.nan,"mean_over_std":np.nan})
     return m
 
-VARIANTS = {
-    "A_baseline": {},
-    "B_no_big_waiver": {"FLY_ALLOW_BIG_ZDISP": False},
-    "C_no_big_waiver_lowZ": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4},
-    "D_no_big_waiver_lowZ_tightWindow": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5},
-    "E_strict_gate": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "FLY_MODE": "strict"},
-    "F_tighter_entry": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "Z_ENTRY": 0.9},
-    "G_faster_take_profit": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "Z_EXIT": 0.35},
-}
+# ---------- Build candidate set (with pruning) ----------
+def _variant_iter():
+    for (mode, allow_big, big_margin,
+         zmin, window, neigh_only, skip_short, req_cnt,
+         z_entry, z_exit, max_hold, short_extra) in itertools.product(
+        GRID_FLY_MODE, GRID_FLY_ALLOW_BIG, GRID_FLY_BIG_MARGIN,
+        GRID_FLY_Z_MIN, GRID_FLY_WINDOW, GRID_FLY_NEIGH_ONLY, GRID_FLY_SKIP_SHORT, GRID_FLY_REQUIRE_COUNT,
+        GRID_Z_ENTRY, GRID_Z_EXIT, GRID_MAX_HOLD_DAYS, GRID_SHORT_END_EXTRA_Z
+    ):
+        v = dict(
+            FLY_MODE=mode,
+            FLY_ALLOW_BIG_ZDISP=allow_big,
+            FLY_BIG_ZDISP_MARGIN=big_margin,
+            FLY_Z_MIN=zmin,
+            FLY_WINDOW_YEARS=window,
+            FLY_NEIGHBOR_ONLY=neigh_only,
+            FLY_SKIP_SHORT_UNDER=skip_short,
+            FLY_REQUIRE_COUNT=req_cnt,
+            Z_ENTRY=z_entry,
+            Z_EXIT=z_exit,
+            MAX_HOLD_DAYS=max_hold,
+            SHORT_END_EXTRA_Z=short_extra,
+        )
+        # Prune: fly params irrelevant when FLY_MODE='off'
+        if mode == "off":
+            if not (zmin == GRID_FLY_Z_MIN[0] and window == GRID_FLY_WINDOW[0] and skip_short == GRID_FLY_SKIP_SHORT[0]):
+                continue
+            v["FLY_ALLOW_BIG_ZDISP"] = False
+        # Prune: ignore extra margins when not allowing big waiver
+        if not allow_big and big_margin != GRID_FLY_BIG_MARGIN[0]:
+            continue
+        # Prune: req_cnt only matters for tolerant
+        if mode != "tolerant" and req_cnt != GRID_FLY_REQUIRE_COUNT[0]:
+            continue
+        yield v
 
-results = []
-variant_outputs = {}
+candidates = list(_variant_iter())
+if RANDOMIZE: random.shuffle(candidates)
+if MAX_VARIANTS and len(candidates) > MAX_VARIANTS:
+    candidates = candidates[:MAX_VARIANTS]
+print(f"[INFO] candidate variants: {len(candidates)}")
 
-for name, overrides in VARIANTS.items():
-    _apply_variant(overrides)
-    print(f"[RUN] {name} | MODE={cfg.FLY_MODE} | ALLOW_BIG={cfg.FLY_ALLOW_BIG_ZDISP} "
-          f"| Z_MIN={cfg.FLY_Z_MIN} | NEIGH_ONLY={cfg.FLY_NEIGHBOR_ONLY} "
-          f"| WINDOW={cfg.FLY_WINDOW_YEARS} | SKIP_SHORT<{cfg.FLY_SKIP_SHORT_UNDER} "
-          f"| Z_ENTRY={cfg.Z_ENTRY} | Z_EXIT={cfg.Z_EXIT}")
+# ---------- Run sweep ----------
+rows = []
+best = {"cum_pnl": -1e18}
+for i, variant in enumerate(candidates, 1):
+    print(f"\n[{i}/{len(candidates)}] {json.dumps(variant, sort_keys=True)}")
+    _apply_variant(variant)
     pos, led, by = pt.run_all(YYMMS)
-    results.append({"variant": name, **_metrics(pos, led, by)})
-    variant_outputs[name] = {"positions": pos, "ledger": led, "pnl_by": by}
+    m = _metrics(pos, led, by)
+    rows.append({**variant, **m})
+    if m["cum_pnl"] > best["cum_pnl"]:
+        best = {"cum_pnl": m["cum_pnl"], "variant": variant, "positions": pos, "ledger": led, "pnl_by": by}
 
 # restore original config
 _apply_variant({})
 
-df = (pd.DataFrame(results)
-        .set_index("variant")
-        .loc[:, ["trades","avg_pnl_per_trade","cum_pnl","max_drawdown",
-                 "exit_reversion","exit_max_hold","exit_stop","mean_over_std"]]
-        .sort_values("cum_pnl", ascending=False))
-display(df)
+df = pd.DataFrame(rows)
+df["score"] = df["cum_pnl"] - 0.25*df["max_drawdown"]
+df = df.sort_values(["score","cum_pnl"], ascending=[False, False]).reset_index(drop=True)
 
-# quick plot of cum PnL for a few variants (single month recommended)
+# Save & show
+out_dir = Path(cfg.PATH_OUT); out_dir.mkdir(parents=True, exist_ok=True)
+parq = out_dir / f"{SAVE_PREFIX}.parquet"
+csv  = out_dir / f"{SAVE_PREFIX}.csv"
+df.to_parquet(parq, index=False); df.to_csv(csv, index=False)
+display(df.head(25))
+print(f"[SAVE] {parq}\n[SAVE] {csv}")
+
+# Pareto-ish cloud: cum PnL vs max drawdown
 plt.figure()
-for name in ["A_baseline","B_no_big_waiver","D_no_big_waiver_lowZ_tightWindow","E_strict_gate"]:
-    by = variant_outputs[name]["pnl_by"]
-    if by is None or len(by)==0: continue
-    s = by.sort_values("bucket")["pnl"].astype(float).cumsum()
-    plt.plot(s.values, label=name)
-plt.title("Cumulative PnL per Variant (daily)")
-plt.xlabel("Decision steps"); plt.ylabel("Cum PnL")
-plt.legend(); plt.show()
+plt.scatter(df["max_drawdown"], df["cum_pnl"], s=10)
+plt.title("Variants: Cum PnL vs Max Drawdown"); plt.xlabel("Max Drawdown"); plt.ylabel("Cum PnL")
+plt.show()
 
-print("Tip: inspect `variant_outputs['E_strict_gate']['positions']` etc. for details.")
+# Best variant params saved for repro:
+with open(out_dir / f"{SAVE_PREFIX}_best.json", "w") as f:
+    json.dump(best["variant"], f, indent=2)
+print("Best variant:\n", json.dumps(best["variant"], indent=2))
 
 #analytics in general
 from pathlib import Path
