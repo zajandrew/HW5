@@ -1,3 +1,185 @@
+import os, sys, json, numpy as np, pandas as pd
+from pathlib import Path
+
+from cr_config import (
+    PATH_ENH, PATH_OUT,
+    DECISION_FREQ, MIN_SEP_YEARS, Z_ENTRY
+)
+
+os.makedirs(PATH_OUT, exist_ok=True)
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def _dispersion_ok(snap_last: pd.DataFrame, z_entry: float, min_sep_years: float) -> (bool, str, dict):
+    """
+    Decide if this bucket has at least one tradable pair under very simple rules:
+      - at least 2 tenors with separation >= MIN_SEP_YEARS
+      - z-dispersion (max-min) >= Z_ENTRY
+    Returns: (ok, reason, extras)
+    """
+    extras = {}
+    if snap_last.empty:
+        return False, "no_data", extras
+
+    ten = snap_last["tenor_yrs"].to_numpy()
+    if len(ten) < 2:
+        return False, "too_few_tenors", extras
+
+    ten_sorted = np.sort(ten)
+    if np.max(np.diff(ten_sorted)) < min_sep_years and (ten_sorted[-1]-ten_sorted[0] < min_sep_years):
+        # extremely conservative “sep blocker”: every pair too close
+        return False, "sep_blocker", extras
+
+    z = snap_last["z_comb"].astype(float).to_numpy()
+    if z.size == 0 or np.all(~np.isfinite(z)):
+        return False, "no_data", extras
+
+    z_rng = np.nanmax(z) - np.nanmin(z)
+    extras["z_range"] = _safe_float(z_rng)
+    if z_rng >= float(z_entry):
+        return True, "ok", extras
+    return False, "no_pair_meets_threshold", extras
+
+def _bucket_ts(df: pd.DataFrame, decision_freq: str) -> pd.Series:
+    if decision_freq.upper() == "D":
+        return df["ts"].dt.floor("D")
+    elif decision_freq.upper() == "H":
+        return df["ts"].dt.floor("H")
+    else:
+        raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
+
+def check_month(yymm: str) -> dict:
+    """Return a plain dict of numeric/string fields (safe for Parquet), also write a TXT report."""
+    path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    out_txt = Path(PATH_OUT) / f"diag_{yymm}.txt"
+
+    if not path.exists():
+        msg = f"[WARN] missing enhanced file: {path}"
+        print(msg)
+        out_txt.write_text(msg)
+        return {
+            "yymm": yymm, "rows": 0, "dec": 0, "medTenors": np.nan,
+            "zmin": np.nan, "zp50": np.nan, "zp90": np.nan, "zmax": np.nan,
+            "ok_samples": 0,
+            "n_no_data": 0, "n_too_few_tenors": 0, "n_no_pair_meets_threshold": 0, "n_sep_blocker": 0, "n_ok": 0
+        }
+
+    df = pd.read_parquet(path)
+    if df.empty:
+        out_txt.write_text(f"[WARN] empty enhanced file: {path}")
+        return {
+            "yymm": yymm, "rows": 0, "dec": 0, "medTenors": np.nan,
+            "zmin": np.nan, "zp50": np.nan, "zp90": np.nan, "zmax": np.nan,
+            "ok_samples": 0,
+            "n_no_data": 0, "n_too_few_tenors": 0, "n_no_pair_meets_threshold": 0, "n_sep_blocker": 0, "n_ok": 0
+        }
+
+    # Type hygiene
+    df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
+    df = df.dropna(subset=["ts", "tenor_yrs", "z_comb"])
+    if df.empty:
+        out_txt.write_text(f"[WARN] all NaN after basic hygiene: {path}")
+        return {
+            "yymm": yymm, "rows": 0, "dec": 0, "medTenors": np.nan,
+            "zmin": np.nan, "zp50": np.nan, "zp90": np.nan, "zmax": np.nan,
+            "ok_samples": 0,
+            "n_no_data": 0, "n_too_few_tenors": 0, "n_no_pair_meets_threshold": 0, "n_sep_blocker": 0, "n_ok": 0
+        }
+
+    df["bucket"] = _bucket_ts(df, DECISION_FREQ)
+
+    # Per-bucket last tick per tenor
+    reasons = {"no_data":0, "too_few_tenors":0, "no_pair_meets_threshold":0, "sep_blocker":0, "ok":0}
+    z_ranges = []
+    ok_samples = 0
+    decisions = 0
+    tenors_per_bucket = []
+
+    for bkt, snap in df.groupby("bucket", sort=True):
+        decisions += 1
+        snap_last = (snap.sort_values("ts")
+                          .groupby("tenor_yrs", as_index=False)
+                          .tail(1)[["tenor_yrs","rate","z_comb"]]
+                          .dropna(subset=["tenor_yrs","z_comb"]))
+        tenors_per_bucket.append(snap_last["tenor_yrs"].nunique())
+
+        ok, reason, extras = _dispersion_ok(snap_last, Z_ENTRY, MIN_SEP_YEARS)
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if "z_range" in extras and np.isfinite(extras["z_range"]):
+            z_ranges.append(extras["z_range"])
+        if ok:
+            ok_samples += 1
+
+    # summarize z stats
+    z_ranges = np.array(z_ranges, dtype=float)
+    zmin = _safe_float(np.nanmin(z_ranges)) if z_ranges.size else np.nan
+    zp50 = _safe_float(np.nanpercentile(z_ranges, 50)) if z_ranges.size else np.nan
+    zp90 = _safe_float(np.nanpercentile(z_ranges, 90)) if z_ranges.size else np.nan
+    zmax = _safe_float(np.nanmax(z_ranges)) if z_ranges.size else np.nan
+
+    medTen = _safe_float(np.nanmedian(np.array(tenors_per_bucket))) if tenors_per_bucket else np.nan
+
+    # Write a small human-readable TXT
+    lines = []
+    lines.append(f"[DIAG] {yymm}")
+    lines.append(f"path: {path}")
+    lines.append(f"rows: {len(df)}")
+    lines.append(f"decisions: {decisions} | median tenors: {medTen}")
+    lines.append(f"z_range min/p50/p90/max: {zmin:.4f}/{zp50:.4f}/{zp90:.4f}/{zmax:.4f}" if np.isfinite(zp50) else "z_range: (no valid buckets)")
+    lines.append(f"reasons: {json.dumps(reasons)}")
+    lines.append(f"ok_samples: {ok_samples}")
+    out_txt.write_text("\n".join(lines))
+
+    # Return a parquet-safe dict (no tuples/dicts)
+    return {
+        "yymm": str(yymm),
+        "rows": int(len(df)),
+        "dec": int(decisions),
+        "medTenors": _safe_float(medTen),
+        "zmin": _safe_float(zmin),
+        "zp50": _safe_float(zp50),
+        "zp90": _safe_float(zp90),
+        "zmax": _safe_float(zmax),
+        "ok_samples": int(ok_samples),
+        "n_no_data": int(reasons.get("no_data",0)),
+        "n_too_few_tenors": int(reasons.get("too_few_tenors",0)),
+        "n_no_pair_meets_threshold": int(reasons.get("no_pair_meets_threshold",0)),
+        "n_sep_blocker": int(reasons.get("sep_blocker",0)),
+        "n_ok": int(reasons.get("ok",0)),
+    }
+
+def main():
+    yymms = sys.argv[1:] if len(sys.argv) > 1 else []
+    if not yymms:
+        print("Usage: python diag_backtest.py 2304 [2305 2306 ...]")
+        sys.exit(0)
+
+    rows = []
+    print(f"[INFO] months: {len(yymms)} -> {yymms}")
+    for y in yymms:
+        print(f"[RUN] {y}")
+        rec = check_month(y)
+        rows.append(rec)
+        print(f"[DONE] {y} | ok_samples={rec['ok_samples']}")
+
+    df_out = pd.DataFrame(rows)
+
+    # Ensure pyarrow-safe dtypes (no objects except strings)
+    for c in df_out.columns:
+        if df_out[c].dtype == "object":
+            df_out[c] = df_out[c].astype(str)
+
+    out_parq = Path(PATH_OUT) / "diag_summary.parquet"
+    df_out.to_parquet(out_parq, index=False)
+    print(f"[SAVE] {out_parq}")
+
+if __name__ == "__main__":
+    main()
+
 # 1️⃣ Check that every day has all 28 tenors
 daily_counts = df.groupby(df["ts"].dt.floor("D"))["tenor_yrs"].nunique()
 print(daily_counts.describe())
