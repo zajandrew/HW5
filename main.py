@@ -1,4 +1,15 @@
+# 1️⃣ Check that every day has all 28 tenors
+daily_counts = df.groupby(df["ts"].dt.floor("D"))["tenor_yrs"].nunique()
+print(daily_counts.describe())
 
+# 2️⃣ Confirm no missing z_comb values
+print(df["z_comb"].isna().mean())
+
+# 3️⃣ Plot an arbitrary day for shape sanity
+for d in ["2023-04-04", "2023-04-12", "2023-04-20"]:
+    snap = df[df["ts"].dt.date.astype(str) == d]
+    plt.plot(snap["tenor_yrs"], snap["z_comb"], label=d)
+plt.legend(); plt.show()
 
 def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
     """
