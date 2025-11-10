@@ -1,3 +1,44 @@
+def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
+    """
+    Robust application of a previously-fitted PCA model to one decision bucket.
+    - Chooses the LAST tick per tenor inside the bucket
+    - Aligns strictly to model['cols'] (both set & order)
+    - Returns a Series of standardized reconstructed scores mapped to df_block rows
+    """
+    out = pd.Series(index=df_block.index, dtype=float)
+    if not pca_model or df_block.empty:
+        return out
+
+    cols  = list(pca_model["cols"])
+    mu    = np.asarray(pca_model["mean"], dtype=float)
+    comps = np.asarray(pca_model["components"], dtype=float)
+
+    # Last observation per tenor in this bucket
+    # (guards against multiple ticks per tenor within the bucket)
+    last = (df_block.sort_values("ts")
+                     .groupby("tenor_yrs", as_index=False)
+                     .tail(1)
+                     .set_index("tenor_yrs")["rate"])
+    # Align to model cols (exact set + order)
+    if any(c not in last.index for c in cols):
+        # Missing a required tenor → skip PCA for this bucket
+        return out
+
+    x = last.reindex(cols).values.astype(float)   # shape (n_features,)
+    xc = x - mu                                   # center
+    score = comps @ xc                            # (k,)
+    recon = comps.T @ score                       # (n_features,)
+
+    # Standardize reconstruction across features for a z-like shape
+    sd = recon.std()
+    if not np.isfinite(sd) or sd == 0:
+        return out
+    z_std = (recon - recon.mean()) / sd
+
+    # Map back to tenor_yrs, then to the original df_block rows
+    z_map = dict(zip(cols, z_std))
+    return df_block["tenor_yrs"].map(z_map)
+
 def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     """Filter to business days (QuantLib if available) + local trading hours."""
     if df_wide.empty:
