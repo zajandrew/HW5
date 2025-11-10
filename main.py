@@ -11,6 +11,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
 from cr_config import (
     # paths / runtime
     PATH_ENH, PATH_OUT, DECISION_FREQ,
@@ -18,8 +23,13 @@ from cr_config import (
     # selection sanity
     MIN_SEP_YEARS, Z_ENTRY,
 
+    # capacity & buckets (needed for caps_feasible logic)
+    BUCKETS,
+    PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP,
+    SHORT_END_EXTRA_Z,
+
     # fly-gate (tolerant) knobs
-    FLY_ENABLE,          # bool (rename of FLY_GATE_ENABLE)
+    FLY_ENABLE,          # master on/off
     FLY_MODE,            # "off" | "loose" | "tolerant" | "strict"
     FLY_DEFS,            # list of (a,b,c) tenors
     FLY_Z_MIN,           # min |fly z| to count
@@ -159,10 +169,8 @@ def analyze_month(yymm: str) -> pd.DataFrame:
     else:
         raise ValueError("DECISION_FREQ must be 'D' or 'H'")
 
-    # results per decision bucket
     rows = []
     for dts, snap in df.groupby("decision_ts", sort=True):
-        # last tick per tenor in bucket
         snap_last = (snap.sort_values("ts")
                          .groupby("tenor_yrs", as_index=False)
                          .tail(1)
@@ -172,9 +180,9 @@ def analyze_month(yymm: str) -> pd.DataFrame:
             "n_tenors": int(snap_last.shape[0]),
             "z_min": np.nan, "z_p50": np.nan, "z_p90": np.nan, "z_max": np.nan,
             "z_range": np.nan,
-            "stage": "init",                     # where it failed (or 'ok')
+            "stage": "init",
             "cand_pairs": 0, "cand_after_fly": 0,
-            "caps_feasible": np.nan,             # can any one neutral pair pass caps?
+            "caps_feasible": np.nan,
             "why": ""
         }
 
@@ -182,7 +190,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
             rec["stage"] = "no_data"
             rows.append(rec); continue
 
-        # basic distrib
         z = snap_last["z_comb"].astype(float).to_numpy()
         rec["z_min"] = np.nanmin(z) if z.size else np.nan
         rec["z_p50"] = np.nanpercentile(z, 50) if z.size else np.nan
@@ -190,7 +197,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
         rec["z_max"] = np.nanmax(z) if z.size else np.nan
         rec["z_range"] = (rec["z_max"] - rec["z_min"]) if (np.isfinite(rec["z_max"]) and np.isfinite(rec["z_min"])) else np.nan
 
-        # tenor separation quick check
         ten = snap_last["tenor_yrs"].astype(float).sort_values().to_numpy()
         if len(ten) < 2:
             rec["stage"] = "too_few_tenors"; rows.append(rec); continue
@@ -198,17 +204,14 @@ def analyze_month(yymm: str) -> pd.DataFrame:
         if not sep_ok:
             rec["stage"] = "sep_blocker"; rows.append(rec); continue
 
-        # entry threshold feasibility (ignoring fly and caps)
         if not (np.isfinite(rec["z_range"]) and rec["z_range"] >= Z_ENTRY):
-            rec["stage"] = "z_bar_not_met"  # global cross-sec bar already too low
+            rec["stage"] = "z_bar_not_met"
             rows.append(rec); continue
 
-        # enumerate candidate pairs (extremes) & test fly
         sig = snap_last[["tenor_yrs","rate","z_comb"]].dropna().sort_values("z_comb")
         L = len(sig)
         cand = 0; cand_fly = 0
         fly_kill = 0
-        # also test minimal caps feasibility using the strongest pair (max zdisp)
         best_caps_feasible = False
 
         for k_low in range(min(6, L)):
@@ -223,9 +226,9 @@ def analyze_month(yymm: str) -> pd.DataFrame:
                     continue
                 cand += 1
 
-                # fly
-                ok_i = fly_alignment_ok(t_i, +1, snap_last)
-                ok_j = fly_alignment_ok(t_j, -1, snap_last)
+                # >>> CHANGED: pass zdisp_for_pair=zdisp <<<
+                ok_i = fly_alignment_ok(t_i, +1, snap_last, zdisp_for_pair=zdisp)
+                ok_j = fly_alignment_ok(t_j, -1, snap_last, zdisp_for_pair=zdisp)
                 if not (ok_i and ok_j):
                     fly_kill += 1
                     continue
@@ -251,7 +254,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
 
                 pair_ok = per_bucket_ok and fe_ok and total_ok
 
-                # extra short-end hurdle check (for info)
                 if (b_i=="short" or b_j=="short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
                     pair_ok = False
 
@@ -261,7 +263,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
         rec["cand_after_fly"] = cand_fly
         rec["caps_feasible"] = bool(best_caps_feasible)
 
-        # Decide final stage tag
         if cand == 0:
             rec["stage"] = "no_pair_meets_threshold"
         elif cand_fly == 0:
@@ -274,7 +275,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
         rows.append(rec)
 
     out = pd.DataFrame(rows).sort_values("decision_ts")
-    # write both CSV + TXT month summary
     csv_path = Path(PATH_OUT) / f"diag_selector_{yymm}.csv"
     out.to_csv(csv_path, index=False)
 
@@ -301,34 +301,6 @@ def analyze_month(yymm: str) -> pd.DataFrame:
     print(f"[SAVE] {csv_path}")
     print(f"[SAVE] {txt_path}")
     return out
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python diag_selector.py 2304 [2305 2306 ...]")
-        sys.exit(1)
-
-    months = sys.argv[1:]
-    all_df = []
-    all_txt = []
-
-    for y in months:
-        df = analyze_month(y)
-        if not df.empty:
-            df["month"] = y
-            all_df.append(df)
-            ok_ratio = (df["stage"] == "ok").mean() * 100
-            all_txt.append(f"{y}: ok={ok_ratio:.1f}% decisions | {df['stage'].value_counts().to_dict()}")
-
-    if all_df:
-        combined = pd.concat(all_df, ignore_index=True)
-        combined_path = Path(PATH_OUT) / "diag_selector_all.csv"
-        combined.to_csv(combined_path, index=False)
-        print(f"[SAVE] combined CSV: {combined_path}")
-
-        txt_path = Path(PATH_OUT) / "diag_selector_all.txt"
-        with open(txt_path, "w") as f:
-            f.write("\n".join(all_txt))
-        print(f"[SAVE] combined TXT: {txt_path}")
 
 # cr_config.py
 from zoneinfo import ZoneInfo
@@ -1196,52 +1168,48 @@ def fly_alignment_ok(
     *,
     zdisp_for_pair: float | None = None
 ) -> bool:
-    from cr_config import (
-        FLY_ENABLE, FLY_MODE, FLY_Z_MIN, FLY_NEIGHBOR_ONLY, FLY_WINDOW_YEARS,
-        FLY_REQUIRE_COUNT, FLY_SKIP_SHORT_UNDER, FLY_ALLOW_BIG_ZDISP, FLY_BIG_ZDISP_MARGIN,
-        FLY_DEFS, Z_ENTRY
-    )
-
-    if not FLY_ENABLE or FLY_MODE == "off":
+    # Respect global config already imported at top of file
+    if not FLY_ENABLE or (FLY_MODE or "tolerant").lower() == "off":
         return True
 
-    # Big dispersion → don't block
-    if (FLY_ALLOW_BIG_ZDISP and zdisp_for_pair is not None and
-        float(zdisp_for_pair) >= float(Z_ENTRY) + float(FLY_BIG_ZDISP_MARGIN)):
+    # Big dispersion waiver
+    if (
+        FLY_ALLOW_BIG_ZDISP
+        and (zdisp_for_pair is not None)
+        and (float(zdisp_for_pair) >= float(Z_ENTRY) + float(FLY_BIG_ZDISP_MARGIN))
+    ):
         return True
 
     # Skip very short end if requested
-    if FLY_SKIP_SHORT_UNDER is not None and leg_tenor < float(FLY_SKIP_SHORT_UNDER):
+    if (FLY_SKIP_SHORT_UNDER is not None) and (leg_tenor < float(FLY_SKIP_SHORT_UNDER)):
         return True
 
-    # Choose triplets
+    # Choose triplets: optionally only flies whose CENTER tenor b is near this leg
     triplets = FLY_DEFS
+    mode = (FLY_MODE or "tolerant").lower()
     if FLY_NEIGHBOR_ONLY:
         W = float(FLY_WINDOW_YEARS)
-        lo, hi = leg_tenor - W, leg_tenor + W
-        triplets = [(a,b,c) for (a,b,c) in FLY_DEFS if (a>=lo and c<=hi)]
-        if not triplets:  # no local flies → don't block
+        triplets = [(a, b, c) for (a, b, c) in FLY_DEFS if abs(float(b) - float(leg_tenor)) <= W]
+        if not triplets:
+            # no local flies to contradict → do not block
             return True
 
     # Count strong contradictions
-    opp, align = 0, 0
-    for (a,b,c) in triplets:
-        fz = compute_fly_z(snap_last, a,b,c)
-        if fz is None or abs(fz) < float(FLY_Z_MIN):
+    contradictions = 0
+    for (a, b, c) in triplets:
+        fz = compute_fly_z(snap_last, float(a), float(b), float(c))
+        if fz is None or not np.isfinite(fz) or abs(fz) < float(FLY_Z_MIN):
             continue
-        s = np.sign(fz) * np.sign(leg_sign_z)
-        if s > 0:      # contradicts expected reversion
-            opp += 1
-        elif s < 0:    # aligns with expected reversion
-            align += 1
+        # CONTRADICTION when product is negative
+        if np.sign(fz) * np.sign(leg_sign_z) < 0:
+            contradictions += 1
 
-    mode = (FLY_MODE or "tolerant").lower()
     if mode == "strict":
-        return opp == 0
+        return contradictions == 0
     if mode == "loose":
-        return opp < 1
+        return contradictions < 1
     if mode == "tolerant":
-        return opp < int(FLY_REQUIRE_COUNT)
+        return contradictions < int(FLY_REQUIRE_COUNT)
     return True
 
 # ------------------------
@@ -1452,8 +1420,14 @@ def run_month(yymm: str, decision_freq: str = DECISION_FREQ):
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
 
-    # How many decisions before MAX_HOLD_DAYS is reached?
-    max_hold_decisions = MAX_HOLD_DAYS * (1 if decision_freq.upper() == "D" else 24)
+    # After you create df["decision_ts"], only once per month:
+    if decision_freq.upper() == "H":
+        per_day_counts = df.groupby(df["decision_ts"].dt.floor("D"))["decision_ts"].nunique()
+        decisions_per_day = int(per_day_counts.mean()) if len(per_day_counts) else 24
+    else:
+        decisions_per_day = 1
+    
+    max_hold_decisions = MAX_HOLD_DAYS * decisions_per_day
 
     # Iterate decisions in time order
     for dts, snap in df.groupby("decision_ts", sort=True):
