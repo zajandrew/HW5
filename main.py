@@ -1,3 +1,437 @@
+
+# feature_creation.py
+from __future__ import annotations
+import os, time
+from pathlib import Path
+from typing import Dict, Optional
+
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from sklearn.decomposition import PCA
+
+# ==== import your config (exact names as in cr_config.py) ====
+from cr_config import (
+    PATH_DATA, PATH_ENH,
+    TENOR_YEARS,
+    TRADING_HOURS,           # e.g. ("10:00","22:10")
+    DECISION_FREQ,           # 'D' or 'H'
+    PCA_COMPONENTS,          # int
+    PCA_LOOKBACK_DAYS,       # int
+)
+
+# Optional knobs (provide sensible defaults if not present in cr_config)
+try:
+    PCA_ENABLE = PCA_ENABLE           # type: ignore[name-defined]
+except NameError:
+    PCA_ENABLE = True
+
+try:
+    N_JOBS = N_JOBS                    # type: ignore[name-defined]
+except NameError:
+    N_JOBS = 0                         # 0 = auto (conservative)
+
+# For hourly mode, convert days→hours but cap to keep fits tractable
+# (You can lift this cap if your box is beefy.)
+PCA_LOOKBACK_CAP_HOURS = 24 * 14  # 2 weeks
+
+def _effective_pca_lookback() -> int:
+    if DECISION_FREQ == 'D':
+        return max(1, int(PCA_LOOKBACK_DAYS))
+    # hourly
+    hours = int(PCA_LOOKBACK_DAYS) * 24
+    return max(1, min(hours, PCA_LOOKBACK_CAP_HOURS))
+
+# ===================== utils =====================
+
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
+
+def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
+    ts = pd.to_datetime(ts, errors="coerce")
+    if freq == 'D':
+        return ts.dt.floor("D")
+    if freq == 'H':
+        return ts.dt.floor("H")
+    raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
+
+def _to_ts_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with a 'ts' column (coerced to datetime)."""
+    out = df.copy()
+    if 'ts' in out.columns:
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    idxn = getattr(out.index, "name", None)
+    if idxn in ('ts', 'sec'):
+        out = out.reset_index().rename(columns={idxn: 'ts'})
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    if isinstance(out.index, pd.DatetimeIndex):
+        out = out.reset_index().rename(columns={'index':'ts'})
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    # last resort
+    out = out.reset_index().rename(columns={'index':'ts'})
+    out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+    return out
+
+def _apply_trading_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """If TRADING_HOURS is set, slice intraday window. Assumes naive UTC timestamps."""
+    if not TRADING_HOURS or len(TRADING_HOURS) != 2:
+        return df
+    try:
+        return (df.set_index('ts')
+                  .between_time(TRADING_HOURS[0], TRADING_HOURS[1])
+                  .reset_index())
+    except Exception:
+        # If index isn't time-like, just return df
+        return df
+
+def _zeros_to_nan(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert placeholder zeros to NaN only when the column has non-zero values elsewhere."""
+    out = df.copy()
+    for c in out.columns:
+        if c == 'ts':
+            continue
+        s = pd.to_numeric(out[c], errors='coerce')
+        if (s == 0).any() and (s != 0).any():
+            s = s.mask(s == 0, np.nan)
+        out[c] = s
+    return out
+
+def _melt_long(df_wide: pd.DataFrame, tenormap: Dict[str, float]) -> pd.DataFrame:
+    """Select columns present in TENOR_YEARS, melt to long: ['ts','tenor_yrs','rate']."""
+    cols = [c for c in df_wide.columns if c in tenormap]
+    if not cols:
+        raise ValueError("No overlapping tickers between input file and TENOR_YEARS.")
+    long = df_wide[['ts'] + cols].melt('ts', var_name='instrument', value_name='rate')
+    long['tenor_yrs'] = long['instrument'].map(tenormap).astype(float)
+    long = long.dropna(subset=['ts','tenor_yrs'])
+    # Ensure numeric rates
+    long['rate'] = pd.to_numeric(long['rate'], errors='coerce')
+    long = long.dropna(subset=['rate'])
+    return long[['ts','tenor_yrs','rate']]
+
+# ---------------- curve spline (per snapshot) ----------------
+
+def _fit_spline_guarded(x: np.ndarray, y: np.ndarray, k: int = 3):
+    """Return callable f(t) producing fitted curve; robust fallbacks if spline fails."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 3:
+        if x.size < 2:
+            return lambda t: np.full_like(np.asarray(t, float), np.nan, dtype=float)
+        a, b = np.polyfit(x, y, 1)
+        return lambda t: a * np.asarray(t, float) + b
+    try:
+        from scipy.interpolate import UnivariateSpline
+        s = max(1e-8, 0.5 * x.size * np.nanvar(y))
+        spl = UnivariateSpline(x, y, k=min(k, max(1, x.size-1)), s=s, ext=3)
+        return lambda t: spl(np.asarray(t, float))
+    except Exception:
+        deg = min(2, max(1, x.size - 1))
+        coefs = np.polyfit(x, y, deg)
+        poly = np.poly1d(coefs)
+        return lambda t: poly(np.asarray(t, float))
+
+def _zscore_xsec(vals: pd.Series) -> pd.Series:
+    v = pd.to_numeric(vals, errors="coerce")
+    mu = v.mean(skipna=True)
+    sd = v.std(skipna=True, ddof=1)
+    if not np.isfinite(sd) or sd <= 0:
+        return pd.Series(np.nan, index=v.index)
+    return (v - mu) / sd
+
+# ---------------- PCA over lookback window ----------------
+
+def _pca_z_for_bucket(bucket_df: pd.DataFrame,
+                      last_snap: pd.DataFrame,
+                      n_comps: int,
+                      verbose_note: str = "") -> pd.Series:
+    """
+    Fit PCA on time×tenor matrix (lookback window).
+    Return z-score of the standardized residual vector for the last row.
+    """
+    mat = (bucket_df
+           .pivot_table(index='ts', columns='tenor_yrs', values='rate', aggfunc='last')
+           .sort_index())
+    # require some depth and breadth
+    if mat.shape[0] < 12 or mat.shape[1] < 3:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    # keep tenors with good coverage
+    keep = mat.columns[mat.notna().mean() > 0.9]
+    mat = mat[keep]
+    if mat.shape[1] < 3:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    mat = mat.fillna(method='ffill').dropna(axis=0, how='any')
+    if mat.shape[0] < 8:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    # standardize by tenor across time
+    mat_std = (mat - mat.mean(axis=0)) / mat.std(axis=0, ddof=0)
+    mat_std = mat_std.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how='any')
+    if mat_std.shape[0] < 8:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    try:
+        k = min(int(n_comps), mat_std.shape[1])
+        model = PCA(n_components=k, svd_solver='auto', random_state=0)
+        scores = model.fit_transform(mat_std.values)
+        evr = getattr(model, "explained_variance_ratio_", None)
+        if evr is not None:
+            print(f"[{_now()}] [PCA] {verbose_note} rows={mat_std.shape[0]} cols={mat_std.shape[1]} "
+                  f"EVR={np.round(evr[:k],3)}")
+
+        last_row = mat_std.iloc[-1].values
+        comps = model.components_
+        proj = comps @ (comps.T @ last_row)
+        resid_std = last_row - proj
+        resid_std_s = pd.Series(resid_std, index=mat_std.columns)
+
+        rs = resid_std_s.reindex(last_snap['tenor_yrs'].values)
+        return _zscore_xsec(rs)
+    except Exception as e:
+        print(f"[{_now()}] [WARN] PCA failed ({verbose_note}): {e}")
+        return pd.Series(np.nan, index=last_snap.index)
+
+# ---------------- combiner ----------------
+
+def _combine_z_safe(df_block: pd.DataFrame) -> pd.DataFrame:
+    out = df_block.copy()
+    if "z_pca" not in out.columns:    out["z_pca"] = np.nan
+    if "z_spline" not in out.columns: out["z_spline"] = np.nan
+    zp = pd.to_numeric(out["z_pca"], errors="coerce")
+    zs = pd.to_numeric(out["z_spline"], errors="coerce")
+    out["z_comb"] = np.where(np.isfinite(zp), zp, zs)
+    return out
+
+# ===================== per-bucket process =====================
+
+def _process_bucket(dts: pd.Timestamp,
+                    df_bucket: pd.DataFrame,
+                    df_all: pd.DataFrame,
+                    lookback_buckets: int,
+                    pca_enable: bool,
+                    pca_n_comps: int,
+                    yymm: str) -> pd.DataFrame:
+    # last snapshot per tenor
+    snap_last = (df_bucket.sort_values('ts')
+                 .groupby('tenor_yrs', as_index=False)
+                 .tail(1)
+                 .dropna(subset=['tenor_yrs','rate']))
+    if snap_last.empty:
+        return pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb'])
+
+    # spline residual z
+    f = _fit_spline_guarded(snap_last['tenor_yrs'].values, snap_last['rate'].values)
+    fit_vals = f(snap_last['tenor_yrs'].values)
+    spline_resid = pd.Series(snap_last['rate'].values - fit_vals, index=snap_last.index)
+    z_spline = _zscore_xsec(spline_resid)
+
+    # PCA residual z (time-series over lookback buckets)
+    z_pca = pd.Series(np.nan, index=snap_last.index)
+    if pca_enable:
+        uniq = sorted(df_all['decision_ts'].dropna().unique())
+        try:
+            pos = uniq.index(dts)
+        except ValueError:
+            pos = None
+        if pos is not None:
+            lo = max(0, pos - (lookback_buckets - 1))
+            win = uniq[lo:pos+1]
+            mask = df_all['decision_ts'].isin(win)
+            z_pca = _pca_z_for_bucket(
+                bucket_df=df_all.loc[mask, ['ts','tenor_yrs','rate']],
+                last_snap=snap_last[['tenor_yrs','rate']],
+                n_comps=pca_n_comps,
+                verbose_note=f"{yymm} {str(dts)}"
+            )
+
+    out = snap_last[['ts','tenor_yrs','rate']].copy()
+    out['z_spline'] = z_spline.values
+    out['z_pca'] = z_pca.values
+    out = _combine_z_safe(out)
+    out['ts'] = dts  # collapse to decision timestamp
+    return out
+
+# ===================== month runner =====================
+
+def build_month(yymm: str) -> None:
+    in_path  = Path(PATH_DATA) / f"{yymm}.parquet"
+    out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Missing raw month file: {in_path}")
+
+    # Load wide
+    df_wide = pd.read_parquet(in_path)
+    df_wide = _to_ts_index(df_wide)
+    df_wide = df_wide.sort_values('ts')
+    # drop duplicated timestamps (keep last)
+    df_wide = df_wide[~df_wide['ts'].duplicated(keep='last')]
+
+    # Optional intraday slice
+    df_wide = _apply_trading_hours(df_wide)
+
+    # zeros->NaN & numeric coercion
+    df_wide = _zeros_to_nan(df_wide)
+
+    # Wide -> long with tenor mapping
+    df_long = _melt_long(df_wide, TENOR_YEARS)
+
+    # Decision buckets
+    df_long['decision_ts'] = _decision_key(df_long['ts'], DECISION_FREQ)
+
+    buckets = list(df_long['decision_ts'].dropna().unique())
+    buckets.sort()
+
+    # jobs
+    if N_JOBS == 0:
+        import multiprocessing as mp
+        jobs = max(1, min((mp.cpu_count() // 2), 8))
+    else:
+        jobs = int(N_JOBS)
+
+    lookback_buckets = _effective_pca_lookback()
+
+    print(f"[{_now()}] [MONTH] {yymm} | buckets={len(buckets)} freq={DECISION_FREQ} "
+          f"| jobs={jobs} | PCA={'on' if PCA_ENABLE else 'off'} "
+          f"| lookback={lookback_buckets} | comps={PCA_COMPONENTS}")
+
+    if len(buckets) == 0:
+        print(f"[WARN] {yymm}: no buckets found.")
+        pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']).to_parquet(out_path, index=False)
+        print(f"[SAVE] {out_path}")
+        return
+
+    def _one_bucket(dts):
+        snap = df_long[df_long['decision_ts'] == dts]
+        t0 = time.time()
+        out = _process_bucket(
+            dts=dts,
+            df_bucket=snap,
+            df_all=df_long[['ts','tenor_yrs','rate','decision_ts']],
+            lookback_buckets=lookback_buckets,
+            pca_enable=PCA_ENABLE,
+            pca_n_comps=int(PCA_COMPONENTS),
+            yymm=yymm
+        )
+        dt = time.time() - t0
+        print(f"[BUCKET] {yymm} {dts} rows:{len(snap):,} tenors:{snap['tenor_yrs'].nunique()} "
+              f"PCA:{'yes' if out['z_pca'].notna().any() else 'no '} t={dt:.2f}s")
+        return out
+
+    parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one_bucket)(dts) for dts in buckets)
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb'])
+    out = out.sort_values(['ts','tenor_yrs']).reset_index(drop=True)
+
+    # quick month diagnostics
+    zr = pd.to_numeric(out['z_comb'], errors='coerce')
+    z_valid_pct = float(np.isfinite(zr).mean() * 100.0)
+    med_ten = out.groupby('ts')['tenor_yrs'].nunique().median() if not out.empty else 0
+    print(f"[DONE] {yymm} rows:{len(out):,} tenors_med:{med_ten:.1f} z_valid%:{z_valid_pct:.2f}")
+
+    out.to_parquet(out_path, index=False)
+    print(f"[SAVE] {out_path}")
+
+# ===================== CLI =====================
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python feature_creation.py 2304 [2305 2306 ...]")
+        raise SystemExit(1)
+    for yymm in sys.argv[1:]:
+        build_month(yymm)
+
+# cr_config.py
+from zoneinfo import ZoneInfo
+from pathlib import Path
+
+Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
+Path(PATH_MODELS).mkdir(parents=True, exist_ok=True)
+Path(PATH_OUT).mkdir(parents=True, exist_ok=True)
+
+# ========= Session =========
+TRADING_HOURS = ("10:00", "22:10")   # optional slice intraday when building features (UTC-naive index)
+CHI = ZoneInfo("America/Chicago")
+
+# ========= Instruments (explicit) =========
+# Provide your exact mapping (instrument root WITHOUT "_mid" -> tenor years).
+TENOR_YEARS = {
+    "USOSFRA BGN Curncy": 1/12,   "USOSFRB BGN Curncy": 2/12,   "USOSFRC BGN Curncy": 3/12,
+    "USOSFRD BGN Curncy": 4/12,   "USOSFRE BGN Curncy": 5/12,   "USOSFRF BGN Curncy": 6/12,
+    "USOSFRG BGN Curncy": 7/12,   "USOSFRH BGN Curncy": 8/12,   "USOSFRI BGN Curncy": 9/12,
+    "USOSFRJ BGN Curncy": 10/12,  "USOSFRK BGN Curncy": 11/12,  "USOSFR1 BGN Curncy": 1,
+    "USOSFR1F BGN Curncy": 18/12, "USOSFR2 BGN Curncy": 2,      "USOSFR3 BGN Curncy": 3,
+    "USOSFR4 BGN Curncy": 4,      "USOSFR5 BGN Curncy": 5,      "USOSFR6 BGN Curncy": 6,
+    "USOSFR7 BGN Curncy": 7,      "USOSFR8 BGN Curncy": 8,      "USOSFR9 BGN Curncy": 9,
+    "USOSFR10 BGN Curncy": 10,    "USOSFR12 BGN Curncy": 12,    "USOSFR15 BGN Curncy": 15,
+    "USOSFR20 BGN Curncy": 20,    "USOSFR25 BGN Curncy": 25,    "USOSFR30 BGN Curncy": 30,
+    "USOSFR40 BGN Curncy": 40,
+}
+
+# ========= (Optional) Calendar filtering =========
+# Not used by the current feature builder/backtest; keep for later.
+USE_QL_CALENDAR = True
+QL_US_MARKET    = "FederalReserve"
+CAL_TZ          = "America/New_York"
+
+# ========= Feature (builder) settings =========
+# PCA trained on a rolling panel built at the chosen decision frequency (D/H).
+PCA_COMPONENTS     = 3         # number of components to keep
+PCA_LOOKBACK_DAYS  = 126       # original setting (≈ 6 months of trading days)
+
+# Decision frequency for BOTH feature buckets and the backtest layer
+DECISION_FREQ      = 'D'       # 'D' (daily) or 'H' (hourly)
+
+# Enable/disable PCA; when disabled we still compute spline residuals and z_comb will fallback.
+PCA_ENABLE         = True
+
+# Parallelism for feature creation (0 = auto ~ half the cores up to a small cap)
+N_JOBS             = 0
+
+# ---- Derived: convert day lookback to "bucket" lookback used by the builder
+# If daily, 126 days means 126 buckets.
+# If hourly, we expand to hours but cap to avoid huge fits (2 weeks cap by default).
+PCA_LOOKBACK_CAP_HOURS = 24 * 14
+if DECISION_FREQ == 'D':
+    PCA_LOOKBACK = int(PCA_LOOKBACK_DAYS)                    # 126 --> 126 daily buckets
+else:  # 'H'
+    PCA_LOOKBACK = max(1, min(PCA_LOOKBACK_DAYS * 24, PCA_LOOKBACK_CAP_HOURS))
+
+# ========= Backtest decision layer =========
+Z_ENTRY       = 0.75     # enter when cheap-rich z-spread >= Z_ENTRY
+Z_EXIT        = 0.40     # take profit when |z-spread| <= Z_EXIT
+Z_STOP        = 3.00     # stop if divergence since entry >= Z_STOP
+MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
+
+# ========= Risk & selection =========
+BUCKETS = {
+    "short": (0.4, 1.9),   # ~6M–<2Y
+    "front": (2.0, 3.0),
+    "belly": (3.1, 9.0),
+    "long" : (10.0, 40.0),
+}
+MIN_SEP_YEARS        = 0.5
+MAX_CONCURRENT_PAIRS = 3
+PER_BUCKET_DV01_CAP  = 1.0
+TOTAL_DV01_CAP       = 3.0
+FRONT_END_DV01_CAP   = 1.0
+
+# Fly-alignment gating (optional micro-sanity gate, no calendar dependency)
+FLY_GATE_ENABLE = True
+FLY_DEFS        = [(1.0, 3.0, 5.0), (2.0, 5.0, 10.0)]
+FLY_Z_MIN       = 0.3
+FLY_ALIGN_MODE  = "loose"   # "loose" (reject opposite sign) or "strict" (must agree)
+SHORT_END_EXTRA_Z = 0.3     # extra entry threshold if any leg is in 'short'
+
+
+
 # feature_creation.py
 from __future__ import annotations
 import os, time, math
