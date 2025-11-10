@@ -1,3 +1,149 @@
+def _get_ql_calendar():
+    if not USE_QL_CALENDAR:
+        return None
+    try:
+        import QuantLib as ql
+    except Exception:
+        print("[CAL] QuantLib not available; falling back to weekday filter.")
+        return None
+
+    try:
+        # Try direct attribute first (most wheels expose enums like ql.UnitedStates.FederalReserve)
+        direct = getattr(ql.UnitedStates, str(QL_US_MARKET), None)
+        if direct is not None:
+            return ql.UnitedStates(direct)
+
+        # Fallback: some builds expose a nested Market enum
+        market_enum_cls = getattr(ql.UnitedStates, "Market", None)
+        if market_enum_cls is not None:
+            mkt = getattr(market_enum_cls, str(QL_US_MARKET), None)
+            if mkt is not None:
+                return ql.UnitedStates(mkt)
+
+        # Final fallback: use FederalReserve if present, else NYSE, else plain default ctor
+        if hasattr(ql.UnitedStates, "FederalReserve"):
+            return ql.UnitedStates(ql.UnitedStates.FederalReserve)
+        if hasattr(ql.UnitedStates, "NYSE"):
+            return ql.UnitedStates(ql.UnitedStates.NYSE)
+
+        print("[CAL] Could not resolve market enum; using default UnitedStates().")
+        return ql.UnitedStates()
+    except Exception as e:
+        print(f"[CAL] Failed to init QuantLib calendar: {e}; using weekday filter.")
+        return None
+        
+def _pca_fit_panel(panel_df: pd.DataFrame, cols: list[str], n_comps: int):
+    """
+    Fit PCA on the lookback panel restricted to 'cols' (tenor_yrs or columns already aligned).
+    panel_df: long with ['ts','tenor_yrs','rate'] or a wide matrix with index ts, columns=tenor_yrs
+    Returns dict: {'cols', 'mean', 'components', 'evr'} or None if not enough cols/samples.
+    """
+    if isinstance(panel_df, pd.DataFrame) and set(["ts","tenor_yrs","rate"]).issubset(panel_df.columns):
+        # long -> wide
+        M = (panel_df.pivot(index="ts", columns="tenor_yrs", values="rate")
+                        .sort_index())
+    else:
+        M = panel_df.copy()
+
+    M = M.reindex(columns=cols)  # align to current bucket columns/order
+    M = M.ffill().dropna(how="any")  # no deprecated fillna(method=...)
+
+    if M.shape[0] < (n_comps + 5) or M.shape[1] < n_comps:
+        return None  # insufficient history/features
+
+    X = M.values.astype(float)
+    mu = X.mean(axis=0, keepdims=True)
+    Xc = X - mu
+
+    # SVD-based PCA (stable)
+    U, S, VT = np.linalg.svd(Xc, full_matrices=False)
+    comps = VT[:n_comps, :]                   # shape (n_comps, n_features)
+    evr = (S**2) / (S**2).sum()
+    evr = evr[:n_comps]
+
+    return {"cols": list(M.columns), "mean": mu.ravel(), "components": comps, "evr": evr}
+
+
+def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
+    """
+    Apply PCA model to a single bucket snapshot (long frame for one decision_ts).
+    Returns a z_pca Series aligned with df_block rows (by tenor_yrs), NaN if not feasible.
+    """
+    out = pd.Series(index=df_block.index, dtype=float)
+
+    if not pca_model:
+        return out  # all NaN
+
+    cols = pca_model["cols"]
+    mu   = pca_model["mean"]
+    comps= pca_model["components"]  # (k, n_features)
+
+    # Build a 1-row wide vector of current rates ordered like model['cols']
+    snap_w = df_block.pivot(index=None, columns="tenor_yrs", values="rate")
+    # If any required col missing, bail to NaN
+    if any(c not in snap_w.columns for c in cols):
+        return out
+
+    x = snap_w[cols].iloc[0].values.astype(float)  # shape (n_features,)
+    xc = x - mu                                    # center
+
+    # project & rebuild first k components → anomaly on each tenor
+    # score = comps @ xc  -> shape (k,)
+    # recon = comps.T @ score  -> shape (n_features,)
+    score = comps @ xc
+    recon = comps.T @ score
+
+    # Use the reconstruction residual (or the reconstruction itself) as cheap 'shape' z.
+    # Here we use the reconstruction (shape explained by first k PCs), standardized cross-sectionally.
+    z = recon
+    # standardize cross-sectionally (avoid division by zero)
+    sd = z.std()
+    if not np.isfinite(sd) or sd == 0:
+        return out
+    z_std = (z - z.mean()) / sd
+
+    # Map back to long index order
+    m = {t: v for t, v in zip(cols, z_std)}
+    return df_block["tenor_yrs"].map(m)
+    
+def _process_bucket(dts, df_bucket, df_all, lookback_buckets, pca_enable, pca_n_comps, yymm):
+    # df_bucket: long for this decision_ts
+    out = df_bucket[["ts","tenor_yrs","rate"]].copy().reset_index(drop=True)
+
+    # ---- spline z (unchanged) ----
+    out["z_spline"] = _spline_fit_safe(out)
+
+    # ---- PCA (fit on lookback restricted to current columns) ----
+    out["z_pca"] = np.nan
+    if pca_enable:
+        cols_now = sorted(df_bucket["tenor_yrs"].unique().tolist())
+        if len(cols_now) >= pca_n_comps:
+            # gather lookback panel (long) then filter to these tenors first
+            t_end   = df_bucket["ts"].min()
+            t_start = t_end - pd.Timedelta(days=PCA_LOOKBACK_DAYS* (1 if DECISION_FREQ=='D' else 1/24))
+            panel_long = df_all[(df_all["ts"]>=t_start) & (df_all["ts"]<t_end)
+                               & (df_all["tenor_yrs"].isin(cols_now))]
+
+            model = _pca_fit_panel(panel_long, cols_now, pca_n_comps)
+            if model:
+                # log once per minute-ish
+                evr = model["evr"]
+                print(f"[PCA] {yymm} {str(dts)[:16]} obs={len(panel_long):,} cols={len(cols_now)} "
+                      f"EVR={list(np.round(evr,3))}")
+
+                out["z_pca"] = _pca_apply_block(out, model)
+            else:
+                print(f"[WARN] PCA skipped {yymm} {dts}: not enough history/features "
+                      f"(cols={len(cols_now)}, lookback_days={PCA_LOOKBACK_DAYS})")
+
+    # ---- Combine z ----
+    if "z_pca" in out and out["z_pca"].notna().any():
+        out["z_comb"] = 0.5*out["z_spline"] + 0.5*out["z_pca"]
+    else:
+        out["z_comb"] = out["z_spline"]
+
+    return out
+
 def _melt_long(df_wide: pd.DataFrame, tenormap: Dict[str, float]) -> pd.DataFrame:
     """
     Select columns present in TENOR_YEARS (tolerant to '_mid' suffix and spacing),
