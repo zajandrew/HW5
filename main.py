@@ -1,3 +1,50 @@
+from pathlib import Path
+import pandas as pd
+from IPython.display import display, HTML
+
+# --- paths ---
+PATH_OUT = Path("path/to/output/folder")  # <- update to your PATH_OUT in cr_config
+files = {
+    "positions": PATH_OUT / "positions_ledger.parquet",
+    "marks": PATH_OUT / "marks_ledger.parquet",
+    "pnl": PATH_OUT / "pnl_by_bucket.parquet"
+}
+
+# --- load safely ---
+dfs = {}
+for k, p in files.items():
+    if p.exists():
+        dfs[k] = pd.read_parquet(p)
+        print(f"[OK] {k}: {len(dfs[k])} rows")
+    else:
+        print(f"[MISS] {k}: {p}")
+
+# --- helper to show summary ---
+def quick_summary(df: pd.DataFrame, name: str):
+    display(HTML(f"<h3>{name}</h3>"))
+    display(df.head(5))
+    display(df.describe(include='all', datetime_is_numeric=True).T)
+
+# --- diagnostics ---
+if "positions" in dfs:
+    quick_summary(dfs["positions"], "Closed Positions")
+    display(HTML("<b>Exit reason counts:</b>"))
+    display(dfs["positions"]["exit_reason"].value_counts().to_frame())
+
+if "marks" in dfs:
+    quick_summary(dfs["marks"], "Ledger (Marks + Opens)")
+    display(HTML("<b>Closed vs Open counts:</b>"))
+    display(dfs["marks"]["closed"].value_counts().to_frame())
+
+if "pnl" in dfs:
+    quick_summary(dfs["pnl"], "PnL by Bucket")
+    display(HTML("<b>Cumulative PnL:</b>"))
+    df = dfs["pnl"].copy()
+    df["cum_pnl"] = df["pnl"].cumsum()
+    display(df.tail(5))
+
+
+
 import pandas as pd, glob
 files = glob.glob(r"PATH_TO_OUT/diag_selector_*.csv")
 df = pd.concat([pd.read_csv(f) for f in files])
