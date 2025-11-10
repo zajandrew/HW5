@@ -226,8 +226,29 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python diag_selector.py 2304 [2305 2306 ...]")
         sys.exit(1)
-    for y in sys.argv[1:]:
-        analyze_month(y)
+
+    months = sys.argv[1:]
+    all_df = []
+    all_txt = []
+
+    for y in months:
+        df = analyze_month(y)
+        if not df.empty:
+            df["month"] = y
+            all_df.append(df)
+            ok_ratio = (df["stage"] == "ok").mean() * 100
+            all_txt.append(f"{y}: ok={ok_ratio:.1f}% decisions | {df['stage'].value_counts().to_dict()}")
+
+    if all_df:
+        combined = pd.concat(all_df, ignore_index=True)
+        combined_path = Path(PATH_OUT) / "diag_selector_all.csv"
+        combined.to_csv(combined_path, index=False)
+        print(f"[SAVE] combined CSV: {combined_path}")
+
+        txt_path = Path(PATH_OUT) / "diag_selector_all.txt"
+        with open(txt_path, "w") as f:
+            f.write("\n".join(all_txt))
+        print(f"[SAVE] combined TXT: {txt_path}")
 
 # cr_config.py
 from zoneinfo import ZoneInfo
