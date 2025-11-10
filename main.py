@@ -11,19 +11,28 @@ YYMMS = ["2304"]   # e.g., ["2304","2305"]
 def _reload_all():
     importlib.reload(cfg); importlib.reload(pt)
 
-def _set_cfg(**kw):
-    for k,v in kw.items():
-        if hasattr(cfg,k): setattr(cfg,k,v)
+def _reload_pt_only():
+    importlib.reload(pt)
 
-# snapshot original config so each variant starts clean
-ORIG = {k:getattr(cfg,k) for k in dir(cfg) if k.isupper()}
+def _set_cfg(**kw):
+    for k, v in kw.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+
+# snapshot original config (so each variant starts clean)
+ORIG = {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
 
 def _apply_variant(overrides: dict):
-    for k,val in ORIG.items():
-        try: setattr(cfg,k,val)
-        except: pass
+    # restore from ORIG in-memory (do NOT reload cfg from disk)
+    for k, val in ORIG.items():
+        try:
+            setattr(cfg, k, val)
+        except Exception:
+            pass
+    # apply overrides in-memory
     _set_cfg(**overrides)
-    _reload_all()
+    # now reload portfolio_test so it re-imports constants from the mutated cfg object
+    _reload_pt_only()
 
 def _metrics(pos, led, by):
     m = {}
