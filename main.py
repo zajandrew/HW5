@@ -1,3 +1,64 @@
+def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
+    """Filter to business days (QuantLib if available) + local trading hours."""
+    if df_wide.empty:
+        return df_wide
+
+    # 1) Business-day filter (QuantLib if available, else Mon–Fri)
+    cal = _get_ql_calendar()
+    ts = pd.to_datetime(df_wide["ts"])
+    if cal is not None:
+        try:
+            import QuantLib as ql
+            ymd = np.array([(t.year, t.month, t.day) for t in ts], dtype=int)
+            days = pd.to_datetime(
+                {"year": ymd[:, 0], "month": ymd[:, 1], "day": ymd[:, 2]}
+            ).drop_duplicates().sort_values()
+            bd_mask = []
+            for d in days:
+                qd = ql.Date(int(d.day), int(d.month), int(d.year))
+                bd_mask.append(cal.isBusinessDay(qd))
+            day_ok = pd.Series(bd_mask, index=days)
+            ok = day_ok.reindex(ts.dt.floor("D"), fill_value=False).values
+            df_wide = df_wide.loc[ok]
+            print(f"[CAL] QuantLib calendar active ({QL_US_MARKET}); days={day_ok.sum()}")
+        except Exception as e:
+            print(f"[CAL] QuantLib daily check failed: {e}; using weekday filter.")
+            df_wide = df_wide[ts.dt.weekday < 5]
+            print(f"[CAL] Simple Mon–Fri filter active; "
+                  f"days={df_wide['ts'].dt.floor('D').nunique()}")
+    else:
+        df_wide = df_wide[ts.dt.weekday < 5]
+        print(f"[CAL] Simple Mon–Fri filter active; "
+              f"days={df_wide['ts'].dt.floor('D').nunique()}")
+
+    # 2) Session hours in local tz (e.g., America/New_York)
+    tz_local = CAL_TZ
+    start_str, end_str = TRADING_HOURS
+    pre = len(df_wide)
+
+    # Make a tz-aware local-time index specifically for slicing,
+    # then convert back to UTC-naive.
+    df_wide = df_wide.copy()
+    df_wide["ts_local"] = df_wide["ts"].dt.tz_localize("UTC").dt.tz_convert(tz_local)
+
+    tmp = df_wide.set_index("ts_local").sort_index()
+    tmp = tmp.between_time(start_str, end_str)
+
+    # Recreate UTC-naive 'ts' from the local index; then drop the index safely.
+    tmp = tmp.copy()
+    tmp["ts"] = tmp.index.tz_convert("UTC").tz_localize(None)
+    tmp = tmp.reset_index(drop=True)  # removes 'ts_local' index without needing .drop(columns=...)
+
+    kept = len(tmp)
+    if pre > 0:
+        print(f"[CAL] kept {kept:,}/{pre:,} rows ({(kept/pre*100):.2f}%) after calendar+hours")
+
+    # Ensure only expected columns remain
+    if "ts_local" in tmp.columns:
+        tmp = tmp.drop(columns=["ts_local"], errors="ignore")
+
+    return tmp.reset_index(drop=True)
+
 # feature_creation.py
 import os, sys, time
 from pathlib import Path
