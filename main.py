@@ -1,3 +1,10 @@
+import pandas as pd, glob
+files = glob.glob(r"PATH_TO_OUT/diag_selector_*.csv")
+df = pd.concat([pd.read_csv(f) for f in files])
+summary = df.groupby("month")["stage"].value_counts().unstack(fill_value=0)
+zstats = df.groupby("month")["z_range"].agg(["median","max","mean"])
+print(summary.join(zstats))
+
 # diag_selector.py
 import sys
 from pathlib import Path
