@@ -1,3 +1,261 @@
+# diag_backtest.py
+import sys, os, math, traceback
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+# Use your existing config (paths, thresholds)
+from cr_config import (
+    PATH_ENH, PATH_OUT,
+    DECISION_FREQ, Z_ENTRY, MIN_SEP_YEARS
+)
+
+# ---------- helpers ----------
+
+def _ok_cols(df, cols):
+    missing = [c for c in cols if c not in df.columns]
+    return len(missing) == 0, missing
+
+def _is_monotonic(dt):
+    return (dt.values[1:] >= dt.values[:-1]).all()
+
+def _tenor_bucket(tenor):
+    # purely for reporting; doesn’t need exact buckets
+    if tenor < 2: return "short"
+    if tenor < 7: return "belly"
+    return "long"
+
+def _pairable_any(snap_last, z_entry, min_sep_yrs):
+    """
+    Fast dry-run: ignore caps/flies; just check if any pair satisfies
+    z_diff >= z_entry and tenor separation >= min_sep_yrs.
+    Returns (ok:boolean, max_dispersion, (t_lo, z_lo, t_hi, z_hi))
+    """
+    sl = snap_last[["tenor_yrs","z_comb"]].dropna()
+    if sl.empty or len(sl) < 2:
+        return False, np.nan, None
+    sl = sl.sort_values("z_comb")
+    # best candidates are extremes; try K extremes to be robust
+    K = min(10, len(sl))
+    best = (-1.0, None)
+    lo_side = sl.iloc[:K].copy()
+    hi_side = sl.iloc[-K:].copy()
+    for _, lo in lo_side.iterrows():
+        for __, hi in hi_side.iterrows():
+            if abs(hi["tenor_yrs"] - lo["tenor_yrs"]) < min_sep_yrs:
+                continue
+            disp = float(hi["z_comb"] - lo["z_comb"])
+            if disp > best[0]:
+                best = (disp, (float(lo["tenor_yrs"]), float(lo["z_comb"]),
+                               float(hi["tenor_yrs"]), float(hi["z_comb"])))
+    ok = best[0] >= z_entry if best[0] is not None else False
+    return ok, best[0], best[1]
+
+def _day_summary(df, decision_freq):
+    # Assign decision buckets (D/H) like the backtest
+    ts = pd.to_datetime(df["ts"], errors="coerce")
+    if decision_freq == 'D':
+        key = ts.dt.floor("D")
+    elif decision_freq == 'H':
+        key = ts.dt.floor("H")
+    else:
+        raise ValueError("DECISION_FREQ must be 'D' or 'H'")
+    # Per bucket, take last tick per tenor (no look-ahead)
+    out = []
+    for dts, snap in df.groupby(key, sort=True):
+        snap_last = snap.sort_values("ts").groupby("tenor_yrs", as_index=False).tail(1)
+        if snap_last.empty:
+            out.append((dts, 0, np.nan, np.nan, np.nan))
+        else:
+            z = pd.to_numeric(snap_last["z_comb"], errors="coerce")
+            out.append((
+                dts,
+                snap_last["tenor_yrs"].nunique(),
+                float(np.nanmin(z)),
+                float(np.nanmax(z)),
+                float(np.nanmax(z) - np.nanmin(z))
+            ))
+    return pd.DataFrame(out, columns=["decision_ts","n_tenors","z_min","z_max","z_range"])
+
+def _nice_num(x):
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "nan"
+    return f"{x:.4f}"
+
+# ---------- main per-month diag ----------
+
+def diagnose_month(yymm: str, decision_freq: str = DECISION_FREQ) -> dict:
+    p = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    res = {"yymm": yymm, "path": str(p), "exists": p.exists(), "errors": []}
+    if not p.exists():
+        res["errors"].append("missing_file")
+        print(f"[MISS] {yymm}: {p}")
+        return res
+
+    try:
+        df = pd.read_parquet(p)
+    except Exception as e:
+        res["errors"].append(f"read_error:{e}")
+        print(f"[ERR ] {yymm}: read parquet failed: {e}")
+        return res
+
+    # ---- schema checks
+    needed = ["ts","tenor_yrs","rate","z_comb"]
+    ok, missing = _ok_cols(df, needed)
+    if not ok:
+        res["errors"].append(f"missing_cols:{missing}")
+        print(f"[ERR ] {yymm}: missing columns {missing}")
+        return res
+
+    # types and NaNs/zeros
+    n_rows = len(df)
+    df = df.copy()
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    # convert to numeric but keep NaN (don’t crash)
+    df["tenor_yrs"] = pd.to_numeric(df["tenor_yrs"], errors="coerce")
+    df["rate"] = pd.to_numeric(df["rate"], errors="coerce")
+    df["z_comb"] = pd.to_numeric(df["z_comb"], errors="coerce")
+
+    n_ts_nan = df["ts"].isna().sum()
+    n_ten_nan = df["tenor_yrs"].isna().sum()
+    n_rate_nan = df["rate"].isna().sum()
+    n_z_nan = df["z_comb"].isna().sum()
+    n_zero_rate = (df["rate"] == 0).sum()
+    n_zero_z = (df["z_comb"] == 0).sum()
+
+    # monotonic time within month
+    # allow per-day gaps, but global monotonic should generally hold for tick feeds
+    ts_monotonic = _is_monotonic(df["ts"].sort_values())
+
+    # decision bucket stats
+    stats = _day_summary(df, decision_freq)
+    if stats.empty:
+        res["errors"].append("empty_stats")
+        print(f"[ERR ] {yymm}: no decision buckets.")
+        return res
+
+    # z-range percentiles (across decision buckets)
+    zrng = stats["z_range"].dropna()
+    z_min = float(zrng.min()) if not zrng.empty else np.nan
+    z_p50 = float(zrng.quantile(0.50)) if not zrng.empty else np.nan
+    z_p90 = float(zrng.quantile(0.90)) if not zrng.empty else np.nan
+    z_max = float(zrng.max()) if not zrng.empty else np.nan
+
+    # feasibility sampling: try 12 buckets spread through the month
+    idxs = np.linspace(0, max(0, len(stats)-1), num=min(12, len(stats)), dtype=int)
+    sample_times = stats.iloc[idxs]["decision_ts"].tolist()
+
+    reasons = {"no_data":0, "too_few_tenors":0, "no_pair_meets_threshold":0, "sep_blocker":0, "ok":0}
+    examples = []
+
+    # Map times back to a quick snap_last per bucket and dry-run
+    df["decision_ts"] = (df["ts"].dt.floor("D") if decision_freq=='D' else df["ts"].dt.floor("H"))
+    for dts in sample_times:
+        snap = df[df["decision_ts"]==dts]
+        if snap.empty:
+            reasons["no_data"] += 1
+            continue
+        snap_last = snap.sort_values("ts").groupby("tenor_yrs", as_index=False).tail(1)
+        if snap_last.empty or snap_last["tenor_yrs"].nunique() < 2:
+            reasons["too_few_tenors"] += 1
+            continue
+
+        ok, best_disp, best_tuple = _pairable_any(snap_last, Z_ENTRY, MIN_SEP_YEARS)
+        if ok:
+            reasons["ok"] += 1
+            examples.append((dts, best_disp, best_tuple))
+        else:
+            # Was it dispersion or separation?
+            # Check dispersion without separation
+            sl = snap_last[["tenor_yrs","z_comb"]].dropna().sort_values("z_comb")
+            if sl.empty or len(sl) < 2:
+                reasons["too_few_tenors"] += 1
+                continue
+            zdisp_any = float(sl["z_comb"].iloc[-1] - sl["z_comb"].iloc[0])
+            if zdisp_any < Z_ENTRY:
+                reasons["no_pair_meets_threshold"] += 1
+            else:
+                # dispersion was there but all candidate pairs violated separation
+                reasons["sep_blocker"] += 1
+
+    # Assemble report dictionary
+    res.update({
+        "n_rows": int(n_rows),
+        "n_ts_nan": int(n_ts_nan),
+        "n_tenor_nan": int(n_ten_nan),
+        "n_rate_nan": int(n_rate_nan),
+        "n_z_nan": int(n_z_nan),
+        "n_zero_rate": int(n_zero_rate),
+        "n_zero_z": int(n_zero_z),
+        "ts_monotonic": bool(ts_monotonic),
+        "n_decisions": int(len(stats)),
+        "median_n_tenors": float(stats["n_tenors"].median()),
+        "z_range_min": z_min, "z_range_p50": z_p50, "z_range_p90": z_p90, "z_range_max": z_max,
+        "reasons": reasons,
+        "examples": examples[:3],  # at most 3 illustrative successes
+    })
+
+    # Optional: write a small txt report
+    Path(PATH_OUT).mkdir(parents=True, exist_ok=True)
+    rpt = Path(PATH_OUT)/f"diag_{yymm}.txt"
+    with open(rpt, "w", encoding="utf-8") as f:
+        f.write(f"[DIAG] {yymm}\n")
+        f.write(f"path: {p}\n")
+        f.write(f"rows: {n_rows}\n")
+        f.write(f"NaNs ts/tenor/rate/z: {n_ts_nan}/{n_ten_nan}/{n_rate_nan}/{n_z_nan}\n")
+        f.write(f"Zeros rate/z: {n_zero_rate}/{n_zero_z}\n")
+        f.write(f"ts_monotonic: {ts_monotonic}\n")
+        f.write(f"decisions: {len(stats)} | median tenors: {stats['n_tenors'].median():.1f}\n")
+        f.write(f"z_range min/p50/p90/max: {_nice_num(z_min)}/{_nice_num(z_p50)}/{_nice_num(z_p90)}/{_nice_num(z_max)}\n")
+        f.write(f"reasons: {reasons}\n")
+        if examples:
+            f.write("examples_ok (dts, best_disp, (t_lo,z_lo,t_hi,z_hi)):\n")
+            for e in examples:
+                f.write(f"  {e}\n")
+    print(f"[REPORT] {rpt}")
+    return res
+
+# ---------- CLI ----------
+
+def main(argv):
+    if len(argv) < 2:
+        print("Usage: python diag_backtest.py 2304 [2305 2306 ...]")
+        sys.exit(1)
+
+    yymms = argv[1:]
+    print(f"[INFO] months: {len(yymms)} -> {yymms}")
+    all_res = []
+    for yymm in yymms:
+        try:
+            r = diagnose_month(yymm, DECISION_FREQ)
+            all_res.append(r)
+            # quick console line:
+            print(f"[DONE] {yymm} | rows={r.get('n_rows','?')} "
+                  f"dec={r.get('n_decisions','?')} medTenors={_nice_num(r.get('median_n_tenors'))} "
+                  f"zP50={_nice_num(r.get('z_range_p50'))} zP90={_nice_num(r.get('z_range_p90'))} "
+                  f"ok_samples={r.get('reasons',{}).get('ok',0)}")
+        except Exception as e:
+            print(f"[FATAL] {yymm}: {e}")
+            traceback.print_exc()
+
+    # Summarize across months
+    df = pd.DataFrame(all_res)
+    if not df.empty:
+        out = Path(PATH_OUT)/"diag_summary.parquet"
+        df.to_parquet(out)
+        print(f"[SAVE ] {out}")
+        # Quick top-line reason counts
+        if "reasons" in df.columns:
+            agg = {"ok":0,"no_data":0,"too_few_tenors":0,"no_pair_meets_threshold":0,"sep_blocker":0}
+            for d in df["reasons"]:
+                for k in agg:
+                    agg[k] += int(d.get(k,0))
+            print(f"[REASONS] aggregate samples: {agg}")
+
+if __name__ == "__main__":
+    main(sys.argv)
+
+
 def run_month(
     yymm: str,
     decision_freq: str = DECISION_FREQ,   # 'D' or 'H'
