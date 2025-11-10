@@ -1,3 +1,95 @@
+# ==== Cheap–Rich Daily Variant Sweeper ====
+# Put this in the same folder as cr_config.py and portfolio_test.py
+from pathlib import Path
+import importlib, numpy as np, pandas as pd, matplotlib.pyplot as plt
+import cr_config as cfg
+import portfolio_test as pt
+
+# --- months to test ---
+YYMMS = ["2304"]   # e.g., ["2304","2305"]
+
+def _reload_all():
+    importlib.reload(cfg); importlib.reload(pt)
+
+def _set_cfg(**kw):
+    for k,v in kw.items():
+        if hasattr(cfg,k): setattr(cfg,k,v)
+
+# snapshot original config so each variant starts clean
+ORIG = {k:getattr(cfg,k) for k in dir(cfg) if k.isupper()}
+
+def _apply_variant(overrides: dict):
+    for k,val in ORIG.items():
+        try: setattr(cfg,k,val)
+        except: pass
+    _set_cfg(**overrides)
+    _reload_all()
+
+def _metrics(pos, led, by):
+    m = {}
+    n = len(pos) if pos is not None else 0
+    m["trades"] = int(n)
+    m["avg_pnl_per_trade"] = float(pos["pnl"].mean()) if n else np.nan
+    for r in ["reversion","max_hold","stop"]:
+        m[f"exit_{r}"] = int(pos["exit_reason"].value_counts().get(r,0)) if n else 0
+    if by is not None and len(by):
+        s = by.sort_values("bucket")["pnl"].astype(float).cumsum()
+        m["cum_pnl"] = float(s.iloc[-1])
+        dd = (s.cummax() - s)
+        m["max_drawdown"] = float(dd.max())
+        pnl = by["pnl"].astype(float)
+        m["pnl_mean"] = float(pnl.mean())
+        m["pnl_std"]  = float(pnl.std(ddof=1)) if len(pnl)>1 else np.nan
+        m["mean_over_std"] = float(m["pnl_mean"]/m["pnl_std"]) if m["pnl_std"] not in (0.0,np.nan) else np.nan
+    else:
+        m.update({"cum_pnl":0.0,"max_drawdown":0.0,"pnl_mean":np.nan,"pnl_std":np.nan,"mean_over_std":np.nan})
+    return m
+
+VARIANTS = {
+    "A_baseline": {},
+    "B_no_big_waiver": {"FLY_ALLOW_BIG_ZDISP": False},
+    "C_no_big_waiver_lowZ": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4},
+    "D_no_big_waiver_lowZ_tightWindow": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5},
+    "E_strict_gate": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "FLY_MODE": "strict"},
+    "F_tighter_entry": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "Z_ENTRY": 0.9},
+    "G_faster_take_profit": {"FLY_ALLOW_BIG_ZDISP": False, "FLY_Z_MIN": 0.4, "FLY_WINDOW_YEARS": 1.5, "Z_EXIT": 0.35},
+}
+
+results = []
+variant_outputs = {}
+
+for name, overrides in VARIANTS.items():
+    _apply_variant(overrides)
+    print(f"[RUN] {name} | MODE={cfg.FLY_MODE} | ALLOW_BIG={cfg.FLY_ALLOW_BIG_ZDISP} "
+          f"| Z_MIN={cfg.FLY_Z_MIN} | NEIGH_ONLY={cfg.FLY_NEIGHBOR_ONLY} "
+          f"| WINDOW={cfg.FLY_WINDOW_YEARS} | SKIP_SHORT<{cfg.FLY_SKIP_SHORT_UNDER} "
+          f"| Z_ENTRY={cfg.Z_ENTRY} | Z_EXIT={cfg.Z_EXIT}")
+    pos, led, by = pt.run_all(YYMMS)
+    results.append({"variant": name, **_metrics(pos, led, by)})
+    variant_outputs[name] = {"positions": pos, "ledger": led, "pnl_by": by}
+
+# restore original config
+_apply_variant({})
+
+df = (pd.DataFrame(results)
+        .set_index("variant")
+        .loc[:, ["trades","avg_pnl_per_trade","cum_pnl","max_drawdown",
+                 "exit_reversion","exit_max_hold","exit_stop","mean_over_std"]]
+        .sort_values("cum_pnl", ascending=False))
+display(df)
+
+# quick plot of cum PnL for a few variants (single month recommended)
+plt.figure()
+for name in ["A_baseline","B_no_big_waiver","D_no_big_waiver_lowZ_tightWindow","E_strict_gate"]:
+    by = variant_outputs[name]["pnl_by"]
+    if by is None or len(by)==0: continue
+    s = by.sort_values("bucket")["pnl"].astype(float).cumsum()
+    plt.plot(s.values, label=name)
+plt.title("Cumulative PnL per Variant (daily)")
+plt.xlabel("Decision steps"); plt.ylabel("Cum PnL")
+plt.legend(); plt.show()
+
+print("Tip: inspect `variant_outputs['E_strict_gate']['positions']` etc. for details.")
 
 #analytics in general
 from pathlib import Path
