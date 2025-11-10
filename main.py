@@ -1,3 +1,34 @@
+# check_features.py
+import sys, pandas as pd
+from pathlib import Path
+from cr_config import PATH_ENH
+
+def check_month(yymm):
+    p = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    if not p.exists():
+        print(f"[MISS] {p}")
+        return
+    df = pd.read_parquet(p)
+    print(f"[{yymm}] rows={len(df):,}")
+    cols = [c for c in df.columns if "z" in c.lower() or "pca" in c.lower()]
+    print("Columns with z/PCA:", cols)
+    print(df[cols].describe(include='all'))
+    # quick validity ratio
+    if "z_comb" in df.columns:
+        z = pd.to_numeric(df["z_comb"], errors="coerce")
+        print(f"Valid z_comb % = {(z.notna() & (z!=0)).mean()*100:.2f}%")
+        print("z_comb unique nonzero values:", z[z!=0].unique()[:5])
+    else:
+        print("No z_comb found.")
+    print("-"*80)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python check_features.py 2304 [2305 ...]")
+        sys.exit(1)
+    for yymm in sys.argv[1:]:
+        check_month(yymm)
+
 # diag_backtest.py
 import sys, os, math, traceback
 from pathlib import Path
