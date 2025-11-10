@@ -13,7 +13,6 @@ Path(PATH_MODELS).mkdir(parents=True, exist_ok=True)
 Path(PATH_OUT).mkdir(parents=True, exist_ok=True)
 
 # ========= Instruments (explicit) =========
-# Provide your exact mapping (instrument root WITHOUT "_mid" -> tenor years).
 TENOR_YEARS = {
     "USOSFRA BGN Curncy": 1/12,   "USOSFRB BGN Curncy": 2/12,   "USOSFRC BGN Curncy": 3/12,
     "USOSFRD BGN Curncy": 4/12,   "USOSFRE BGN Curncy": 5/12,   "USOSFRF BGN Curncy": 6/12,
@@ -612,7 +611,7 @@ def _process_bucket(dts, df_bucket, df_all, lookback_days, pca_enable, pca_n_com
 # Month builder (public)
 # -----------------------
 def build_month(yymm: str) -> None:
-    in_path  = Path(PATH_DATA) / f"{yymm}.parquet"
+    in_path  = Path(PATH_DATA) / f"{yymm}_features.parquet"
     out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
     Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
 
