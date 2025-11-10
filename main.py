@@ -1,3 +1,348 @@
+# feature_creation.py
+from __future__ import annotations
+import os, time, math
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+
+from sklearn.decomposition import PCA
+
+from cr_config import (
+    PATH_RAW, PATH_ENH,
+    TENOR_YEARS,
+    DECISION_FREQ,    # 'D' or 'H'
+    PCA_ENABLE,       # bool
+    PCA_LOOKBACK,     # int (number of buckets to use for fit)
+    PCA_N_COMPS,      # int
+    N_JOBS            # 0 -> auto, or int
+)
+
+# ----------------------------
+# Utilities & robust helpers
+# ----------------------------
+
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
+
+def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
+    ts = pd.to_datetime(ts, errors="coerce", utc=False)
+    if freq == 'D':
+        return ts.dt.floor("D")
+    if freq == 'H':
+        return ts.dt.floor("H")
+    raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
+
+def _to_ts_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Accepts index named 'sec' or 'ts' (or DatetimeIndex). Returns frame with a 'ts' column."""
+    out = df.copy()
+    if 'ts' in out.columns:
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    # maybe index
+    idx_name = getattr(out.index, "name", None)
+    if idx_name in ('sec', 'ts'):
+        out = out.reset_index().rename(columns={idx_name: 'ts'})
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    # if DatetimeIndex without name
+    if isinstance(out.index, pd.DatetimeIndex):
+        out = out.reset_index().rename(columns={'index':'ts'})
+        out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+        return out
+    # last resort: try to coerce index
+    out = out.reset_index().rename(columns={'index':'ts'})
+    out['ts'] = pd.to_datetime(out['ts'], errors='coerce')
+    return out
+
+def _zeros_to_nan(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert obvious placeholder zeros to NaN (but only for float-like columns)."""
+    out = df.copy()
+    for c in out.columns:
+        if c == 'ts':
+            continue
+        s = pd.to_numeric(out[c], errors='coerce')
+        # treat exact 0 as missing if the column otherwise has non-zero values
+        if (s == 0).any() and (s != 0).any():
+            s = s.mask(s == 0, np.nan)
+        out[c] = s
+    return out
+
+def _melt_long(df_wide: pd.DataFrame, tenormap: Dict[str, float]) -> pd.DataFrame:
+    """Wide -> long with tenor mapping: columns=tickers; index time; value=rate (percent units)."""
+    cols = [c for c in df_wide.columns if c in tenormap]
+    if not cols:
+        raise ValueError("No overlapping tickers between input file and TENOR_YEARS.")
+    long = df_wide[['ts'] + cols].melt('ts', var_name='instrument', value_name='rate')
+    long['tenor_yrs'] = long['instrument'].map(tenormap).astype(float)
+    long = long.dropna(subset=['ts','tenor_yrs'])
+    return long[['ts','tenor_yrs','rate']]
+
+# -------- curve (tenor) spline residual at a single snapshot --------
+
+def _fit_spline_guarded(x: np.ndarray, y: np.ndarray, k: int = 3):
+    """Return callable f(t) producing fitted curve; robust fallbacks if spline fails."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 3:
+        # linear fallback
+        if x.size < 2:
+            return lambda t: np.full_like(np.asarray(t, float), np.nan, dtype=float)
+        a, b = np.polyfit(x, y, 1)
+        return lambda t: a * np.asarray(t, float) + b
+    try:
+        from scipy.interpolate import UnivariateSpline
+        s = max(1e-8, 0.5 * x.size * np.nanvar(y))
+        spl = UnivariateSpline(x, y, k=min(k, max(1, x.size-1)), s=s, ext=3)
+        return lambda t: spl(np.asarray(t, float))
+    except Exception:
+        deg = min(2, max(1, x.size - 1))
+        coefs = np.polyfit(x, y, deg)
+        poly = np.poly1d(coefs)
+        return lambda t: poly(np.asarray(t, float))
+
+def _zscore_xsec(vals: pd.Series) -> pd.Series:
+    """Cross-sectional z-score (per snapshot across tenors)."""
+    v = pd.to_numeric(vals, errors='coerce')
+    mu = v.mean(skipna=True)
+    sd = v.std(skipna=True, ddof=1)
+    if not np.isfinite(sd) or sd <= 0:
+        return pd.Series(np.nan, index=v.index)
+    return (v - mu) / sd
+
+# -------- PCA per bucket window (time-series variance) --------
+
+def _pca_z_for_bucket(bucket_df: pd.DataFrame,
+                      last_snap: pd.DataFrame,
+                      n_comps: int,
+                      verbose_note: str = "") -> pd.Series:
+    """
+    Fit PCA on the lookback window's time-series matrix (rows: time, cols: tenor).
+    Return cross-sectional z-score of residual vector for the *last* snapshot in the bucket.
+    """
+    # build time x tenor matrix (align by timestamp; inner join for robustness)
+    mat = (bucket_df
+           .pivot_table(index='ts', columns='tenor_yrs', values='rate', aggfunc='last')
+           .sort_index())
+    # Require at least 12 rows and >= 3 tenors
+    if mat.shape[0] < 12 or mat.shape[1] < 3:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    # Drop tenors with too many NaNs; then forward-fill small gaps
+    keep = mat.columns[mat.notna().mean() > 0.9]  # at least 90% present in window
+    mat = mat[keep]
+    if mat.shape[1] < 3:
+        return pd.Series(np.nan, index=last_snap.index)
+    mat = mat.fillna(method='ffill').dropna(axis=0, how='any')
+    if mat.empty or mat.shape[0] < 8:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    # Standardize by tenor across *time*
+    mat_std = (mat - mat.mean(axis=0)) / mat.std(axis=0, ddof=0)
+    mat_std = mat_std.replace([np.inf, -np.inf], np.nan).dropna(axis=0, how='any')
+    if mat_std.shape[0] < 8:
+        return pd.Series(np.nan, index=last_snap.index)
+
+    # Fit PCA
+    try:
+        k = min(n_comps, mat_std.shape[1])
+        model = PCA(n_components=k, svd_solver='auto', random_state=0)
+        scores = model.fit_transform(mat_std.values)
+        evr = getattr(model, "explained_variance_ratio_", None)
+        if evr is not None:
+            print(f"[{_now()}] [PCA] {verbose_note} rows={mat_std.shape[0]} cols={mat_std.shape[1]} "
+                  f"EVR={np.round(evr[:k],3)}")
+        # reconstruct the *last* row and take residual vector
+        last_row = mat_std.iloc[-1].values
+        comps = model.components_               # shape (k, n_cols)
+        # projection -> reconstruction in standardized space
+        proj = comps @ (comps.T @ last_row)
+        resid_std = last_row - proj             # standardized residual vector
+        # map residuals back to tenor index order used in last_snap
+        # Build a Series on mat_std columns first:
+        resid_std_s = pd.Series(resid_std, index=mat_std.columns)
+        # now reindex to last_snap tenors (may drop some if absent)
+        rs = resid_std_s.reindex(last_snap['tenor_yrs'].values)
+        # cross-sectional z-score of residuals (already standardized, but normalize again for stability)
+        return _zscore_xsec(rs)
+    except Exception as e:
+        print(f"[{_now()}] [WARN] PCA failed ({verbose_note}): {e}")
+        return pd.Series(np.nan, index=last_snap.index)
+
+# -------- combiner --------
+
+def _combine_z_safe(df_block: pd.DataFrame) -> pd.DataFrame:
+    out = df_block.copy()
+    if "z_pca" not in out.columns:    out["z_pca"] = np.nan
+    if "z_spline" not in out.columns: out["z_spline"] = np.nan
+    zp = pd.to_numeric(out["z_pca"], errors="coerce")
+    zs = pd.to_numeric(out["z_spline"], errors="coerce")
+    out["z_comb"] = np.where(np.isfinite(zp), zp, zs)
+    return out
+
+# ----------------------------
+# Core per-bucket processing
+# ----------------------------
+
+def _process_bucket(dts: pd.Timestamp,
+                    df_bucket: pd.DataFrame,
+                    df_all: pd.DataFrame,
+                    lookback: int,
+                    pca_enable: bool,
+                    pca_n_comps: int,
+                    freq: str,
+                    yymm: str) -> pd.DataFrame:
+    """
+    Returns frame with one row per tenor at decision timestamp:
+      ['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']
+    """
+    # last snapshot within bucket
+    snap_last = (df_bucket.sort_values('ts')
+                 .groupby('tenor_yrs', as_index=False)
+                 .tail(1)
+                 .dropna(subset=['tenor_yrs','rate']))
+    if snap_last.empty:
+        return pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb'])
+
+    # ---- spline z (cross-sectional) at the snapshot
+    f = _fit_spline_guarded(snap_last['tenor_yrs'].values, snap_last['rate'].values)
+    fit_vals = f(snap_last['tenor_yrs'].values)
+    spline_resid = pd.Series(snap_last['rate'].values - fit_vals, index=snap_last.index)
+    z_spline = _zscore_xsec(spline_resid)
+
+    # ---- PCA z (time-series over lookback buckets)
+    z_pca = pd.Series(np.nan, index=snap_last.index)
+    if pca_enable:
+        # collect lookback window buckets
+        # we rely on df_all having 'decision_ts' column
+        uniq = sorted(df_all['decision_ts'].dropna().unique())
+        # find index of current dts
+        try:
+            pos = uniq.index(dts)
+        except ValueError:
+            pos = None
+        if pos is not None:
+            # window includes current bucket and previous (lookback-1)
+            lo = max(0, pos - (lookback - 1))
+            win = uniq[lo:pos+1]
+            mask = df_all['decision_ts'].isin(win)
+            z_pca = _pca_z_for_bucket(
+                bucket_df=df_all.loc[mask, ['ts','tenor_yrs','rate']],
+                last_snap=snap_last[['tenor_yrs','rate']],
+                n_comps=pca_n_comps,
+                verbose_note=f"{yymm} {str(dts)}"
+            )
+
+    out = snap_last[['ts','tenor_yrs','rate']].copy()
+    out['z_spline'] = z_spline.values
+    out['z_pca'] = z_pca.values
+    out = _combine_z_safe(out)
+    # tag bucket ts as the decision time (collapse to D/H key for clarity)
+    out['ts'] = dts
+    return out
+
+# ----------------------------
+# Month runner
+# ----------------------------
+
+def build_month(yymm: str) -> None:
+    in_path  = Path(PATH_RAW) / f"{yymm}.parquet"
+    out_path = Path(PATH_ENH) / f"{yymm}_enh.parquet"
+    Path(PATH_ENH).mkdir(parents=True, exist_ok=True)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Missing raw month file: {in_path}")
+
+    # ---------- load & clean wide
+    df_wide = pd.read_parquet(in_path)
+    df_wide = _to_ts_index(df_wide)
+    df_wide = df_wide.sort_values('ts')
+    # de-duplicate timestamps (keep last)
+    df_wide = df_wide[~df_wide['ts'].duplicated(keep='last')]
+    # zeros->NaN and numeric coercion
+    df_wide = _zeros_to_nan(df_wide)
+
+    # ---------- long format with tenor mapping
+    df_long = _melt_long(df_wide, TENOR_YEARS)
+    # sanity numeric
+    df_long['rate'] = pd.to_numeric(df_long['rate'], errors='coerce')
+    # drop rows with no rate
+    df_long = df_long.dropna(subset=['rate'])
+
+    # ---------- assign decision buckets
+    df_long['decision_ts'] = _decision_key(df_long['ts'], DECISION_FREQ)
+
+    # ---------- parallel over buckets
+    buckets = list(df_long['decision_ts'].dropna().unique())
+    buckets.sort()
+    if N_JOBS == 0:
+        # "auto": use sensible default without oversubscribing
+        import multiprocessing as mp
+        jobs = max(1, min( (mp.cpu_count()//2), 8 ))
+    else:
+        jobs = int(N_JOBS)
+
+    print(f"[{_now()}] [MONTH] {yymm} | buckets={len(buckets)} freq={DECISION_FREQ} "
+          f"| jobs={jobs} | PCA={'on' if PCA_ENABLE else 'off'} "
+          f"| lookback={PCA_LOOKBACK} | comps={PCA_N_COMPS}")
+
+    def _one_bucket(dts):
+        snap = df_long[df_long['decision_ts'] == dts]
+        t0 = time.time()
+        out = _process_bucket(
+            dts=dts,
+            df_bucket=snap,
+            df_all=df_long[['ts','tenor_yrs','rate','decision_ts']],
+            lookback=PCA_LOOKBACK,
+            pca_enable=PCA_ENABLE,
+            pca_n_comps=PCA_N_COMPS,
+            freq=DECISION_FREQ,
+            yymm=yymm
+        )
+        dt = time.time() - t0
+        print(f"[DAY ] {yymm} {dts} rows:{len(snap):,} tenors:{snap['tenor_yrs'].nunique()} "
+              f"PCA:{'yes' if out['z_pca'].notna().any() else 'no '} t={dt:.2f}s")
+        return out
+
+    if len(buckets) == 0:
+        print(f"[WARN] {yymm}: no buckets found.")
+        pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']).to_parquet(out_path, index=False)
+        print(f"[SAVE] {out_path}")
+        return
+
+    parts = Parallel(n_jobs=jobs, backend="loky")(
+        delayed(_one_bucket)(dts) for dts in buckets
+    )
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb'])
+
+    # final hygiene
+    out = out.sort_values(['ts','tenor_yrs']).reset_index(drop=True)
+
+    # quick month diagnostics
+    zr = pd.to_numeric(out['z_comb'], errors='coerce')
+    z_valid_pct = float(np.isfinite(zr).mean() * 100.0)
+    print(f"[DONE] {yymm} rows:{len(out):,} tenors_med:{out.groupby('ts')['tenor_yrs'].nunique().median():.1f} "
+          f"z_valid%:{z_valid_pct:.2f}")
+
+    out.to_parquet(out_path, index=False)
+    print(f"[SAVE] {out_path}")
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python feature_creation.py 2304 [2305 2306 ...]")
+        raise SystemExit(1)
+    months = sys.argv[1:]
+    for yymm in months:
+        build_month(yymm)
+
 # check_features.py
 import sys, pandas as pd
 from pathlib import Path
