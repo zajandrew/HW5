@@ -12,11 +12,23 @@ import numpy as np
 import pandas as pd
 
 from cr_config import (
-    PATH_ENH, PATH_OUT, DECISION_FREQ, MIN_SEP_YEARS,
-    Z_ENTRY, SHORT_END_EXTRA_Z,
-    BUCKETS,
-    FLY_GATE_ENABLE, FLY_DEFS, FLY_Z_MIN, FLY_ALIGN_MODE,
-    PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP,
+    # paths / runtime
+    PATH_ENH, PATH_OUT, DECISION_FREQ,
+
+    # selection sanity
+    MIN_SEP_YEARS, Z_ENTRY,
+
+    # fly-gate (tolerant) knobs
+    FLY_ENABLE,          # bool (rename of FLY_GATE_ENABLE)
+    FLY_MODE,            # "off" | "loose" | "tolerant" | "strict"
+    FLY_DEFS,            # list of (a,b,c) tenors
+    FLY_Z_MIN,           # min |fly z| to count
+    FLY_REQUIRE_COUNT,   # contradictions needed to block (tolerant)
+    FLY_NEIGHBOR_ONLY,   # only flies near leg tenor
+    FLY_WINDOW_YEARS,    # neighborhood half-width (years)
+    FLY_SKIP_SHORT_UNDER,# skip gate if leg tenor < this
+    FLY_ALLOW_BIG_ZDISP, # allow waiver when dispersion big
+    FLY_BIG_ZDISP_MARGIN # size above Z_ENTRY to waive
 )
 
 # ---------- helpers ----------
@@ -38,28 +50,89 @@ def assign_bucket(tenor):
     return "other"
 
 def compute_fly_z(snap_last: pd.DataFrame, a: float, b: float, c: float) -> float | None:
-    def getz(T):
-        r = snap_last.loc[snap_last["tenor_yrs"] == T]
-        if r.empty: return np.nan
-        return _to_float(r.iloc[0]["z_comb"])
-    za, zb, zc = getz(a), getz(b), getz(c)
-    if np.isnan([za,zb,zc]).any(): return None
-    shape = 0.5*(za+zc)-zb
-    xs = snap_last["z_comb"].astype(float).to_numpy()
-    sd = np.nanstd(xs, ddof=1) if xs.size>1 else 1.0
-    if not np.isfinite(sd) or sd<=0: sd=1.0
-    return shape / sd
+    """
+    On each snapshot, compute simple fly z = [0.5*(z_a+z_c) - z_b] / cross-sec std(z)
+    using z_comb (NOT levels). Return None if any leg missing.
+    """
+    try:
+        rows = {
+            a: snap_last.loc[snap_last["tenor_yrs"] == a, "z_comb"],
+            b: snap_last.loc[snap_last["tenor_yrs"] == b, "z_comb"],
+            c: snap_last.loc[snap_last["tenor_yrs"] == c, "z_comb"],
+        }
+        if any(r.empty for r in rows.values()):
+            return None
+        z_a, z_b, z_c = float(rows[a].iloc[0]), float(rows[b].iloc[0]), float(rows[c].iloc[0])
+        xs = snap_last["z_comb"].astype(float).values
+        sd = np.nanstd(xs, ddof=1) if xs.size > 1 else 1.0
+        sd = sd if sd > 0 else 1.0
+        fly = 0.5 * (z_a + z_c) - z_b
+        return fly / sd
+    except Exception:
+        return None
 
-def fly_alignment_ok(leg_tenor: float, leg_sign_z: int, snap_last: pd.DataFrame) -> bool:
-    if not FLY_GATE_ENABLE: return True
-    for (a,b,c) in FLY_DEFS:
-        fz = compute_fly_z(snap_last, a,b,c)
-        if fz is None: continue
-        if abs(fz) < FLY_Z_MIN: continue
-        if FLY_ALIGN_MODE == "strict" and np.sign(fz) != np.sign(leg_sign_z):
-            return False
-        if FLY_ALIGN_MODE == "loose" and (np.sign(fz) * np.sign(leg_sign_z) < 0):
-            return False
+def fly_alignment_ok(
+    leg_tenor: float,
+    leg_sign_z: float,                 # +1 for “cheap should go down”, -1 for “rich should go up”
+    snap_last: pd.DataFrame,
+    *,
+    zdisp_for_pair: float | None = None
+) -> bool:
+    """
+    Tolerant fly gate:
+      - look at flies in FLY_DEFS
+      - optionally only those with center ≈ leg tenor (within FLY_WINDOW_YEARS)
+      - count contradictory strong flies (|fly_z| >= FLY_Z_MIN) whose sign *opposes* leg_sign_z
+      - optionally skip fly checks if leg tenor < FLY_SKIP_SHORT_UNDER (noisy short end)
+      - optionally allow *big* dispersion to waive a block (FLY_ALLOW_BIG_ZDISP w/ margin)
+      - require >= FLY_REQUIRE_COUNT contradictory flies to actually block
+
+    Returns True (pass) / False (block).
+    """
+    if not FLY_ENABLE:
+        return True
+
+    # Short-end skip
+    if (FLY_SKIP_SHORT_UNDER is not None) and (leg_tenor < float(FLY_SKIP_SHORT_UNDER)):
+        return True
+
+    # Waive if dispersion already large
+    if (
+        FLY_ALLOW_BIG_ZDISP
+        and (zdisp_for_pair is not None)
+        and (zdisp_for_pair >= (Z_ENTRY + FLY_BIG_ZDISP_MARGIN))
+    ):
+        return True
+
+    contradictions = 0
+    for (a, b, c) in FLY_DEFS:
+        # Neighborhood filter
+        if FLY_NEIGHBOR_ONLY and (abs(b - leg_tenor) > float(FLY_WINDOW_YEARS)):
+            continue
+
+        zz = compute_fly_z(snap_last, a, b, c)
+        if zz is None:
+            continue
+        if abs(zz) < FLY_Z_MIN:          # only react to strong curvature
+            continue
+
+        # Opposite direction to our intended leg?
+        if np.sign(zz) * np.sign(leg_sign_z) < 0:
+            contradictions += 1
+
+    if FLY_MODE == "off":
+        return True
+    if FLY_MODE == "loose":
+        # Block on ANY contradiction
+        return contradictions == 0
+    if FLY_MODE == "tolerant":
+        # Block only if enough contradictions
+        return contradictions < int(FLY_REQUIRE_COUNT)
+    if FLY_MODE == "strict":
+        # Require all checked flies to agree (no positive contradiction allowed)
+        return contradictions == 0
+
+    # Unknown mode -> be safe
     return True
 
 # ---------- core diagnostics ----------
@@ -333,13 +406,26 @@ PER_BUCKET_DV01_CAP  = 1.0
 TOTAL_DV01_CAP       = 3.0
 FRONT_END_DV01_CAP   = 1.0
 
-# Fly-alignment gating (optional micro-sanity gate, no calendar dependency)
-FLY_GATE_ENABLE = True
-FLY_DEFS        = [(1.0, 3.0, 5.0), (2.0, 5.0, 10.0)]
-FLY_Z_MIN       = 0.3
-FLY_ALIGN_MODE  = "loose"   # "loose" (reject opposite sign) or "strict" (must agree)
-SHORT_END_EXTRA_Z = 0.3     # extra entry threshold if any leg is in 'short'
+# ========= Fly-alignment gate (curvature sanity) =========
+FLY_ENABLE            = True          # master on/off
+FLY_MODE              = "tolerant"    # "off" | "loose" | "tolerant" | "strict"
 
+# Which flies to evaluate (triplets in years, sorted a<b<c)
+FLY_DEFS              = [(1.0, 3.0, 7.0), (2.0, 5.0, 10.0), (3.0, 7.0, 15.0), (4.0, 8.0, 20.0)]
+
+# Strength and locality
+FLY_Z_MIN             = 0.8           # require |fly_z| >= this to consider it “strong”
+FLY_NEIGHBOR_ONLY     = True          # only evaluate flies near the leg tenor
+FLY_WINDOW_YEARS      = 3.0           # neighborhood half-width in years (± around leg tenor)
+
+# Robust blocking logic
+FLY_REQUIRE_COUNT     = 2             # need ≥K contradictory strong flies to block (tolerant)
+FLY_SKIP_SHORT_UNDER  = 2.0           # skip gate entirely for legs < this tenor (yrs)
+FLY_ALLOW_BIG_ZDISP   = True          # never block if pair dispersion already big
+FLY_BIG_ZDISP_MARGIN  = 0.20          # allow when zdisp ≥ Z_ENTRY + margin
+
+# Extra entry threshold if any leg is in short bucket (kept from earlier design)
+SHORT_END_EXTRA_Z     = 0.30
 
 #diag_backtest.py
 import os, sys, json, numpy as np, pandas as pd
@@ -358,35 +444,104 @@ def _safe_float(x):
     except Exception:
         return np.nan
 
-def _dispersion_ok(snap_last: pd.DataFrame, z_entry: float, min_sep_years: float) -> (bool, str, dict):
+def _dispersion_ok(
+    snap_last: pd.DataFrame,
+    z_entry: float,
+    min_sep_years: float
+) -> tuple[bool, str, dict]:
     """
-    Decide if this bucket has at least one tradable pair under very simple rules:
-      - at least 2 tenors with separation >= MIN_SEP_YEARS
-      - z-dispersion (max-min) >= Z_ENTRY
+    Decide if this snapshot has at least one tradable pair under simple tests:
+      - at least 2 tenors
+      - min tenor separation >= min_sep_years
+      - dispersion (cheap - rich) >= z_entry
+      - passes tolerant fly-gate (can be waived for large zdisp per config)
+
     Returns: (ok, reason, extras)
+      ok:     True if at least one candidate passes; else False
+      reason: 'ok' | 'no_data' | 'too_few_tenors' | 'sep_blocker'
+              | 'no_pair_meets_threshold' | 'fly_blocker'
+      extras: dict with small stats (z_range, n_tenors, etc.)
     """
-    extras = {}
-    if snap_last.empty:
+    extras: dict = {}
+
+    if snap_last is None or snap_last.empty:
         return False, "no_data", extras
 
-    ten = snap_last["tenor_yrs"].to_numpy()
-    if len(ten) < 2:
-        return False, "too_few_tenors", extras
+    # Required columns present
+    need = {"tenor_yrs", "rate", "z_comb"}
+    if not need.issubset(snap_last.columns):
+        extras["missing_cols"] = sorted(list(need - set(snap_last.columns)))
+        return False, "no_data", extras
 
-    ten_sorted = np.sort(ten)
-    if np.max(np.diff(ten_sorted)) < min_sep_years and (ten_sorted[-1]-ten_sorted[0] < min_sep_years):
-        # extremely conservative “sep blocker”: every pair too close
+    # Extract clean vectors
+    ten = snap_last["tenor_yrs"].to_numpy(dtype=float, copy=False)
+    z   = snap_last["z_comb"].to_numpy(dtype=float, copy=False)
+
+    # Filter NaNs
+    m = ~np.isnan(ten) & ~np.isnan(z)
+    if m.sum() < 2:
+        return False, "too_few_tenors", {"n_tenors": int(m.sum())}
+
+    ten = ten[m]
+    z   = z[m]
+
+    # Simple stats for the report
+    z_rng = float(np.nanmax(z) - np.nanmin(z))
+    extras.update({"n_tenors": int(ten.size), "z_range": z_rng})
+
+    # Sort by z to probe extremes
+    order = np.argsort(z)
+    ten_s = ten[order]
+    z_s   = z[order]
+
+    # Quick separation sanity: if *global* max separation < min_sep_years,
+    # everything will fail the pairwise check.
+    if (np.max(ten_s) - np.min(ten_s)) < min_sep_years:
         return False, "sep_blocker", extras
 
-    z = snap_last["z_comb"].astype(float).to_numpy()
-    if z.size == 0 or np.all(~np.isfinite(z)):
-        return False, "no_data", extras
+    # Build a small candidate pool from a few lows/highs
+    low_take  = min(5, len(z_s))
+    high_take = min(8, len(z_s))
 
-    z_rng = np.nanmax(z) - np.nanmin(z)
-    extras["z_range"] = _safe_float(z_rng)
-    if z_rng >= float(z_entry):
-        return True, "ok", extras
-    return False, "no_pair_meets_threshold", extras
+    any_meets_threshold = False
+    any_fly_blocked     = False
+
+    for i_low in range(low_take):
+        # "rich" = low z
+        T_rich, z_rich = ten_s[i_low], z_s[i_low]
+
+        for k in range(1, high_take + 1):
+            # "cheap" = high z
+            T_cheap, z_cheap = ten_s[-k], z_s[-k]
+
+            # separation
+            if abs(T_cheap - T_rich) < min_sep_years:
+                continue
+
+            zdisp = float(z_cheap - z_rich)
+            if zdisp < z_entry:
+                continue
+
+            any_meets_threshold = True  # at least one pair hits the raw z threshold
+
+            # --- tolerant fly gate (can waive for big zdisp) ---
+            leg_ok_cheap = fly_alignment_ok(T_cheap, +1.0, snap_last, zdisp_for_pair=zdisp)
+            leg_ok_rich  = fly_alignment_ok(T_rich,  -1.0, snap_last, zdisp_for_pair=zdisp)
+
+            if leg_ok_cheap and leg_ok_rich:
+                return True, "ok", extras  # we found a tradable pair
+            else:
+                any_fly_blocked = True
+
+    # No pair survived; decide the dominant reason
+    if not any_meets_threshold:
+        return False, "no_pair_meets_threshold", extras
+
+    if any_fly_blocked:
+        return False, "fly_blocker", extras
+
+    # Fallback (shouldn't usually reach here)
+    return False, "no_data", extras
 
 def _bucket_ts(df: pd.DataFrame, decision_freq: str) -> pd.Series:
     if decision_freq.upper() == "D":
@@ -958,12 +1113,28 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from cr_config import (
-    PATH_ENH, PATH_OUT,
-    DECISION_FREQ,
-    Z_ENTRY, Z_EXIT, Z_STOP, MAX_HOLD_DAYS,
-    BUCKETS, MIN_SEP_YEARS,
-    MAX_CONCURRENT_PAIRS, PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP,
-    FLY_GATE_ENABLE, FLY_DEFS, FLY_Z_MIN, FLY_ALIGN_MODE, SHORT_END_EXTRA_Z,
+    # paths + decision layer
+    PATH_ENH, PATH_OUT, DECISION_FREQ,
+
+    # thresholds
+    MIN_SEP_YEARS, Z_ENTRY, Z_EXIT, Z_STOP, MAX_HOLD_DAYS,
+
+    # capacity controls
+    BUCKETS, MAX_CONCURRENT_PAIRS,
+    PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP,
+    SHORT_END_EXTRA_Z,
+
+    # fly-gate knobs (same as diagnostics)
+    FLY_ENABLE,
+    FLY_MODE,
+    FLY_DEFS,
+    FLY_Z_MIN,
+    FLY_REQUIRE_COUNT,
+    FLY_NEIGHBOR_ONLY,
+    FLY_WINDOW_YEARS,
+    FLY_SKIP_SHORT_UNDER,
+    FLY_ALLOW_BIG_ZDISP,
+    FLY_BIG_ZDISP_MARGIN
 )
 
 # ------------------------
@@ -1002,43 +1173,75 @@ def _row_for_tenor(snap_last: pd.DataFrame, tenor: float) -> pd.Series | None:
     return r.iloc[0]
 
 def compute_fly_z(snap_last: pd.DataFrame, a: float, b: float, c: float) -> float | None:
-    """
-    Compute 0.5*(a+c)-b on the *z_comb* cross-section, then standardize by xs std (same cross-section).
-    """
-    ra = _row_for_tenor(snap_last, a)
-    rb = _row_for_tenor(snap_last, b)
-    rc = _row_for_tenor(snap_last, c)
-    if (ra is None) or (rb is None) or (rc is None):
+    """Standardized fly: (0.5*(a+c) - b) / cross-sec std(z_comb)."""
+    try:
+        zi_a = snap_last.loc[snap_last["tenor_yrs"] == a, "z_comb"]
+        zi_b = snap_last.loc[snap_last["tenor_yrs"] == b, "z_comb"]
+        zi_c = snap_last.loc[snap_last["tenor_yrs"] == c, "z_comb"]
+        if zi_a.empty or zi_b.empty or zi_c.empty:
+            return None
+        fly_raw = 0.5 * (float(zi_a.iloc[0]) + float(zi_c.iloc[0])) - float(zi_b.iloc[0])
+        xs = snap_last["z_comb"].astype(float)
+        sd = xs.std(ddof=1) if xs.size > 1 else 1.0
+        if not np.isfinite(sd) or sd <= 0:
+            sd = 1.0
+        return fly_raw / sd
+    except Exception:
         return None
-    za = _to_float(ra["z_comb"])
-    zb = _to_float(rb["z_comb"])
-    zc = _to_float(rc["z_comb"])
-    if any(np.isnan([za, zb, zc])):
-        return None
-    fly_shape = 0.5 * (za + zc) - zb
-    xs = snap_last["z_comb"].astype(float).to_numpy()
-    sd = np.nanstd(xs, ddof=1) if xs.size > 1 else 1.0
-    if not np.isfinite(sd) or sd <= 0:
-        sd = 1.0
-    return fly_shape / sd
 
-def fly_alignment_ok(leg_tenor: float, leg_sign_z: int, snap_last: pd.DataFrame) -> bool:
-    """
-    Gate entries using fly info. If disabled, always True.
-    leg_sign_z: +1 if we expect z to fall (cheap->rich), -1 if z to rise (rich->cheap).
-    """
-    if not FLY_GATE_ENABLE:
+def fly_alignment_ok(
+    leg_tenor: float,
+    leg_sign_z: float,                 # +1 for cheap (expect z ↓), -1 for rich (expect z ↑)
+    snap_last: pd.DataFrame,
+    *,
+    zdisp_for_pair: float | None = None
+) -> bool:
+    from cr_config import (
+        FLY_ENABLE, FLY_MODE, FLY_Z_MIN, FLY_NEIGHBOR_ONLY, FLY_WINDOW_YEARS,
+        FLY_REQUIRE_COUNT, FLY_SKIP_SHORT_UNDER, FLY_ALLOW_BIG_ZDISP, FLY_BIG_ZDISP_MARGIN,
+        FLY_DEFS, Z_ENTRY
+    )
+
+    if not FLY_ENABLE or FLY_MODE == "off":
         return True
-    for (a, b, c) in FLY_DEFS:
-        fz = compute_fly_z(snap_last, a, b, c)
-        if fz is None:
+
+    # Big dispersion → don't block
+    if (FLY_ALLOW_BIG_ZDISP and zdisp_for_pair is not None and
+        float(zdisp_for_pair) >= float(Z_ENTRY) + float(FLY_BIG_ZDISP_MARGIN)):
+        return True
+
+    # Skip very short end if requested
+    if FLY_SKIP_SHORT_UNDER is not None and leg_tenor < float(FLY_SKIP_SHORT_UNDER):
+        return True
+
+    # Choose triplets
+    triplets = FLY_DEFS
+    if FLY_NEIGHBOR_ONLY:
+        W = float(FLY_WINDOW_YEARS)
+        lo, hi = leg_tenor - W, leg_tenor + W
+        triplets = [(a,b,c) for (a,b,c) in FLY_DEFS if (a>=lo and c<=hi)]
+        if not triplets:  # no local flies → don't block
+            return True
+
+    # Count strong contradictions
+    opp, align = 0, 0
+    for (a,b,c) in triplets:
+        fz = compute_fly_z(snap_last, a,b,c)
+        if fz is None or abs(fz) < float(FLY_Z_MIN):
             continue
-        if abs(fz) < FLY_Z_MIN:
-            continue
-        if FLY_ALIGN_MODE == "strict" and np.sign(fz) != np.sign(leg_sign_z):
-            return False
-        if FLY_ALIGN_MODE == "loose" and (np.sign(fz) * np.sign(leg_sign_z) < 0):
-            return False
+        s = np.sign(fz) * np.sign(leg_sign_z)
+        if s > 0:      # contradicts expected reversion
+            opp += 1
+        elif s < 0:    # aligns with expected reversion
+            align += 1
+
+    mode = (FLY_MODE or "tolerant").lower()
+    if mode == "strict":
+        return opp == 0
+    if mode == "loose":
+        return opp < 1
+    if mode == "tolerant":
+        return opp < int(FLY_REQUIRE_COUNT)
     return True
 
 # ------------------------
@@ -1106,88 +1309,108 @@ def choose_pairs_under_caps(
     per_bucket_cap: float,
     total_cap: float,
     front_end_cap: float,
-    extra_z_entry: float,
-) -> list[tuple[pd.Series, pd.Series, float, float]]:
+    extra_z_entry: float
+):
     """
-    Returns a list of (cheap_row, rich_row, w_i, w_j).
-    Greedy across extremes of z_comb, with tenor uniqueness and DV01 caps.
+    Returns list of (cheap_row, rich_row, w_i, w_j).
+    Greedy: rank by dispersion, enforce tenor uniqueness & DV01 caps by bucket and total.
+    Uses tolerant fly gate; big zdisp can waive fly blocks.
     """
-    sig = snap_last[["tenor_yrs", "rate", "z_comb"]].dropna().copy()
+    # minimal columns required
+    cols_need = {"tenor_yrs", "rate", "z_comb"}
+    if not cols_need.issubset(snap_last.columns):
+        return []
+
+    sig = snap_last[list(cols_need)].dropna().copy()
     if sig.empty:
         return []
 
-    sig = sig.sort_values("z_comb")
-    used_tenors: set[float] = set()
-    candidates: list[tuple[float, pd.Series, pd.Series]] = []
+    # Sort cross-section by z to find extremes
+    sig = sig.sort_values("z_comb", kind="mergesort")  # stable sort
 
-    # Build candidate pairs from extremes
-    L = len(sig)
-    for k_low in range(min(6, L)):          # pick a few richest
+    candidates = []
+    used_tenors = set()
+
+    # Build pool from a few lowest and highest z points
+    low_take  = min(5, len(sig))
+    high_take = min(8, len(sig))
+
+    for k_low in range(low_take):
         rich = sig.iloc[k_low]
-        for k_hi in range(1, min(10, L) + 1):  # and several cheapest
+        for k_hi in range(1, high_take + 1):
             cheap = sig.iloc[-k_hi]
-            t_i = _to_float(cheap["tenor_yrs"]); t_j = _to_float(rich["tenor_yrs"])
-            if (t_i in used_tenors) or (t_j in used_tenors):
-                continue
-            if abs(t_i - t_j) < MIN_SEP_YEARS:
+
+            Ti, Tj = float(cheap["tenor_yrs"]), float(rich["tenor_yrs"])
+            if Ti in used_tenors or Tj in used_tenors:
                 continue
 
-            # Fly gate
-            if not fly_alignment_ok(t_i, +1, snap_last):  # cheap leg: expect z to fall
-                continue
-            if not fly_alignment_ok(t_j, -1, snap_last):  # rich leg: expect z to rise
+            # minimum tenor separation
+            if abs(Ti - Tj) < MIN_SEP_YEARS:
                 continue
 
-            zdisp = _to_float(cheap["z_comb"]) - _to_float(rich["z_comb"])
-            if not np.isfinite(zdisp) or (zdisp < (Z_ENTRY + extra_z_entry)):
+            zdisp = float(cheap["z_comb"] - rich["z_comb"])
+            if zdisp < (Z_ENTRY + float(extra_z_entry)):
+                continue
+
+            # tolerant fly gate (can waive if signal already large per config)
+            if not fly_alignment_ok(Ti, +1.0, snap_last, zdisp_for_pair=zdisp):
+                continue
+            if not fly_alignment_ok(Tj, -1.0, snap_last, zdisp_for_pair=zdisp):
                 continue
 
             candidates.append((zdisp, cheap, rich))
 
-    # pack under caps
-    selected: list[tuple[pd.Series, pd.Series, float, float]] = []
+    # Greedy pack by decreasing dispersion under DV01 caps
     bucket_dv01 = {b: 0.0 for b in BUCKETS.keys()}
-    total_dv = 0.0
+    total_dv01 = 0.0
+    selected = []
 
     for zdisp, cheap, rich in sorted(candidates, key=lambda x: x[0], reverse=True):
         if len(selected) >= max_pairs:
             break
 
-        t_i = _to_float(cheap["tenor_yrs"]); r_i = _to_float(cheap["rate"])
-        t_j = _to_float(rich["tenor_yrs"]);  r_j = _to_float(rich["rate"])
-        if (t_i in used_tenors) or (t_j in used_tenors):
+        Ti, Tj = float(cheap["tenor_yrs"]), float(rich["tenor_yrs"])
+        if Ti in used_tenors or Tj in used_tenors:
             continue
 
-        pv_i = pv01_proxy(t_i, r_i)
-        pv_j = pv01_proxy(t_j, r_j)
+        # PV01-neutral weights within the pair
+        pv_i = pv01_proxy(Ti, float(cheap["rate"]))
+        pv_j = pv01_proxy(Tj, float(rich["rate"]))
+        w_i =  1.0
+        w_j = - w_i * pv_i / (pv_j if pv_j != 0 else 1e-12)
 
-        w_i = 1.0
-        w_j = - w_i * pv_i / pv_j
+        # Bucket caps
+        b_i = assign_bucket(Ti)
+        b_j = assign_bucket(Tj)
+        dv_i = abs(w_i) * pv_i
+        dv_j = abs(w_j) * pv_j
 
-        b_i = assign_bucket(t_i); b_j = assign_bucket(t_j)
-        dv_i = abs(w_i) * pv_i; dv_j = abs(w_j) * pv_j
-
-        # bucket caps
-        if b_i in bucket_dv01 and (bucket_dv01[b_i] + dv_i > per_bucket_cap):
+        # per-bucket caps
+        if b_i in bucket_dv01 and (bucket_dv01[b_i] + dv_i) > per_bucket_cap:
             continue
-        if b_j in bucket_dv01 and (bucket_dv01[b_j] + dv_j > per_bucket_cap):
+        if b_j in bucket_dv01 and (bucket_dv01[b_j] + dv_j) > per_bucket_cap:
             continue
 
         # front-end aggregate cap
         short_add = (dv_i if b_i == "short" else 0.0) + (dv_j if b_j == "short" else 0.0)
         short_tot = bucket_dv01.get("short", 0.0)
-        if short_tot + short_add > front_end_cap:
+        if (short_tot + short_add) > front_end_cap:
             continue
 
         # total cap
-        if total_dv + dv_i + dv_j > total_cap:
+        if (total_dv01 + dv_i + dv_j) > total_cap:
+            continue
+
+        # extra threshold if any leg sits in the short bucket
+        if (b_i == "short" or b_j == "short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
             continue
 
         # accept
-        used_tenors.add(t_i); used_tenors.add(t_j)
+        used_tenors.add(Ti); used_tenors.add(Tj)
         bucket_dv01[b_i] = bucket_dv01.get(b_i, 0.0) + dv_i
         bucket_dv01[b_j] = bucket_dv01.get(b_j, 0.0) + dv_j
-        total_dv += dv_i + dv_j
+        total_dv01 += (dv_i + dv_j)
+
         selected.append((cheap, rich, w_i, w_j))
 
     return selected
