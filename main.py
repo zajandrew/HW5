@@ -1,3 +1,186 @@
+VARIANTS = [
+    # --- Core fly settings used across variants unless noted ---
+    # FLY_ALLOW_BIG_ZDISP=True (with margin), NEIGHBOR_ONLY=True, REQUIRE_COUNT=1
+    # Window/Z_MIN toggled a bit to test curvature bite; skip-short tests 1y vs 2y.
+
+    # 1–5: early entries, quicker exits, longer holds to reduce max_hold
+    {"_id":1, "desc":"tol | early+quick | mid hold | safer caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":2, "desc":"tol | early+quick | long hold",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":3, "desc":"tol | early+quick | mid hold | tighter caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.0,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":4, "desc":"tol | early+quick | mid hold | diversify 4 pairs",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":4},
+
+    {"_id":5, "desc":"tol | early+quick | long hold | diversify 4 pairs",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":4},
+
+    # 6–9: moderate entries, still quick exits; mix caps/holds
+    {"_id":6, "desc":"tol | Z_ENTRY=0.9 | quick exit | mid hold | safer caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.9,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":7, "desc":"tol | Z_ENTRY=0.9 | quick exit | long hold | tighter caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.9,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.0,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":8, "desc":"tol | Z_ENTRY=0.9 | Z_EXIT=0.4 | mid hold | safer caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.4,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":0.9,"Z_EXIT":0.4,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":9, "desc":"tol | Z_ENTRY=1.0 | Z_EXIT=0.35 | long hold | safer caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.0,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    # 10–12: higher selectivity entries to curb DD, with faster profit-take
+    {"_id":10, "desc":"tol | selective (1.15) | quick exit | mid hold | safer caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.15,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":11, "desc":"tol | selective (1.15) | quick exit | long hold | tighter caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.15,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.0,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":12, "desc":"tol | selective (1.15) | Z_EXIT=0.4 | mid hold | diversify 4 pairs",
+      "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+      "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+      "Z_ENTRY":1.15,"Z_EXIT":0.4,"MAX_HOLD_DAYS":15,
+      "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":4},
+
+    # 13–16: compare 'loose' to 'tolerant' in sweet spot
+    {"_id":13, "desc":"loose | early+quick | mid hold | safer caps",
+     "FLY_MODE":"loose","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,
+     "Z_ENTRY":0.85,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":14, "desc":"loose | Z_ENTRY=0.9 | quick exit | long hold",
+     "FLY_MODE":"loose","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,
+     "Z_ENTRY":0.9,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":15, "desc":"loose | Z_ENTRY=1.0 | Z_EXIT=0.4 | mid hold | tighter caps",
+     "FLY_MODE":"loose","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,
+     "Z_ENTRY":1.0,"Z_EXIT":0.4,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.0,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":16, "desc":"loose | Z_ENTRY=1.15 | quick exit | mid hold | diversify 4 pairs",
+     "FLY_MODE":"loose","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,
+     "Z_ENTRY":1.15,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":4},
+
+    # 17–20: balanced “new baselines” you can compare head-to-head
+    {"_id":17, "desc":"tol | balanced core | mid hold",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.0,"Z_EXIT":0.4,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":18, "desc":"tol | balanced core | long hold",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.5,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.0,"Z_EXIT":0.35,"MAX_HOLD_DAYS":20,
+     "PER_BUCKET_DV01_CAP":0.7,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":19, "desc":"tol | defensive core | mid hold | tighter caps",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":2.0,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":2.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.0,"Z_EXIT":0.35,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.0,"MAX_CONCURRENT_PAIRS":3},
+
+    {"_id":20, "desc":"tol | selective core | mid hold | diversify 4 pairs",
+     "FLY_MODE":"tolerant","FLY_ALLOW_BIG_ZDISP":True,"FLY_BIG_ZDISP_MARGIN":0.6,
+     "FLY_Z_MIN":0.6,"FLY_WINDOW_YEARS":1.5,"FLY_NEIGHBOR_ONLY":True,"FLY_SKIP_SHORT_UNDER":1.0,"FLY_REQUIRE_COUNT":1,
+     "Z_ENTRY":1.15,"Z_EXIT":0.4,"MAX_HOLD_DAYS":15,
+     "PER_BUCKET_DV01_CAP":0.5,"TOTAL_DV01_CAP":1.5,"MAX_CONCURRENT_PAIRS":4},
+]
+
+# === Add derived columns & sort (PASTE RIGHT AFTER: df = pd.DataFrame(rows)) ===
+
+# Safe helpers to avoid divide-by-zero
+def _safe_div(a, b):
+    try:
+        return float(a) / float(b) if (b not in (0, None) and pd.notna(b)) else np.nan
+    except Exception:
+        return np.nan
+
+# Core risk/quality metrics
+df["reversion_ratio"] = [_safe_div(r.get("exit_reversion", np.nan), r.get("trades", np.nan)) for r in rows]
+df["maxhold_ratio"]   = [_safe_div(r.get("exit_max_hold", np.nan), r.get("trades", np.nan)) for r in rows]
+df["stop_ratio"]      = [_safe_div(r.get("exit_stop", np.nan), r.get("trades", np.nan)) for r in rows]
+
+# Drawdown diagnostics
+df["dd_ratio"]        = df.apply(lambda r: _safe_div(r["max_drawdown"], r["cum_pnl"]) if r["cum_pnl"] > 0 else np.nan, axis=1)
+
+# Sharpe-like (already computed in your sweeper as mean_over_std; keep a clean alias)
+df["sharpe_like"]     = df.get("mean_over_std", np.nan)
+
+# Blended score: profit minus a penalty on drawdown (tune the 0.25 if you like)
+df["score"]           = df["cum_pnl"] - 0.25 * df["max_drawdown"]
+
+# Optional: risk-adjusted cum pnl (normalized by 1 + DD)
+df["cum_over_dd"]     = df.apply(lambda r: _safe_div(r["cum_pnl"], 1.0 + max(0.0, r["max_drawdown"])), axis=1)
+
+# Choose a clean column order for review
+_cols = [
+    # objective
+    "score", "cum_pnl", "max_drawdown", "dd_ratio", "sharpe_like", "cum_over_dd",
+    # trade quality
+    "trades", "avg_pnl_per_trade", "reversion_ratio", "maxhold_ratio", "stop_ratio",
+    # raw counts (nice for sanity)
+    "exit_reversion", "exit_max_hold", "exit_stop",
+    # key knobs you swept (include whatever you used)
+    "FLY_MODE", "FLY_ALLOW_BIG_ZDISP", "FLY_BIG_ZDISP_MARGIN",
+    "FLY_Z_MIN", "FLY_WINDOW_YEARS", "FLY_SKIP_SHORT_UNDER", "FLY_REQUIRE_COUNT",
+    "Z_ENTRY", "Z_EXIT", "MAX_HOLD_DAYS", "PER_BUCKET_DV01_CAP", "TOTAL_DV01_CAP", "MAX_CONCURRENT_PAIRS"
+]
+# Keep only columns that exist (in case some knobs weren’t in your variants)
+_cols = [c for c in _cols if c in df.columns]
+
+# Final sorted table: prioritize score, then higher reversion_ratio, then lower dd_ratio
+df = (df
+      .sort_values(["score", "reversion_ratio", "dd_ratio"], ascending=[False, False, True])
+      .reset_index(drop=True))
+
+# Reorder for display/save (don’t drop other columns; just put the important ones first)
+front = [c for c in _cols if c in df.columns]
+df = df[front + [c for c in df.columns if c not in front]]
+# === end snippet ===
+
 # === Robust Cheap–Rich parameter sweeper (Daily cadence) ===
 # Put this in the same folder as cr_config.py and portfolio_test.py
 
