@@ -1,3 +1,12 @@
+ledger["dv01_leg_i"] = np.abs(ledger["w_i"]) * ledger["tenor_i"] / (1 + 0.01*ledger["rate_i"])
+ledger["dv01_leg_j"] = np.abs(ledger["w_j"]) * ledger["tenor_j"] / (1 + 0.01*ledger["rate_j"])
+ledger["pair_dv01"]  = ledger["dv01_leg_i"] + ledger["dv01_leg_j"]
+
+# average and peak concurrent exposure
+avg_dv01 = ledger.groupby("decision_ts")["pair_dv01"].sum().mean()
+max_dv01 = ledger.groupby("decision_ts")["pair_dv01"].sum().max()
+print(f"Average concurrent DV01 units: {avg_dv01:.2f}, peak: {max_dv01:.2f}")
+
 # === RV analytics (drop-in) ==============================================
 from pathlib import Path
 import numpy as np, pandas as pd
