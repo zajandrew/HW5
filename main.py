@@ -1,3 +1,157 @@
+# === RV analytics (drop-in) ==============================================
+from pathlib import Path
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display, HTML
+import cr_config as cr
+
+PATH_OUT = Path(cr.PATH_OUT)
+SFX = (getattr(cr, "ENH_SUFFIX", "") or "").lower()
+
+files = {
+    "positions": PATH_OUT / f"positions_ledger{SFX}.parquet",
+    "marks":     PATH_OUT / f"marks_ledger{SFX}.parquet",
+    "pnl":       PATH_OUT / f"pnl_by_bucket{SFX}.parquet",
+}
+
+dfs = {}
+for k, p in files.items():
+    if p.exists():
+        dfs[k] = pd.read_parquet(p)
+        print(f"[OK] {k}: {len(dfs[k]):,} rows ({p.name})")
+    else:
+        print(f"[MISS] {k}: {p.name}")
+
+def _assign_bucket(tenor):
+    for name, (lo, hi) in cr.BUCKETS.items():
+        if (tenor >= lo) and (tenor <= hi): return name
+    return "other"
+
+def _safe_div(a, b):
+    try:
+        return float(a) / float(b) if (b not in (0, None) and pd.notna(b) and float(b)!=0) else np.nan
+    except Exception:
+        return np.nan
+
+# -------------------- Position-level stats --------------------
+pos = dfs.get("positions", pd.DataFrame()).copy()
+marks = dfs.get("marks", pd.DataFrame()).copy()
+by   = dfs.get("pnl", pd.DataFrame()).copy()
+
+if not pos.empty:
+    # Buckets for each leg
+    pos["bucket_i"] = pos["tenor_i"].astype(float).map(_assign_bucket)
+    pos["bucket_j"] = pos["tenor_j"].astype(float).map(_assign_bucket)
+    pos["win"] = pos["pnl"] > 0
+    pos["days_held_equiv"] = pd.to_numeric(pos["days_held_equiv"], errors="coerce")
+
+    # Exit reason distribution
+    exit_ct = pos["exit_reason"].value_counts().rename_axis("exit_reason").to_frame("count")
+
+    # Core stats
+    n_trades = len(pos)
+    win_rate = _safe_div(pos["win"].sum(), n_trades)
+    avg_pnl  = pos["pnl"].mean()
+    med_pnl  = pos["pnl"].median()
+    p90_pnl  = pos["pnl"].quantile(0.90)
+    hold_mean = pos["days_held_equiv"].mean()
+    hold_p90  = pos["days_held_equiv"].quantile(0.90)
+
+    # By bucket contribution (using leg i as proxy; you can do both legs if preferred)
+    by_bucket = pos.groupby("bucket_i")["pnl"].sum().rename("cum_pnl").sort_values(ascending=False).to_frame()
+
+# -------------------- Time-series PnL & risk --------------------
+daily = pd.DataFrame()
+if not by.empty:
+    # Normalize to calendar day for a clean equity curve (works for D and H)
+    daily = by.copy()
+    daily["date"] = pd.to_datetime(daily["bucket"]).dt.floor("D")
+    daily = (daily.groupby("date")["pnl"].sum()
+                   .rename("daily_pnl").to_frame().reset_index())
+    daily = daily.sort_values("date")
+    daily["cum_pnl"] = daily["daily_pnl"].cumsum()
+
+    # Max drawdown on the daily curve
+    eq = daily["cum_pnl"].astype(float)
+    roll_max = eq.cummax()
+    dd = roll_max - eq
+    max_dd = float(dd.max())
+    dd_end_idx = int(dd.idxmax()) if len(dd) else 0
+    dd_end_date = daily.iloc[dd_end_idx]["date"] if len(daily) else None
+
+    # Simple Sharpe-like on (bucket) PnL
+    pnl_mean = by["pnl"].astype(float).mean()
+    pnl_std  = by["pnl"].astype(float).std(ddof=1)
+    sharpe_like = _safe_div(pnl_mean, pnl_std)
+
+# -------------------- Open vs Closed sanity (position-level) --------------------
+open_now_ct = np.nan
+if not marks.empty:
+    key = ["open_ts", "tenor_i", "tenor_j"]
+    last_mark = (marks.loc[marks["event"]=="mark"]
+                      .sort_values(key + ["decision_ts"])
+                      .groupby(key, as_index=False)
+                      .tail(1))
+    open_now_ct = int((last_mark["closed"]==False).sum())
+
+# -------------------- Display --------------------
+display(HTML("<h3>Summary</h3>"))
+summary_rows = []
+
+if not pos.empty:
+    summary_rows += [
+        ("Trades (closed)", n_trades),
+        ("Win rate", f"{100.0*win_rate:.1f}%"),
+        ("Avg PnL / trade", f"{avg_pnl:,.2f}"),
+        ("Median PnL / trade", f"{med_pnl:,.2f}"),
+        ("90th pct PnL / trade", f"{p90_pnl:,.2f}"),
+        ("Mean hold (days eq.)", f"{hold_mean:.2f}"),
+        ("P90 hold (days eq.)", f"{hold_p90:.2f}"),
+    ]
+if not by.empty:
+    summary_rows += [
+        ("Cum PnL", f"{float(daily['cum_pnl'].iloc[-1]):,.2f}" if len(daily) else "—"),
+        ("Max drawdown", f"{max_dd:,.2f}"),
+        ("Sharpe-like (mean/std, bucket PnL)", f"{sharpe_like:.3f}"),
+    ]
+if not marks.empty:
+    summary_rows += [("Open positions at end", open_now_ct)]
+
+display(pd.DataFrame(summary_rows, columns=["metric", "value"]))
+
+if not pos.empty:
+    display(HTML("<h4>Exit reason counts</h4>"))
+    display(exit_ct)
+    display(HTML("<h4>PnL by bucket (leg i proxy)</h4>"))
+    display(by_bucket)
+
+# -------------------- Plots --------------------
+if not daily.empty:
+    plt.figure()
+    plt.plot(daily["date"], daily["cum_pnl"])
+    plt.title("Cumulative PnL")
+    plt.xlabel("Date"); plt.ylabel("Cum PnL")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+    plt.figure()
+    plt.plot(daily["date"], daily["daily_pnl"])
+    plt.title("Daily PnL")
+    plt.xlabel("Date"); plt.ylabel("PnL")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+    # Drawdown curve (optional)
+    plt.figure()
+    plt.plot(daily["date"], (daily["cum_pnl"].cummax() - daily["cum_pnl"]))
+    plt.title("Drawdown")
+    plt.xlabel("Date"); plt.ylabel("DD")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+else:
+    print("No time-series PnL loaded; skipping plots.")
+# =======================================================================
+
 # Jupyter one-off: add "_D" suffix to enhanced files and sweeper outputs
 
 from pathlib import Path
