@@ -222,6 +222,7 @@ def choose_pairs_under_caps(
     high_take = min(8, len(sig))
 
     MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
+    MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10))
     Z_ENTRY       = float(getattr(cr, "Z_ENTRY", 0.75))
     SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
 
@@ -236,6 +237,9 @@ def choose_pairs_under_caps(
 
             # minimum tenor separation
             if abs(Ti - Tj) < MIN_SEP_YEARS:
+                continue
+            # maximum tenor separation
+            if abs(Ti - Tj) > MAX_SPAN_YEARS:
                 continue
 
             zdisp = float(cheap["z_comb"] - rich["z_comb"])
