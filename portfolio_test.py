@@ -357,88 +357,81 @@ def _pnl_curve_png(yymm: str) -> Path:
 # ------------------------
 # Month runner
 # ------------------------
-def run_month(yymm: str, decision_freq: str | None = None):
+def run_month(
+    yymm: str,
+    *,
+    decision_freq: str | None = None,
+    open_positions: list[PairPos] | None = None,   # carry-in
+    carry_in: bool = True                           # if False, ignore any carry-in
+):
     """
-    Load enhanced features for a month and run the cheap-rich portfolio selection.
+    Run a single month. If 'open_positions' is provided and carry_in=True,
+    they are continued (aged/marked/exited) through this month.
+    Returns: (closed_positions_df, ledger_df, pnl_by_df, open_positions_out)
+    where open_positions_out are the still-open positions to carry into next month.
     """
-    if decision_freq is None:
-        decision_freq = str(getattr(cr, "DECISION_FREQ", "D"))
+    decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
-    enh_path = _enhanced_in_path(yymm)
+    # File naming with suffix (D/H) — assumes you already use cr._suffix()
+    suff = cr._suffix(decision_freq)
+    enh_path = Path(cr.PATH_ENH) / f"{yymm}_enh{suff}.parquet"
     if not enh_path.exists():
         raise FileNotFoundError(f"Missing enhanced file {enh_path}. Run feature_creation.py first.")
 
     df = pd.read_parquet(enh_path)
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), (open_positions or [])
 
-    # Required columns
     need = {"ts", "tenor_yrs", "rate", "z_spline", "z_pca", "z_comb"}
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"{enh_path} missing columns: {missing}")
 
-    # Time / decision bins
+    # Decision buckets & decisions-per-day
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
-    decision_freq_upper = decision_freq.upper()
-    if decision_freq_upper == "D":
+    if decision_freq == "D":
         df["decision_ts"] = df["ts"].dt.floor("D")
         decisions_per_day = 1
-    elif decision_freq_upper == "H":
+    elif decision_freq == "H":
         df["decision_ts"] = df["ts"].dt.floor("H")
-        decisions_per_day = 24  # provisional; we’ll refine below
-    else:
-        raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
-
-    # Outputs
-    open_positions: list[PairPos] = []
-    ledger_rows: list[dict] = []
-    closed_rows: list[dict] = []
-
-    # After you create df["decision_ts"], only once per month:
-    if decision_freq_upper == "H":
+        # compute actual # decisions per trading day in this month
         per_day_counts = df.groupby(df["decision_ts"].dt.floor("D"))["decision_ts"].nunique()
         decisions_per_day = int(per_day_counts.mean()) if len(per_day_counts) else 24
     else:
-        decisions_per_day = 1
-    
-    MAX_HOLD_DAYS = float(getattr(cr, "MAX_HOLD_DAYS", 10))
-    Z_EXIT        = float(getattr(cr, "Z_EXIT", 0.40))
-    Z_STOP        = float(getattr(cr, "Z_STOP", 3.00))
-    Z_ENTRY       = float(getattr(cr, "Z_ENTRY", 0.75))
-    MAX_CONCURRENT_PAIRS = int(getattr(cr, "MAX_CONCURRENT_PAIRS", 3))
-    PER_BUCKET_DV01_CAP  = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
-    TOTAL_DV01_CAP       = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
-    FRONT_END_DV01_CAP   = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
-    SHORT_END_EXTRA_Z    = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
+        raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
-    max_hold_decisions = int(MAX_HOLD_DAYS * decisions_per_day)
+    max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
 
-    # Iterate decisions in time order
+    # Carry-in
+    open_positions = (open_positions or []) if carry_in else []
+
+    ledger_rows: list[dict] = []
+    closed_rows: list[dict] = []
+
+    # Iterate decisions
     for dts, snap in df.groupby("decision_ts", sort=True):
-        # latest tick per tenor within the decision bucket
-        snap_last = (snap.sort_values("ts")
-                          .groupby("tenor_yrs", as_index=False)
-                          .tail(1)
-                          .reset_index(drop=True))
-
+        snap_last = (
+            snap.sort_values("ts")
+                .groupby("tenor_yrs", as_index=False)
+                .tail(1)
+                .reset_index(drop=True)
+        )
         if snap_last.empty:
             continue
 
-        # 1) Mark & exit evaluation
-        still_open = []
+        # 1) Mark & evaluate exits on any open (carried + this month’s)
+        still_open: list[PairPos] = []
         for pos in open_positions:
             zsp = pos.mark(snap_last)
-
-            # exit rules
-            if np.isfinite(zsp) and abs(zsp) <= Z_EXIT:
-                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "reversion"
-            elif np.isfinite(zsp) and np.isfinite(pos.entry_zspread) and abs(zsp - pos.entry_zspread) >= Z_STOP:
-                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "stop"
+            # Exit rules
+            if np.isfinite(zsp) and abs(zsp) <= cr.Z_EXIT:
+                pos.closed, pos.close_ts, pos.exit_reason = True, dts, "reversion"
+            elif np.isfinite(zsp) and np.isfinite(pos.entry_zspread) and abs(zsp - pos.entry_zspread) >= cr.Z_STOP:
+                pos.closed, pos.close_ts, pos.exit_reason = True, dts, "stop"
             elif pos.age_decisions >= max_hold_decisions:
-                pos.closed = True; pos.close_ts = dts; pos.exit_reason = "max_hold"
+                pos.closed, pos.close_ts, pos.exit_reason = True, dts, "max_hold"
 
-            # ledger mark
+            # Ledger mark
             ledger_rows.append({
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
@@ -462,21 +455,21 @@ def run_month(yymm: str, decision_freq: str | None = None):
 
         open_positions = still_open
 
-        # 2) Entries (under caps)
+        # 2) New entries under caps
         selected = choose_pairs_under_caps(
             snap_last=snap_last,
-            max_pairs=max(0, MAX_CONCURRENT_PAIRS - len(open_positions)),
-            per_bucket_cap=PER_BUCKET_DV01_CAP,
-            total_cap=TOTAL_DV01_CAP,
-            front_end_cap=FRONT_END_DV01_CAP,
-            extra_z_entry=0.0  # we enforce SHORT_END_EXTRA_Z per-pair below
+            max_pairs=max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions)),
+            per_bucket_cap=cr.PER_BUCKET_DV01_CAP,
+            total_cap=cr.TOTAL_DV01_CAP,
+            front_end_cap=cr.FRONT_END_DV01_CAP,
+            extra_z_entry=0.0  # short-end extra handled inside chooser using SHORT_END_EXTRA_Z
         )
 
         for (cheap, rich, w_i, w_j) in selected:
             t_i = _to_float(cheap["tenor_yrs"]); t_j = _to_float(rich["tenor_yrs"])
             if (assign_bucket(t_i) == "short") or (assign_bucket(t_j) == "short"):
                 zdisp = _to_float(cheap["z_comb"]) - _to_float(rich["z_comb"])
-                if not np.isfinite(zdisp) or (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
+                if not np.isfinite(zdisp) or (zdisp < (cr.Z_ENTRY + cr.SHORT_END_EXTRA_Z)):
                     continue
 
             pos = PairPos(open_ts=dts, cheap_row=cheap, rich_row=rich,
@@ -489,58 +482,81 @@ def run_month(yymm: str, decision_freq: str | None = None):
                 "entry_zspread": pos.entry_zspread
             })
 
-    # Finalize outputs
+    # Outputs for this month (closed only)
     pos_df = pd.DataFrame(closed_rows)
     ledger = pd.DataFrame(ledger_rows)
 
-    # PnL by day/hour from marks
-    DECISION_FREQ = str(getattr(cr, "DECISION_FREQ", "D")).upper()
+    # PnL by bucket from marks
     if not ledger.empty:
         marks = ledger[ledger["event"] == "mark"].copy()
-        if DECISION_FREQ == "D":
-            idx = marks["decision_ts"].dt.floor("D")
-        else:
-            idx = marks["decision_ts"].dt.floor("H")
+        idx = marks["decision_ts"].dt.floor("D" if decision_freq == "D" else "H")
         pnl_by = marks.groupby(idx)["pnl"].sum().rename("pnl").to_frame().reset_index()
         pnl_by = pnl_by.rename(columns={"decision_ts": "bucket"})
     else:
         pnl_by = pd.DataFrame(columns=["bucket", "pnl"])
 
-    # Optional monthly PnL curve (daily aggregation for readability)
-    if not pnl_by.empty:
-        daily = pnl_by.copy()
-        daily["date"] = pd.to_datetime(daily["bucket"]).dt.floor("D")
-        daily = daily.groupby("date")["pnl"].sum().rename("daily_pnl").to_frame().reset_index()
-        daily = daily.sort_values("date")
-        daily["cum"] = daily["daily_pnl"].cumsum()
-        plt.figure()
-        plt.plot(daily["date"], daily["cum"])
-        plt.title(f"Cumulative PnL proxy {yymm}")
-        plt.xlabel("Date"); plt.ylabel("Cum PnL")
-        out_png = _pnl_curve_png(yymm)
-        plt.savefig(out_png, dpi=120, bbox_inches="tight")
-        plt.close()
-
-    return pos_df, ledger, pnl_by
+    return pos_df, ledger, pnl_by, open_positions  # carry-out
+            
 
 # ------------------------
 # Multi-month runner
 # ------------------------
-def run_all(yymms: list[str]):
+# --- REPLACE your existing run_all with this ---
+def run_all(
+    yymms: list[str],
+    *,
+    decision_freq: str | None = None,
+    carry: bool = True,
+    force_close_end: bool = False
+):
+    """
+    Run multiple months, carrying open positions across months when carry=True.
+    If force_close_end=True, anything still open after the last month is
+    closed at the final bucket time (exit_reason='eoc' end-of-cycle).
+    Returns concatenated (positions_closed, ledger, pnl_by).
+    """
+    decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     all_pos, all_ledger, all_by = [], [], []
-    DECISION_FREQ = str(getattr(cr, "DECISION_FREQ", "D"))
+    open_positions: list[PairPos] = []
+
     print(f"[INFO] months: {len(yymms)} -> {yymms}")
     for yymm in yymms:
         print(f"[RUN] month {yymm}")
-        p, l, b = run_month(yymm, decision_freq=DECISION_FREQ)
+        p, l, b, open_positions = run_month(
+            yymm,
+            decision_freq=decision_freq,
+            open_positions=open_positions,
+            carry_in=carry
+        )
         if not p.empty: all_pos.append(p.assign(yymm=yymm))
         if not l.empty: all_ledger.append(l.assign(yymm=yymm))
         if not b.empty: all_by.append(b.assign(yymm=yymm))
-        print(f"[DONE] {yymm} | pos={0 if p is None else len(p)} "
-              f"ledger={0 if l is None else len(l)} by={0 if b is None else len(b)}")
+        print(f"[DONE] {yymm} | closed={len(p)} | open_carry={len(open_positions)}")
+
+    # Optionally force-close what's left after the last month for tidy reporting
+    if force_close_end and open_positions:
+        # final timestamp = last bucket of last processed month (from ledger/by if present)
+        if all_ledger:
+            final_ts = max(x["decision_ts"].max() for x in all_ledger if not x.empty)
+        else:
+            # Fallback: synthesize month end
+            final_ts = pd.Timestamp.now()
+        closed_rows = []
+        for pos in open_positions:
+            pos.closed, pos.close_ts, pos.exit_reason = True, final_ts, "eoc"
+            closed_rows.append({
+                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "w_i": pos.w_i, "w_j": pos.w_j, "entry_zspread": pos.entry_zspread,
+                "pnl": pos.pnl, "days_held_equiv": pos.age_decisions / max(1, pos.decisions_per_day),
+                "conv_proxy": pos.conv_pnl_proxy
+            })
+        if closed_rows:
+            all_pos.append(pd.DataFrame(closed_rows).assign(yymm=yymms[-1]))
+
     pos = pd.concat(all_pos, ignore_index=True) if all_pos else pd.DataFrame()
     led = pd.concat(all_ledger, ignore_index=True) if all_ledger else pd.DataFrame()
-    by  = pd.concat(all_by, ignore_index=True) if all_by else pd.DataFrame()
+    by  = pd.concat(all_by,  ignore_index=True) if all_by  else pd.DataFrame()
     return pos, led, by
 
 # ------------------------
@@ -551,8 +567,9 @@ if __name__ == "__main__":
         print("Usage: python portfolio_test.py 2304 [2305 2306 ...]")
         sys.exit(1)
     months = sys.argv[1:]
-    pos, led, by = run_all(months)
-    if not pos.empty: pos.to_parquet(_positions_out_path())
-    if not led.empty: led.to_parquet(_marks_out_path())
-    if not by.empty:  by.to_parquet(_pnl_out_path())
+    pos, led, by = run_all(months, carry=True, force_close_end=False)  # keep positions alive
+    out_dir = Path(cr.PATH_OUT); out_dir.mkdir(parents=True, exist_ok=True)
+    if not pos.empty: pos.to_parquet(out_dir / f"positions_ledger{cr._suffix()}.parquet")
+    if not led.empty: led.to_parquet(out_dir / f"marks_ledger{cr._suffix()}.parquet")
+    if not by.empty:  by.to_parquet(out_dir / f"pnl_by_bucket{cr._suffix()}.parquet")
     print("[DONE]")
