@@ -1,3 +1,28 @@
+import pandas as pd
+import overlay_diag as od
+
+hedge_df = pd.read_parquet("my_trade_tape.parquet")
+months = ["2304", "2305"]
+
+diag = od.analyze_overlay(months, hedge_df)
+
+# See why things are failing:
+diag["reason"].value_counts()
+
+# Look at failed ones by category:
+diag[diag["reason"] == "no_exec_tenor"].head()
+diag[diag["reason"] == "no_zdisp_ge_entry"].head()
+diag[diag["reason"] == "fly_block"].head()
+diag[diag["reason"] == "caps_block"].head()
+
+# Check that any would have opened:
+diag[diag["reason"] == "opened"].head()
+
+
+
+
+
+
 ledger["dv01_leg_i"] = np.abs(ledger["w_i"]) * ledger["tenor_i"] / (1 + 0.01*ledger["rate_i"])
 ledger["dv01_leg_j"] = np.abs(ledger["w_j"]) * ledger["tenor_j"] / (1 + 0.01*ledger["rate_j"])
 ledger["pair_dv01"]  = ledger["dv01_leg_i"] + ledger["dv01_leg_j"]
