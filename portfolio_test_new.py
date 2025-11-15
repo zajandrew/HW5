@@ -212,6 +212,9 @@ def fly_alignment_ok(
 # ------------------------
 # Pair object
 # ------------------------
+# ------------------------
+# Pair object
+# ------------------------
 class PairPos:
     def __init__(
         self,
@@ -224,12 +227,17 @@ class PairPos:
         *,
         scale_dv01: float = 1.0,
         mode: str = "strategy",
-        meta: Optional[Dict] = None
+        meta: Optional[Dict] = None,
+        dir_sign: Optional[float] = None,
     ):
         """
         cheap_row / rich_row naming is historical; in overlay mode, these can be
         interpreted as (alt_leg, exec_leg). Orientation is fully captured by w_i/w_j
         and side sign when we construct the pair.
+
+        dir_sign:
+          - If provided, this is the "direction" in z-space we care about for exits.
+          - If None, we default to sign(entry_zspread) (cheap minus rich).
         """
         self.open_ts = open_ts
 
@@ -244,6 +252,19 @@ class PairPos:
         zi = _to_float(cheap_row["z_comb"])
         zj = _to_float(rich_row["z_comb"])
         self.entry_zspread = zi - zj
+
+        # Direction in z-space (cheap-rich) that we care about for exits.
+        if dir_sign is None or not np.isfinite(dir_sign) or dir_sign == 0.0:
+            if np.isfinite(self.entry_zspread) and self.entry_zspread != 0.0:
+                self.dir_sign = float(np.sign(self.entry_zspread))
+            else:
+                # Fallback: treat positive direction as default
+                self.dir_sign = 1.0
+        else:
+            self.dir_sign = float(dir_sign)
+
+        # Directional z at entry (used for reversion/stop logic)
+        self.entry_z_dir = self.dir_sign * self.entry_zspread
 
         self.closed = False
         self.close_ts = None
@@ -270,6 +291,7 @@ class PairPos:
 
         # attribution proxy
         self.last_zspread = self.entry_zspread
+        self.last_z_dir = self.entry_z_dir
         self.conv_pnl_proxy = 0.0
 
     def mark(self, snap_last: pd.DataFrame):
@@ -291,14 +313,20 @@ class PairPos:
         zj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "z_comb"])
         zsp = zi - zj
 
+        # Update convergence proxy in raw z-spread space
         if np.isfinite(zsp) and np.isfinite(self.last_zspread):
             self.conv_pnl_proxy += (self.last_zspread - zsp) * 10.0
         self.last_zspread = zsp
 
+        # Also keep a directional z for exit logic
+        if np.isfinite(zsp) and np.isfinite(self.dir_sign):
+            self.last_z_dir = self.dir_sign * zsp
+        else:
+            self.last_z_dir = np.nan
+
         # age by one decision step
         self.age_decisions += 1
         return zsp
-
 
 # ------------------------
 # Greedy selector with caps (Mode A: strategy)
@@ -571,27 +599,51 @@ def run_month(
             zsp = pos.mark(snap_last)
             entry_z = pos.entry_zspread
 
-            # Directional reversion logic:
-            # - same side of zero as entry
-            # - closer to zero than entry
-            # - inside Z_EXIT band
-            if np.isfinite(zsp) and np.isfinite(entry_z):
-                same_sign = (np.sign(zsp) == np.sign(entry_z)) and (np.sign(entry_z) != 0)
-                moved_towards_zero = abs(zsp) <= abs(entry_z)
-                within_exit = abs(zsp) <= Z_EXIT
+            Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
+            Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
 
-                if same_sign and moved_towards_zero and within_exit:
-                    pos.closed, pos.close_ts, pos.exit_reason = True, dts, "reversion"
-                elif abs(zsp - entry_z) >= Z_STOP:
-                    pos.closed, pos.close_ts, pos.exit_reason = True, dts, "stop"
-                elif pos.age_decisions >= max_hold_decisions:
-                    pos.closed, pos.close_ts, pos.exit_reason = True, dts, "max_hold"
-            else:
-                # Fallback when entry_z is NaN: no directional reversion, only stop/max-hold
-                if np.isfinite(zsp) and abs(zsp) >= Z_STOP:
-                    pos.closed, pos.close_ts, pos.exit_reason = True, dts, "stop"
-                elif pos.age_decisions >= max_hold_decisions:
-                    pos.closed, pos.close_ts, pos.exit_reason = True, dts, "max_hold"
+            exit_flag = None
+
+            if np.isfinite(zsp) and np.isfinite(entry_z):
+                # Directional z at entry / current (cheap–rich space)
+                entry_dir = getattr(pos, "entry_z_dir", pos.dir_sign * entry_z)
+                curr_dir  = getattr(pos, "last_z_dir", pos.dir_sign * zsp)
+
+                if np.isfinite(entry_dir) and np.isfinite(curr_dir):
+                    sign_entry = np.sign(entry_dir)
+                    sign_curr  = np.sign(curr_dir)
+
+                    same_side = (sign_entry != 0) and (sign_entry == sign_curr)
+
+                    # Has z moved toward zero relative to entry?
+                    moved_towards_zero = abs(curr_dir) <= abs(entry_dir)
+
+                    # Is current z inside the exit band?
+                    within_exit_band = abs(curr_dir) <= Z_EXIT
+
+                    # Directional change from entry
+                    dz_dir = curr_dir - entry_dir
+                    moved_away = (
+                        same_side
+                        and (abs(curr_dir) >= abs(entry_dir))
+                        and (abs(dz_dir) >= Z_STOP)
+                    )
+
+                    # 1) Reversion: same side of zero, closer to zero, inside exit band
+                    if same_side and moved_towards_zero and within_exit_band:
+                        exit_flag = "reversion"
+                    # 2) Stop: same side, but materially further from zero than entry
+                    elif moved_away:
+                        exit_flag = "stop"
+
+            # 3) Max-hold if nothing else triggered
+            if exit_flag is None and pos.age_decisions >= max_hold_decisions:
+                exit_flag = "max_hold"
+
+            if exit_flag is not None:
+                pos.closed = True
+                pos.close_ts = dts
+                pos.exit_reason = exit_flag
 
             # Ledger mark (pnl in bps and cash)
             ledger_rows.append({
