@@ -199,7 +199,7 @@ def analyze_overlay(
                     reasons_seen.add("z_nan")
                     continue
 
-                # Direction-dependent better-tenor logic
+                # Direction-dependent better-tenor logic (same as overlay):
                 if side == "CRCV":
                     if z_alt <= exec_z:
                         reasons_seen.add("z_dir")
@@ -227,25 +227,22 @@ def analyze_overlay(
                     reasons_seen.add("fly")
                     continue
 
-                # Caps (only if we are “using caps” in overlay)
+                # Caps (only if we are “using caps” in overlay) – DV01-native
                 if overlay_use_caps:
                     b_alt = assign_bucket(alt_tenor)
                     b_exec = assign_bucket(exec_tenor)
-                    pv_alt = pv01_proxy(alt_tenor, float(alt_row["rate"]))
-                    pv_exec = pv01_proxy(exec_tenor, float(exec_row["rate"]))
-                    dv_alt = abs(pv_alt)
-                    dv_exec = abs(pv_exec)
+                    dv = abs(dv01_cash)
 
-                    # quick one-pair caps, like in diag_selector (not accumulative across hedges)
+                    # quick one-pair caps, DV01-based
                     per_bucket_ok = True
-                    if b_alt in cr.BUCKETS and dv_alt > PER_BUCKET_DV01_CAP:
+                    if b_alt in cr.BUCKETS and dv > PER_BUCKET_DV01_CAP:
                         per_bucket_ok = False
-                    if b_exec in cr.BUCKETS and dv_exec > PER_BUCKET_DV01_CAP:
+                    if b_exec in cr.BUCKETS and dv > PER_BUCKET_DV01_CAP:
                         per_bucket_ok = False
 
-                    short_used = (dv_alt if b_alt == "short" else 0.0) + (dv_exec if b_exec == "short" else 0.0)
+                    short_used = (dv if b_alt == "short" else 0.0) + (dv if b_exec == "short" else 0.0)
                     fe_ok = short_used <= FRONT_END_DV01_CAP
-                    total_ok = (dv_alt + dv_exec) <= TOTAL_DV01_CAP
+                    total_ok = (2.0 * dv) <= TOTAL_DV01_CAP
 
                     # Short-end extra hurdle
                     if (b_alt == "short" or b_exec == "short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
@@ -306,7 +303,6 @@ def analyze_overlay(
     print(f"[DIAG] opened: {opened} / {total} ({opened/total*100:.2f}% if total>0 else 0.0)")
 
     return out
-
 
 def _slice_month(hedges: pd.DataFrame, yymm: str) -> pd.DataFrame:
     """Slice hedges to a given yymm using decision_ts (UTC-naive)."""
