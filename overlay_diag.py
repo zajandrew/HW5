@@ -170,7 +170,7 @@ def analyze_overlay(
             rec["exec_z"] = exec_z
 
             # Side sign (as in overlay code)
-            if side == "CREC":
+            if side == "CRCV":
                 side_sign = +1.0
             elif side == "CPAY":
                 side_sign = -1.0
@@ -200,7 +200,7 @@ def analyze_overlay(
                     continue
 
                 # Direction-dependent better-tenor logic
-                if side == "CREC":
+                if side == "CRCV":
                     if z_alt <= exec_z:
                         reasons_seen.add("z_dir")
                         continue
