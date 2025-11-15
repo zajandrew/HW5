@@ -1,3 +1,17 @@
+from pathlib import Path
+
+PATH_OUT = Path(cr.PATH_OUT)
+
+# Example: use a different OUT_SUFFIX for overlay vs pure strategy if you like
+suffix_overlay = cr.OUT_SUFFIX  # or "_overlay_d" if you set it that way
+
+pos_overlay = pd.read_parquet(PATH_OUT / f"positions_ledger{suffix_overlay}.parquet")
+diag_overlay = pd.read_parquet(PATH_OUT / f"overlay_diag{suffix_overlay}.parquet")
+
+summarize_overlay_backtest(pos_overlay, diag_overlay, label="overlay D")
+
+
+
 import pandas as pd
 import overlay_diag as od
 
