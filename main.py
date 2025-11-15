@@ -1,3 +1,8 @@
+import cr_analytics as cra
+
+cra.overlay_full_report(pos_overlay, diag_overlay, label="overlay_D")
+
+
 from pathlib import Path
 
 PATH_OUT = Path(cr.PATH_OUT)
