@@ -63,7 +63,7 @@ def _map_instrument_to_tenor(instr: str) -> Optional[float]:
 def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
     """
     Clean hedge tape for overlay mode.
-    Expects columns: side ('CPAY'/'CREC'), instrument, EqVolDelta, tradetimeUTC.
+    Expects columns: side ('CPAY'/'CRCV'), instrument, EqVolDelta, tradetimeUTC.
     Returns dataframe with: trade_id, trade_ts, decision_ts, tenor_yrs, side, dv01.
     """
     if raw_df is None or raw_df.empty:
@@ -88,7 +88,7 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
 
     # Side
     df["side"] = df["side"].astype(str).str.upper()
-    df = df[df["side"].isin(["CPAY", "CREC"])]
+    df = df[df["side"].isin(["CPAY", "CRCV"])]
 
     # Tenor mapping
     df["tenor_yrs"] = df["instrument"].map(_map_instrument_to_tenor)
@@ -701,8 +701,8 @@ def run_month(
                 dv01_cash = float(h["dv01"])
                 trade_id = h.get("trade_id", None)
 
-                # Direction sign: +1 for CREC, -1 for CPAY
-                if side == "CREC":
+                # Direction sign: +1 for CRCV, -1 for CPAY
+                if side == "CRCV":
                     side_sign = +1.0
                 elif side == "CPAY":
                     side_sign = -1.0
@@ -737,8 +737,8 @@ def run_month(
                         continue
 
                     # Direction-dependent "better tenor" logic:
-                    # CREC prefers higher z; CPAY prefers lower z
-                    if side == "CREC":
+                    # CRCV prefers higher z; CPAY prefers lower z
+                    if side == "CRCV":
                         # alt must be higher z than executed
                         if z_alt <= exec_z:
                             continue
