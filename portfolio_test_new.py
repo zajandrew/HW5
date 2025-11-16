@@ -10,6 +10,71 @@ from pandas.tseries.offsets import MonthEnd
 # All config access via module namespace
 import cr_config as cr
 
+# ============================================================
+# Overlay DV01 / threshold helpers (runtime)
+# ============================================================
+
+def _overlay_effective_dv01_cap(bucket: str, raw_dv01: float) -> float:
+    """
+    Apply per-bucket and global DV01 caps for the overlay notional.
+
+    Parameters
+    ----------
+    bucket : str
+        Tenor bucket of the hedge ("short", "front", "belly", "long", "other", ...)
+    raw_dv01 : float
+        Desired overlay DV01 (absolute cash DV01 before capping).
+
+    Returns
+    -------
+    float
+        Capped DV01 (absolute).
+    """
+    if raw_dv01 <= 0:
+        return 0.0
+
+    # Global cap for any overlay trade
+    effective_cap = cr.OVERLAY_DV01_CAP_PER_TRADE
+
+    # Optional per-bucket cap
+    bucket_cap = cr.OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, None)
+    if bucket_cap is not None:
+        effective_cap = min(effective_cap, bucket_cap)
+
+    return min(raw_dv01, effective_cap)
+
+
+def _overlay_effective_z_entry(scale_dv01: float) -> float:
+    """
+    DV01-adaptive entry z-threshold.
+
+    For small trades, returns cr.Z_ENTRY.
+    For larger trades, bumps z-entry by k * log(dv01 / ref).
+    """
+    base = cr.Z_ENTRY
+    if scale_dv01 <= 0 or scale_dv01 <= cr.OVERLAY_Z_ENTRY_DV01_REF:
+        return base
+
+    k = cr.OVERLAY_Z_ENTRY_DV01_K
+    ref = cr.OVERLAY_Z_ENTRY_DV01_REF
+    z_eff = base + k * np.log(scale_dv01 / ref)
+    return max(base, z_eff)
+
+
+def _overlay_effective_max_hold_days(scale_dv01: float) -> int:
+    """
+    DV01-adaptive max holding period for an overlay pair.
+
+    Uses three regimes: small / medium / large.
+    """
+    base = cr.MAX_HOLD_DAYS  # default for small trades
+
+    if scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_HI:
+        return int(cr.OVERLAY_MAX_HOLD_DAYS_HI)
+    elif scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_MED:
+        return int(cr.OVERLAY_MAX_HOLD_DAYS_MED)
+    else:
+        return int(base)
 
 # ------------------------
 # Utilities / conventions
