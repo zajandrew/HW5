@@ -7,65 +7,14 @@ import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
 import cr_config as cr
-import portfolio_test as pt
-from portfolio_test import (
+import portfolio_test_new as pt
+from portfolio_test_new import (
     _enhanced_in_path,
     _get_z_at_tenor,
     fly_alignment_ok,
     pv01_proxy,
     assign_bucket,
 )
-
-# ======== Overlay DV01 / threshold helpers =========
-
-def _overlay_effective_dv01_cap(bucket: str, raw_dv01: float) -> float:
-    """
-    Apply per-bucket and global DV01 caps for the overlay notional.
-    raw_dv01 is the 'natural' DV01 you would otherwise use for the pair.
-    """
-    if raw_dv01 <= 0:
-        return 0.0
-
-    bucket_cap = cr.OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, None)
-    effective_cap = cr.OVERLAY_DV01_CAP_PER_TRADE
-
-    if bucket_cap is not None:
-        effective_cap = min(effective_cap, bucket_cap)
-
-    return min(raw_dv01, effective_cap)
-
-
-def _overlay_effective_z_entry(scale_dv01: float) -> float:
-    """
-    DV01-adaptive entry z-threshold.
-    For small trades, returns cr.Z_ENTRY.
-    For larger dv01, raises the bar.
-    """
-    base = cr.Z_ENTRY
-    if scale_dv01 <= 0 or scale_dv01 <= cr.OVERLAY_Z_ENTRY_DV01_REF:
-        return base
-
-    k = cr.OVERLAY_Z_ENTRY_DV01_K
-    ref = cr.OVERLAY_Z_ENTRY_DV01_REF
-    # log-scaling, always >= base
-    z_eff = base + k * np.log(scale_dv01 / ref)
-    return max(base, z_eff)
-
-
-def _overlay_effective_max_hold_days(scale_dv01: float) -> int:
-    """
-    DV01-adaptive max holding period for a pair.
-    For small dv01, use global MAX_HOLD_DAYS.
-    Tighten for larger dv01 trades.
-    """
-    base = cr.MAX_HOLD_DAYS
-
-    if scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_HI:
-        return int(cr.OVERLAY_MAX_HOLD_DAYS_HI)
-    elif scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_MED:
-        return int(cr.OVERLAY_MAX_HOLD_DAYS_MED)
-    else:
-        return int(base)
 
 def _safe_float(x, default=np.nan):
     try:
@@ -95,14 +44,47 @@ def analyze_overlay(
       reason (opened / no_snapshot / no_exec_tenor / no_alt_tenors / ...),
       and some flags for which filters blocked candidates.
     """
+    import math
+
     if hedge_df is None or hedge_df.empty:
         raise ValueError("hedge_df is empty; nothing to analyze.")
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
-    overlay_use_caps = cr.OVERLAY_USE_CAPS if overlay_use_caps is None else bool(overlay_use_caps)
+    # Default: apply overlay caps (per-trade + per-timestamp) in diagnostics
+    overlay_use_caps = True if overlay_use_caps is None else bool(overlay_use_caps)
 
-    # NEW: global min-leg floor, same as portfolio_test overlay logic
+    # Global floors / spans
     MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+    MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
+    MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
+    SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
+
+    # Overlay DV01 cap config
+    OVERLAY_DV01_CAP_PER_TRADE = float(getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE", float("inf")))
+    OVERLAY_DV01_CAP_PER_TRADE_BUCKET = dict(
+        getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE_BUCKET", {})
+    )
+    OVERLAY_DV01_TS_CAP = float(getattr(cr, "OVERLAY_DV01_TS_CAP", float("inf")))
+
+    # DV01-scaled Z-entry config
+    BASE_Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
+    Z_REF = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_REF", 5_000.0))
+    Z_K = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_K", 0.0))
+
+    def _overlay_effective_z_entry(dv01_cash: float) -> float:
+        dv = abs(float(dv01_cash))
+        if dv <= 0 or Z_REF <= 0 or Z_K == 0.0:
+            return BASE_Z_ENTRY
+        return BASE_Z_ENTRY + Z_K * math.log(dv / Z_REF)
+
+    def _per_trade_dv01_cap_for_bucket(bucket: str) -> float:
+        # Bucket-specific cap overrides global; fall back to "other" then global.
+        bucket_caps = OVERLAY_DV01_CAP_PER_TRADE_BUCKET
+        if bucket in bucket_caps:
+            return float(bucket_caps[bucket])
+        if "other" in bucket_caps:
+            return float(bucket_caps["other"])
+        return OVERLAY_DV01_CAP_PER_TRADE
 
     # 1) Reuse the same hedge-tape preparation logic as overlay mode
     clean_hedges = pt.prepare_hedge_tape(hedge_df, decision_freq)
@@ -114,15 +96,6 @@ def analyze_overlay(
     print(f"[DIAG] After clean-up (side, tenor mapping, dv01): {len(clean_hedges)}")
 
     records: List[Dict] = []
-
-    # Caps config if overlay caps are "on"
-    PER_BUCKET_DV01_CAP  = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
-    TOTAL_DV01_CAP       = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
-    FRONT_END_DV01_CAP   = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
-    Z_ENTRY              = float(getattr(cr, "Z_ENTRY", 0.75))
-    SHORT_END_EXTRA_Z    = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
-    MIN_SEP_YEARS        = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-    MAX_SPAN_YEARS       = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
 
     for yymm in yymms:
         # 2) Load enhanced month file
@@ -161,6 +134,16 @@ def analyze_overlay(
         # Pre-split enhanced file by decision_ts to avoid repeated filtering
         grouped = dict(tuple(df.groupby("decision_ts", sort=True)))
 
+        # Pre-compute per-timestamp DV01 sums (for OVERLAY_DV01_TS_CAP)
+        if overlay_use_caps and OVERLAY_DV01_TS_CAP < float("inf"):
+            ts_dv01_sum = (
+                hedges_month.groupby("decision_ts")["dv01"]
+                .apply(lambda s: s.abs().sum())
+                .to_dict()
+            )
+        else:
+            ts_dv01_sum = {}
+
         for _, h in hedges_month.iterrows():
             trade_id = h.get("trade_id", None)
             trade_ts = h["trade_ts"]
@@ -189,13 +172,22 @@ def analyze_overlay(
                 "hit_caps_block": False,
             }
 
-            # NEW: if executed hedge tenor itself is too short, bail early
+            # Tenor floor on executed hedge
             if trade_tenor < MIN_LEG_TENOR:
                 rec["reason"] = "too_short_exec_tenor"
                 records.append(rec)
                 continue
 
-            # 2a) Is there a snapshot at this decision_ts?
+            # Per-timestamp DV01 gate
+            if overlay_use_caps and ts_dv01_sum:
+                ts_sum = float(ts_dv01_sum.get(dts, 0.0))
+                if ts_sum > OVERLAY_DV01_TS_CAP:
+                    rec["reason"] = "caps_block"
+                    rec["hit_caps_block"] = True
+                    records.append(rec)
+                    continue
+
+            # 2a) Snapshot at this decision_ts?
             snap = grouped.get(dts)
             if snap is None or snap.empty:
                 rec["reason"] = "no_snapshot"
@@ -220,14 +212,13 @@ def analyze_overlay(
                 records.append(rec)
                 continue
 
-            # Actual row of executed tenor (nearest in tenor space)
             nearest_idx = (snap_last["tenor_yrs"] - trade_tenor).abs().idxmin()
             exec_row = snap_last.iloc[nearest_idx]
             exec_tenor = float(exec_row["tenor_yrs"])
             rec["exec_tenor"] = exec_tenor
             rec["exec_z"] = exec_z
 
-            # Side sign (as in overlay code)
+            # Side sign (for directional "better tenor" logic)
             if side == "CRCV":
                 side_sign = +1.0
             elif side == "CPAY":
@@ -236,6 +227,26 @@ def analyze_overlay(
                 rec["reason"] = "bad_side"
                 records.append(rec)
                 continue
+
+            # Per-trade DV01 caps
+            if overlay_use_caps:
+                dv_abs = abs(dv01_cash)
+                if dv_abs <= 0.0:
+                    rec["reason"] = "caps_block"
+                    rec["hit_caps_block"] = True
+                    records.append(rec)
+                    continue
+
+                bucket = assign_bucket(trade_tenor)
+                per_trade_cap = _per_trade_dv01_cap_for_bucket(bucket)
+                if dv_abs > OVERLAY_DV01_CAP_PER_TRADE or dv_abs > per_trade_cap:
+                    rec["reason"] = "caps_block"
+                    rec["hit_caps_block"] = True
+                    records.append(rec)
+                    continue
+
+            # DV01-scaled entry threshold for this hedge
+            z_entry_eff = _overlay_effective_z_entry(dv01_cash)
 
             # 3) Scan alt tenors and track reasons why they are killed
             best_candidate = None
@@ -247,7 +258,7 @@ def analyze_overlay(
                 if alt_tenor == exec_tenor:
                     continue
 
-                # NEW: enforce tenor floor on *both* legs of the potential pair
+                # Tenor floor on both legs
                 if (alt_tenor < MIN_LEG_TENOR) or (exec_tenor < MIN_LEG_TENOR):
                     reasons_seen.add("too_short_leg")
                     continue
@@ -274,49 +285,28 @@ def analyze_overlay(
                         continue
                     zdisp = exec_z - z_alt
 
-                if zdisp < Z_ENTRY:
+                if zdisp < z_entry_eff:
                     reasons_seen.add("z_threshold")
                     continue
 
-                # Fly gate orientation by z only (cheap vs rich)
+                # Cheap/rich by z only
                 if z_alt > exec_z:
                     cheap_tenor, rich_tenor = alt_tenor, exec_tenor
                 else:
                     cheap_tenor, rich_tenor = exec_tenor, alt_tenor
+
+                # Short-end extra hurdle: if either leg in short bucket, require extra zdisp
+                b_alt = assign_bucket(alt_tenor)
+                b_exec = assign_bucket(exec_tenor)
+                if (b_alt == "short" or b_exec == "short") and (zdisp < (z_entry_eff + SHORT_END_EXTRA_Z)):
+                    reasons_seen.add("z_threshold")
+                    continue
 
                 ok_i = fly_alignment_ok(cheap_tenor, +1.0, snap_last, zdisp_for_pair=zdisp)
                 ok_j = fly_alignment_ok(rich_tenor, -1.0, snap_last, zdisp_for_pair=zdisp)
                 if not (ok_i and ok_j):
                     reasons_seen.add("fly")
                     continue
-
-                # Caps (only if we are “using caps” in overlay)
-                if overlay_use_caps:
-                    b_alt = assign_bucket(alt_tenor)
-                    b_exec = assign_bucket(exec_tenor)
-                    pv_alt = pv01_proxy(alt_tenor, float(alt_row["rate"]))
-                    pv_exec = pv01_proxy(exec_tenor, float(exec_row["rate"]))
-                    dv_alt = abs(pv_alt)
-                    dv_exec = abs(pv_exec)
-
-                    # quick one-pair caps, like in diag_selector (not accumulative across hedges)
-                    per_bucket_ok = True
-                    if b_alt in cr.BUCKETS and dv_alt > PER_BUCKET_DV01_CAP:
-                        per_bucket_ok = False
-                    if b_exec in cr.BUCKETS and dv_exec > PER_BUCKET_DV01_CAP:
-                        per_bucket_ok = False
-
-                    short_used = (dv_alt if b_alt == "short" else 0.0) + (dv_exec if b_exec == "short" else 0.0)
-                    fe_ok = short_used <= FRONT_END_DV01_CAP
-                    total_ok = (dv_alt + dv_exec) <= TOTAL_DV01_CAP
-
-                    # Short-end extra hurdle
-                    if (b_alt == "short" or b_exec == "short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
-                        per_bucket_ok = False
-
-                    if not (per_bucket_ok and fe_ok and total_ok):
-                        reasons_seen.add("caps")
-                        continue
 
                 # If we got here, this alt is a valid candidate
                 rec["hit_any_alt"] = True
@@ -367,8 +357,9 @@ def analyze_overlay(
     print(out["reason"].value_counts(dropna=False))
 
     opened = int((out["reason"] == "opened").sum())
-    total  = len(out)
-    print(f"[DIAG] opened: {opened} / {total} ({opened/total*100:.2f}% if total>0 else 0.0)")
+    total = len(out)
+    pct = (opened / total * 100.0) if total > 0 else 0.0
+    print(f"[DIAG] opened: {opened} / {total} ({pct:.2f}%)")
 
     return out
 
