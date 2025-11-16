@@ -377,6 +377,10 @@ def choose_pairs_under_caps(
             if Ti in used_tenors or Tj in used_tenors:
                 continue
 
+            MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+            if (Ti < MIN_LEG_TENOR) or (Tj < MIN_LEG_TENOR):
+                continue
+
             # minimum tenor separation
             if abs(Ti - Tj) < MIN_SEP_YEARS:
                 continue
@@ -767,6 +771,12 @@ def run_month(
                     break
 
                 trade_tenor = float(h["tenor_yrs"])
+
+                MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+                # If the executed hedge itself is too short, skip overlay entirely
+                if trade_tenor < MIN_LEG_TENOR:
+                    continue
+
                 side = str(h["side"]).upper()
                 dv01_cash = float(h["dv01"])
                 trade_id = h.get("trade_id", None)
@@ -798,6 +808,11 @@ def run_month(
                     alt_tenor = float(alt_row["tenor_yrs"])
                     if alt_tenor == exec_tenor:
                         continue
+                
+                    # Enforce min tenor on both legs of the potential pair
+                    if (alt_tenor < MIN_LEG_TENOR) or (exec_tenor < MIN_LEG_TENOR):
+                        continue
+
                     diff = abs(alt_tenor - exec_tenor)
                     if diff < MIN_SEP_YEARS or diff > MAX_SPAN_YEARS:
                         continue
