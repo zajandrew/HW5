@@ -23,7 +23,6 @@ def _safe_float(x, default=np.nan):
     except Exception:
         return default
 
-
 def analyze_overlay(
     yymms: List[str],
     hedge_df: pd.DataFrame,
@@ -51,6 +50,9 @@ def analyze_overlay(
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     overlay_use_caps = cr.OVERLAY_USE_CAPS if overlay_use_caps is None else bool(overlay_use_caps)
+
+    # NEW: global min-leg floor, same as portfolio_test overlay logic
+    MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
 
     # 1) Reuse the same hedge-tape preparation logic as overlay mode
     clean_hedges = pt.prepare_hedge_tape(hedge_df, decision_freq)
@@ -137,6 +139,12 @@ def analyze_overlay(
                 "hit_caps_block": False,
             }
 
+            # NEW: if executed hedge tenor itself is too short, bail early
+            if trade_tenor < MIN_LEG_TENOR:
+                rec["reason"] = "too_short_exec_tenor"
+                records.append(rec)
+                continue
+
             # 2a) Is there a snapshot at this decision_ts?
             snap = grouped.get(dts)
             if snap is None or snap.empty:
@@ -189,6 +197,11 @@ def analyze_overlay(
                 if alt_tenor == exec_tenor:
                     continue
 
+                # NEW: enforce tenor floor on *both* legs of the potential pair
+                if (alt_tenor < MIN_LEG_TENOR) or (exec_tenor < MIN_LEG_TENOR):
+                    reasons_seen.add("too_short_leg")
+                    continue
+
                 diff = abs(alt_tenor - exec_tenor)
                 if diff < MIN_SEP_YEARS or diff > MAX_SPAN_YEARS:
                     reasons_seen.add("span")
@@ -199,7 +212,7 @@ def analyze_overlay(
                     reasons_seen.add("z_nan")
                     continue
 
-                # Direction-dependent better-tenor logic (same as overlay):
+                # Direction-dependent better-tenor logic
                 if side == "CRCV":
                     if z_alt <= exec_z:
                         reasons_seen.add("z_dir")
@@ -227,22 +240,25 @@ def analyze_overlay(
                     reasons_seen.add("fly")
                     continue
 
-                # Caps (only if we are “using caps” in overlay) – DV01-native
+                # Caps (only if we are “using caps” in overlay)
                 if overlay_use_caps:
                     b_alt = assign_bucket(alt_tenor)
                     b_exec = assign_bucket(exec_tenor)
-                    dv = abs(dv01_cash)
+                    pv_alt = pv01_proxy(alt_tenor, float(alt_row["rate"]))
+                    pv_exec = pv01_proxy(exec_tenor, float(exec_row["rate"]))
+                    dv_alt = abs(pv_alt)
+                    dv_exec = abs(pv_exec)
 
-                    # quick one-pair caps, DV01-based
+                    # quick one-pair caps, like in diag_selector (not accumulative across hedges)
                     per_bucket_ok = True
-                    if b_alt in cr.BUCKETS and dv > PER_BUCKET_DV01_CAP:
+                    if b_alt in cr.BUCKETS and dv_alt > PER_BUCKET_DV01_CAP:
                         per_bucket_ok = False
-                    if b_exec in cr.BUCKETS and dv > PER_BUCKET_DV01_CAP:
+                    if b_exec in cr.BUCKETS and dv_exec > PER_BUCKET_DV01_CAP:
                         per_bucket_ok = False
 
-                    short_used = (dv if b_alt == "short" else 0.0) + (dv if b_exec == "short" else 0.0)
+                    short_used = (dv_alt if b_alt == "short" else 0.0) + (dv_exec if b_exec == "short" else 0.0)
                     fe_ok = short_used <= FRONT_END_DV01_CAP
-                    total_ok = (2.0 * dv) <= TOTAL_DV01_CAP
+                    total_ok = (dv_alt + dv_exec) <= TOTAL_DV01_CAP
 
                     # Short-end extra hurdle
                     if (b_alt == "short" or b_exec == "short") and (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
@@ -260,7 +276,9 @@ def analyze_overlay(
 
             # Decide final reason
             if best_candidate is None:
-                if "span" in reasons_seen and len(reasons_seen) == 1:
+                if "too_short_leg" in reasons_seen:
+                    final_reason = "too_short_leg"
+                elif "span" in reasons_seen and len(reasons_seen) == 1:
                     final_reason = "no_alt_tenors"
                 elif ("z_threshold" in reasons_seen or "z_dir" in reasons_seen):
                     final_reason = "no_zdisp_ge_entry"
