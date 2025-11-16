@@ -71,6 +71,7 @@ Z_ENTRY       = 0.75     # enter when cheap-rich z-spread >= Z_ENTRY
 Z_EXIT        = 0.40     # take profit when |z-spread| <= Z_EXIT
 Z_STOP        = 3.00     # stop if divergence since entry >= Z_STOP
 MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
+MIN_LEG_TENOR_YEARS = 0.4
 
 # ========= Risk & selection =========
 BUCKETS = {
