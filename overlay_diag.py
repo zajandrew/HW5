@@ -16,6 +16,56 @@ from portfolio_test import (
     assign_bucket,
 )
 
+# ======== Overlay DV01 / threshold helpers =========
+
+def _overlay_effective_dv01_cap(bucket: str, raw_dv01: float) -> float:
+    """
+    Apply per-bucket and global DV01 caps for the overlay notional.
+    raw_dv01 is the 'natural' DV01 you would otherwise use for the pair.
+    """
+    if raw_dv01 <= 0:
+        return 0.0
+
+    bucket_cap = cr.OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, None)
+    effective_cap = cr.OVERLAY_DV01_CAP_PER_TRADE
+
+    if bucket_cap is not None:
+        effective_cap = min(effective_cap, bucket_cap)
+
+    return min(raw_dv01, effective_cap)
+
+
+def _overlay_effective_z_entry(scale_dv01: float) -> float:
+    """
+    DV01-adaptive entry z-threshold.
+    For small trades, returns cr.Z_ENTRY.
+    For larger dv01, raises the bar.
+    """
+    base = cr.Z_ENTRY
+    if scale_dv01 <= 0 or scale_dv01 <= cr.OVERLAY_Z_ENTRY_DV01_REF:
+        return base
+
+    k = cr.OVERLAY_Z_ENTRY_DV01_K
+    ref = cr.OVERLAY_Z_ENTRY_DV01_REF
+    # log-scaling, always >= base
+    z_eff = base + k * np.log(scale_dv01 / ref)
+    return max(base, z_eff)
+
+
+def _overlay_effective_max_hold_days(scale_dv01: float) -> int:
+    """
+    DV01-adaptive max holding period for a pair.
+    For small dv01, use global MAX_HOLD_DAYS.
+    Tighten for larger dv01 trades.
+    """
+    base = cr.MAX_HOLD_DAYS
+
+    if scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_HI:
+        return int(cr.OVERLAY_MAX_HOLD_DAYS_HI)
+    elif scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_MED:
+        return int(cr.OVERLAY_MAX_HOLD_DAYS_MED)
+    else:
+        return int(base)
 
 def _safe_float(x, default=np.nan):
     try:
