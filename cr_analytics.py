@@ -322,6 +322,119 @@ def summarize_diag_overlay(diag_overlay: pd.DataFrame, label: str = "overlay"):
             print("\n-- Non-opened hedges: blocker flags (count) --")
             display(pd.Series(blk_counts).to_frame("count"))
 
+def overlay_dv01_structure_report(
+    hedge_df: pd.DataFrame,
+    pos_overlay: pd.DataFrame,
+    *,
+    decision_freq: str | None = None,
+    label: str = "overlay_dv01_report",
+):
+    """
+    Full DV01 structure analytics:
+    - DV01 distribution of hedge tape (overall + by bucket)
+    - DV01 load per decision_ts
+    - Extreme trades (biggest dv01 hedges)
+    - Overlay positions: biggest winners/losers
+    - PnL vs size scatter
+
+    Does NOT run backtest; only analyzes supplied data.
+    """
+
+    from portfolio_test import prepare_hedge_tape, assign_bucket  # local import
+    import cr_config as cr
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    print(f"\n========== DV01 STRUCTURE REPORT: {label} ==========\n")
+
+    # -----------------------------
+    # 1. CLEAN + STRUCTURE HEDGE TAPE
+    # -----------------------------
+    decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
+
+    hedges = prepare_hedge_tape(hedge_df, decision_freq)
+    if hedges.empty:
+        print("[REPORT] No hedges survived prepare_hedge_tape. Check tape.")
+        return
+
+    hedges = hedges.copy()
+    hedges["bucket"] = hedges["tenor_yrs"].map(assign_bucket)
+
+    print("---- Hedge DV01 distribution (ALL hedges) ----")
+    desc_all = hedges["dv01"].describe(percentiles=[0.50, 0.75, 0.90, 0.95, 0.99])
+    display(desc_all.to_frame("dv01"))
+
+    print("\n---- Hedge DV01 distribution by BUCKET ----")
+    desc_by_bucket = (
+        hedges.groupby("bucket")["dv01"]
+              .describe(percentiles=[0.50, 0.75, 0.90, 0.95, 0.99])
+    )
+    display(desc_by_bucket)
+
+    print("\n---- Per-trade DV01: Top 20 largest hedge sizes ----")
+    top_dv01 = hedges.nlargest(20, "dv01")
+    display(top_dv01[["trade_ts", "tenor_yrs", "bucket", "dv01", "side"]])
+
+    # -----------------------------
+    # 2. DECISION-TIME DV01 LOAD PROFILES
+    # -----------------------------
+    print("\n---- DV01 per decision_ts (desk load) ----")
+    dv_by_ts = (
+        hedges.groupby("decision_ts")["dv01"]
+              .sum()
+              .describe(percentiles=[0.50, 0.75, 0.90, 0.95, 0.99])
+    )
+    display(dv_by_ts.to_frame("dv01_sum"))
+
+    print("\n---- DV01 per decision_ts & bucket ----")
+    dv_load = (
+        hedges.groupby(["decision_ts", "bucket"])["dv01"]
+              .sum()
+              .reset_index()
+    )
+    desc_ts_bucket = (
+        dv_load.groupby("bucket")["dv01"]
+               .describe(percentiles=[0.50, 0.75, 0.90, 0.95])
+    )
+    display(desc_ts_bucket)
+
+    # -----------------------------
+    # 3. OVERLAY RESULTS VS SIZE
+    # -----------------------------
+    if pos_overlay is None or pos_overlay.empty:
+        print("\n[REPORT] pos_overlay empty — skipping overlay diagnostics.")
+        return
+
+    df = pos_overlay.copy()
+
+    print("\n---- Overlay: Biggest Losing Trades (Top 20, Cash) ----")
+    worst = df.nsmallest(20, "pnl_net_cash")
+    display(worst[["open_ts", "close_ts", "exit_reason",
+                   "scale_dv01", "pnl_net_cash", "pnl_net_bp"]])
+
+    print("\n---- Overlay: Biggest Winning Trades (Top 20, Cash) ----")
+    best = df.nlargest(20, "pnl_net_cash")
+    display(best[["open_ts", "close_ts", "exit_reason",
+                  "scale_dv01", "pnl_net_cash", "pnl_net_bp"]])
+
+    # Scatter plot: PnL vs size
+    if "scale_dv01" in df.columns and "pnl_net_cash" in df.columns:
+        plt.figure(figsize=(6,4))
+        plt.scatter(df["scale_dv01"], df["pnl_net_cash"], alpha=0.3)
+        plt.xscale("log")
+        plt.axhline(0, color="gray", lw=1)
+        plt.xlabel("scale_dv01 (cash DV01 used in overlay)")
+        plt.ylabel("pnl_net_cash")
+        plt.title("Overlay PnL vs Trade Size (log scale)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("[REPORT] scale_dv01 or pnl_net_cash missing; skipped scatter.")
+
+    print("\n========== END REPORT ==========\n")
 
 # --------------------
 # One-shot full report
