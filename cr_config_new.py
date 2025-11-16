@@ -110,7 +110,40 @@ FLY_TENOR_TOL_YEARS   = 0.02
 SHORT_END_EXTRA_Z     = 0.30
 
 # ========= Overlay mode settings =========
-# Whether overlay pairs (driven by hedge tape) should respect DV01 caps.
-OVERLAY_USE_CAPS       = False  # if True, reuse PER_BUCKET_DV01_CAP / TOTAL_DV01_CAP / FRONT_END_DV01_CAP
-# Transaction cost for curve switch, in bps per unit DV01.
 OVERLAY_SWITCH_COST_BP = 0.10   # 0.10 bp × DV01 per round-trip switch
+
+# 1) Hard per-trade DV01 cap (absolute DV01 used in overlay pair)
+OVERLAY_DV01_CAP_PER_TRADE = 20_000.0   # good first pass
+
+# 2) Per-bucket per-trade DV01 caps (overrides global cap when present)
+OVERLAY_DV01_CAP_PER_TRADE_BUCKET = {
+    "short": 7_000.0,
+    "front": 10_000.0,
+    "belly": 6_000.0,
+    "long": 5_000.0,
+    "other": 10_000.0,
+}
+
+# 3) Per decision timestamp DV01 gate (skip overlay on extreme flow days)
+# This is sum(abs(dv01)) across hedge tape at that decision timestamp.
+OVERLAY_DV01_TS_CAP = 300_000.0         # try 300k; later test 200k vs 500k
+
+# ======== Overlay Z-entry scaling with DV01 =======
+
+# Base reference DV01 for which Z_ENTRY applies "as-is"
+OVERLAY_Z_ENTRY_DV01_REF = 5_000.0      # roughly median hedge size
+
+# Slope for DV01 scaling:
+# Z_ENTRY_eff = Z_ENTRY + k * log(dv01 / OVERLAY_Z_ENTRY_DV01_REF)
+OVERLAY_Z_ENTRY_DV01_K = 0.45           # try 0.45 first; 0.35–0.55 reasonable
+
+# ======== Overlay max-hold scaling with DV01 ======
+
+# For small trades: use global MAX_HOLD_DAYS (your existing config)
+# For medium/large trades: tighten max-hold.
+
+OVERLAY_MAX_HOLD_DV01_MED  = 20_000.0   # dv01 >= this → use MED max-hold
+OVERLAY_MAX_HOLD_DAYS_MED  = 5          # instead of 10
+
+OVERLAY_MAX_HOLD_DV01_HI   = 50_000.0   # dv01 >= this → use HI max-hold
+OVERLAY_MAX_HOLD_DAYS_HI   = 2          # very tight leash on big trades
