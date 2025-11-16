@@ -10,72 +10,6 @@ from pandas.tseries.offsets import MonthEnd
 # All config access via module namespace
 import cr_config as cr
 
-# ============================================================
-# Overlay DV01 / threshold helpers (runtime)
-# ============================================================
-
-def _overlay_effective_dv01_cap(bucket: str, raw_dv01: float) -> float:
-    """
-    Apply per-bucket and global DV01 caps for the overlay notional.
-
-    Parameters
-    ----------
-    bucket : str
-        Tenor bucket of the hedge ("short", "front", "belly", "long", "other", ...)
-    raw_dv01 : float
-        Desired overlay DV01 (absolute cash DV01 before capping).
-
-    Returns
-    -------
-    float
-        Capped DV01 (absolute).
-    """
-    if raw_dv01 <= 0:
-        return 0.0
-
-    # Global cap for any overlay trade
-    effective_cap = cr.OVERLAY_DV01_CAP_PER_TRADE
-
-    # Optional per-bucket cap
-    bucket_cap = cr.OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, None)
-    if bucket_cap is not None:
-        effective_cap = min(effective_cap, bucket_cap)
-
-    return min(raw_dv01, effective_cap)
-
-
-def _overlay_effective_z_entry(scale_dv01: float) -> float:
-    """
-    DV01-adaptive entry z-threshold.
-
-    For small trades, returns cr.Z_ENTRY.
-    For larger trades, bumps z-entry by k * log(dv01 / ref).
-    """
-    base = cr.Z_ENTRY
-    if scale_dv01 <= 0 or scale_dv01 <= cr.OVERLAY_Z_ENTRY_DV01_REF:
-        return base
-
-    k = cr.OVERLAY_Z_ENTRY_DV01_K
-    ref = cr.OVERLAY_Z_ENTRY_DV01_REF
-    z_eff = base + k * np.log(scale_dv01 / ref)
-    return max(base, z_eff)
-
-
-def _overlay_effective_max_hold_days(scale_dv01: float) -> int:
-    """
-    DV01-adaptive max holding period for an overlay pair.
-
-    Uses three regimes: small / medium / large.
-    """
-    base = cr.MAX_HOLD_DAYS  # default for small trades
-
-    if scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_HI:
-        return int(cr.OVERLAY_MAX_HOLD_DAYS_HI)
-    elif scale_dv01 >= cr.OVERLAY_MAX_HOLD_DV01_MED:
-        return int(cr.OVERLAY_MAX_HOLD_DAYS_MED)
-    else:
-        return int(base)
-
 # ------------------------
 # Utilities / conventions
 # ------------------------
@@ -586,7 +520,7 @@ def run_month(
     carry_in: bool = True,
     mode: str = "strategy",                                  # "strategy" or "overlay"
     hedges: Optional[pd.DataFrame] = None,
-    overlay_use_caps: Optional[bool] = None
+    overlay_use_caps: Optional[bool] = None,                 # kept for signature; not used
 ):
     """
     Run a single month.
@@ -597,9 +531,10 @@ def run_month(
     Returns: (closed_positions_df, ledger_df, pnl_by_df, open_positions_out)
     where open_positions_out are the still-open positions to carry into next month.
     """
+    import math
+
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     mode = mode.lower()
-    overlay_use_caps = cr.OVERLAY_USE_CAPS if overlay_use_caps is None else bool(overlay_use_caps)
 
     enh_path = _enhanced_in_path(yymm)
     if not enh_path.exists():
@@ -621,13 +556,54 @@ def run_month(
         decisions_per_day = 1
     elif decision_freq == "H":
         df["decision_ts"] = df["ts"].dt.floor("H")
-        # compute actual # decisions per trading day in this month
         per_day_counts = df.groupby(df["decision_ts"].dt.floor("D"))["decision_ts"].nunique()
         decisions_per_day = int(per_day_counts.mean()) if len(per_day_counts) else 24
     else:
         raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
-    max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
+    base_max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
+
+    # DV01-scaled max-hold for overlay positions
+    OVERLAY_MAX_HOLD_DV01_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_MED", 20_000.0))
+    OVERLAY_MAX_HOLD_DV01_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_HI", 50_000.0))
+    OVERLAY_MAX_HOLD_DAYS_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_MED", 5.0))
+    OVERLAY_MAX_HOLD_DAYS_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_HI", 2.0))
+
+    def _overlay_max_hold_decisions(dv01_cash: float) -> int:
+        dv = abs(float(dv01_cash))
+        if dv >= OVERLAY_MAX_HOLD_DV01_HI:
+            days = OVERLAY_MAX_HOLD_DAYS_HI
+        elif dv >= OVERLAY_MAX_HOLD_DV01_MED:
+            days = OVERLAY_MAX_HOLD_DAYS_MED
+        else:
+            days = float(cr.MAX_HOLD_DAYS)
+        return int(round(days * decisions_per_day))
+
+    # DV01-scaled overlay Z-entry config
+    BASE_Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
+    Z_REF = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_REF", 5_000.0))
+    Z_K = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_K", 0.0))
+
+    def _overlay_effective_z_entry(dv01_cash: float) -> float:
+        dv = abs(float(dv01_cash))
+        if dv <= 0 or Z_REF <= 0 or Z_K == 0.0:
+            return BASE_Z_ENTRY
+        return BASE_Z_ENTRY + Z_K * math.log(dv / Z_REF)
+
+    # Overlay DV01 caps
+    OVERLAY_DV01_CAP_PER_TRADE = float(getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE", float("inf")))
+    OVERLAY_DV01_CAP_PER_TRADE_BUCKET = dict(
+        getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE_BUCKET", {})
+    )
+    OVERLAY_DV01_TS_CAP = float(getattr(cr, "OVERLAY_DV01_TS_CAP", float("inf")))
+
+    def _per_trade_dv01_cap_for_bucket(bucket: str) -> float:
+        bucket_caps = OVERLAY_DV01_CAP_PER_TRADE_BUCKET
+        if bucket in bucket_caps:
+            return float(bucket_caps[bucket])
+        if "other" in bucket_caps:
+            return float(bucket_caps["other"])
+        return OVERLAY_DV01_CAP_PER_TRADE
 
     # Carry-in
     open_positions = (open_positions or []) if carry_in else []
@@ -642,15 +618,17 @@ def run_month(
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
 
-    # Overlay caps (per decision snapshot)
-    OVERLAY_CAPS_ON = overlay_use_caps
-    PER_BUCKET_DV01_CAP  = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
-    TOTAL_DV01_CAP       = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
-    FRONT_END_DV01_CAP   = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
-    Z_ENTRY              = float(getattr(cr, "Z_ENTRY", 0.75))
-    SHORT_END_EXTRA_Z    = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
-    Z_EXIT               = float(getattr(cr, "Z_EXIT", 0.40))
-    Z_STOP               = float(getattr(cr, "Z_STOP", 3.00))
+    # Strategy caps (unchanged)
+    PER_BUCKET_DV01_CAP = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
+    TOTAL_DV01_CAP = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
+    FRONT_END_DV01_CAP = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
+    Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
+    SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
+    Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
+    Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
+    MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+    MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
+    MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
 
     for dts, snap in df.groupby("decision_ts", sort=True):
         snap_last = (
@@ -668,19 +646,16 @@ def run_month(
             zsp = pos.mark(snap_last)
             entry_z = pos.entry_zspread
 
-            Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
-            Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
-
             exit_flag = None
 
             if np.isfinite(zsp) and np.isfinite(entry_z):
                 # Directional z at entry / current (cheap–rich space)
                 entry_dir = getattr(pos, "entry_z_dir", pos.dir_sign * entry_z)
-                curr_dir  = getattr(pos, "last_z_dir", pos.dir_sign * zsp)
+                curr_dir = getattr(pos, "last_z_dir", pos.dir_sign * zsp)
 
                 if np.isfinite(entry_dir) and np.isfinite(curr_dir):
                     sign_entry = np.sign(entry_dir)
-                    sign_curr  = np.sign(curr_dir)
+                    sign_curr = np.sign(curr_dir)
 
                     same_side = (sign_entry != 0) and (sign_entry == sign_curr)
 
@@ -706,8 +681,14 @@ def run_month(
                         exit_flag = "stop"
 
             # 3) Max-hold if nothing else triggered
-            if exit_flag is None and pos.age_decisions >= max_hold_decisions:
-                exit_flag = "max_hold"
+            if exit_flag is None:
+                if pos.mode == "overlay":
+                    eff_max_hold_decisions = _overlay_max_hold_decisions(pos.scale_dv01)
+                else:
+                    eff_max_hold_decisions = base_max_hold_decisions
+
+                if pos.age_decisions >= eff_max_hold_decisions:
+                    exit_flag = "max_hold"
 
             if exit_flag is not None:
                 pos.closed = True
@@ -777,9 +758,9 @@ def run_month(
             selected = choose_pairs_under_caps(
                 snap_last=snap_last,
                 max_pairs=remaining_slots,
-                per_bucket_cap=cr.PER_BUCKET_DV01_CAP,
-                total_cap=cr.TOTAL_DV01_CAP,
-                front_end_cap=cr.FRONT_END_DV01_CAP,
+                per_bucket_cap=PER_BUCKET_DV01_CAP,
+                total_cap=TOTAL_DV01_CAP,
+                front_end_cap=FRONT_END_DV01_CAP,
                 extra_z_entry=0.0  # short-end extra handled inside chooser using SHORT_END_EXTRA_Z
             )
 
@@ -824,11 +805,12 @@ def run_month(
             if hedges_here.empty:
                 continue
 
-            # Overlay caps per decision snapshot, in DV01 space
-            bucket_dv01 = {b: 0.0 for b in getattr(cr, "BUCKETS", {}).keys()}
-            total_dv01 = 0.0
+            # Per-timestamp DV01 gate: skip overlay on extreme-flow decisions
+            ts_dv01_sum = float(hedges_here["dv01"].abs().sum())
+            if ts_dv01_sum > OVERLAY_DV01_TS_CAP:
+                # Entire timestamp blocked by overlay TS cap
+                continue
 
-            # Pre-index snap_last by tenor_yrs for quick lookups
             snap_last_sorted = snap_last.sort_values("tenor_yrs").reset_index(drop=True)
 
             for _, h in hedges_here.iterrows():
@@ -836,9 +818,6 @@ def run_month(
                     break
 
                 trade_tenor = float(h["tenor_yrs"])
-
-                MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
-                # If the executed hedge itself is too short, skip overlay entirely
                 if trade_tenor < MIN_LEG_TENOR:
                     continue
 
@@ -846,7 +825,6 @@ def run_month(
                 dv01_cash = float(h["dv01"])
                 trade_id = h.get("trade_id", None)
 
-                # Side sign is only used for better-tenor logic; pair is DV01-native unit.
                 if side == "CRCV":
                     side_sign = +1.0
                 elif side == "CPAY":
@@ -854,7 +832,20 @@ def run_month(
                 else:
                     continue
 
-                # Find executed tenor row (nearest within tolerance)
+                dv_abs = abs(dv01_cash)
+                if dv_abs <= 0.0:
+                    continue
+
+                # Per-trade DV01 caps (global + bucket-specific)
+                bucket = assign_bucket(trade_tenor)
+                per_trade_cap = _per_trade_dv01_cap_for_bucket(bucket)
+                if dv_abs > OVERLAY_DV01_CAP_PER_TRADE or dv_abs > per_trade_cap:
+                    continue
+
+                # Effective Z-entry for this hedge
+                z_entry_eff = _overlay_effective_z_entry(dv01_cash)
+
+                # Find executed tenor row (nearest)
                 exec_z = _get_z_at_tenor(snap_last_sorted, trade_tenor)
                 if exec_z is None or not np.isfinite(exec_z):
                     continue
@@ -863,18 +854,15 @@ def run_month(
                 ]
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                # Scan for alternative tenors
+                # Scan alternative tenors
                 best_candidate = None
                 best_zdisp = 0.0
-                MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-                MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
 
                 for _, alt_row in snap_last_sorted.iterrows():
                     alt_tenor = float(alt_row["tenor_yrs"])
                     if alt_tenor == exec_tenor:
                         continue
-                
-                    # Enforce min tenor on both legs of the potential pair
+
                     if (alt_tenor < MIN_LEG_TENOR) or (exec_tenor < MIN_LEG_TENOR):
                         continue
 
@@ -886,9 +874,6 @@ def run_month(
                     if not np.isfinite(z_alt):
                         continue
 
-                    # Direction-dependent "better tenor" logic:
-                    #   CRCV: prefer higher z than executed
-                    #   CPAY: prefer lower z than executed
                     if side == "CRCV":
                         if z_alt <= exec_z:
                             continue
@@ -898,21 +883,26 @@ def run_month(
                             continue
                         zdisp = exec_z - z_alt
 
-                    if zdisp < Z_ENTRY:
+                    if zdisp < z_entry_eff:
                         continue
 
-                    # Fly gate: classify cheap/rich purely by z
+                    # Cheap/rich by z
                     if z_alt > exec_z:
                         cheap_tenor, rich_tenor = alt_tenor, exec_tenor
                     else:
                         cheap_tenor, rich_tenor = exec_tenor, alt_tenor
+
+                    # Short-end extra hurdle
+                    b_alt = assign_bucket(alt_tenor)
+                    b_exec = assign_bucket(exec_tenor)
+                    if (b_alt == "short" or b_exec == "short") and (zdisp < (z_entry_eff + SHORT_END_EXTRA_Z)):
+                        continue
 
                     ok_i = fly_alignment_ok(cheap_tenor, +1.0, snap_last_sorted, zdisp_for_pair=zdisp)
                     ok_j = fly_alignment_ok(rich_tenor, -1.0, snap_last_sorted, zdisp_for_pair=zdisp)
                     if not (ok_i and ok_j):
                         continue
 
-                    # Keep best (largest zdisp) candidate
                     if zdisp > best_zdisp:
                         best_zdisp = zdisp
                         best_candidate = (alt_row, exec_row, z_alt, exec_z)
@@ -924,45 +914,10 @@ def run_month(
                 alt_tenor = float(alt_row["tenor_yrs"])
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                # DV01-native unit pair:
-                #   - no PV01 scaling
-                #   - |w_i| = |w_j| = 1
-                #   - orientation via side_sign
+                # DV01-native unit pair (weights ±1, scaling via dv01_cash)
                 w_alt = side_sign * 1.0
                 w_exec = side_sign * -1.0
 
-                # Optional overlay caps – apply directly to dv01_trade by bucket & total
-                if OVERLAY_CAPS_ON:
-                    b_alt = assign_bucket(alt_tenor)
-                    b_exec = assign_bucket(exec_tenor)
-                    dv = abs(dv01_cash)
-
-                    # Per-bucket caps (each leg consumes dv01_trade in its own bucket)
-                    if b_alt in bucket_dv01 and (bucket_dv01[b_alt] + dv) > PER_BUCKET_DV01_CAP:
-                        continue
-                    if b_exec in bucket_dv01 and (bucket_dv01[b_exec] + dv) > PER_BUCKET_DV01_CAP:
-                        continue
-
-                    # Front-end aggregate cap
-                    short_add = (dv if b_alt == "short" else 0.0) + (dv if b_exec == "short" else 0.0)
-                    short_tot = bucket_dv01.get("short", 0.0)
-                    if (short_tot + short_add) > FRONT_END_DV01_CAP:
-                        continue
-
-                    # Total cap (sum of abs DV01 across both legs)
-                    if (total_dv01 + 2.0 * dv) > TOTAL_DV01_CAP:
-                        continue
-
-                    # Short-end extra threshold (overlay) if either leg is short bucket
-                    if (b_alt == "short" or b_exec == "short") and (best_zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
-                        continue
-
-                    bucket_dv01[b_alt] = bucket_dv01.get(b_alt, 0.0) + dv
-                    bucket_dv01[b_exec] = bucket_dv01.get(b_exec, 0.0) + dv
-                    total_dv01 += 2.0 * dv
-
-                # Build PairPos with scale_dv01 = hedge DV01 (cash)
-                # Treat alt_row as "cheap_row" and exec_row as "rich_row" for zspread bookkeeping.
                 pos = PairPos(
                     open_ts=dts,
                     cheap_row=alt_row,
@@ -996,7 +951,7 @@ def run_month(
     pos_df = pd.DataFrame(closed_rows)
     ledger = pd.DataFrame(ledger_rows)
 
-    # PnL by bucket from marks (we aggregate in cash terms; bp is still in ledger)
+    # PnL by bucket from marks (aggregate in cash terms)
     if not ledger.empty:
         marks = ledger[ledger["event"] == "mark"].copy()
         idx = marks["decision_ts"].dt.floor("D" if decision_freq == "D" else "H")
