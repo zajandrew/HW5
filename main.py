@@ -1,3 +1,217 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+import cr_config as cr  # assumes cr_config.py is importable from this notebook
+
+plt.rcParams["figure.figsize"] = (12, 4)
+
+# ---------- FILE ITERATION ----------
+
+def iter_enhanced_files():
+    """
+    Yield enhanced parquet files one by one from PATH_ENH matching ENH_SUFFIX,
+    e.g. *_d.parquet or *_h.parquet.
+    """
+    enh_path = Path(cr.PATH_ENH)
+    pattern = f"*{cr.ENH_SUFFIX}.parquet"
+    files = sorted(enh_path.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No enhanced parquet files matching {pattern} in {enh_path}")
+    for f in files:
+        yield f
+
+
+# ---------- PER-FILE STATS (SMALL) ----------
+
+def compute_file_stats(parquet_path: Path) -> pd.DataFrame:
+    """
+    Load ONE enhanced parquet file and compute per-bucket summary stats.
+    Returns a small DataFrame (one row per decision bucket in that file).
+    """
+    df = pd.read_parquet(parquet_path)
+    if df.empty:
+        return pd.DataFrame()
+
+    if "ts" not in df.columns or "tenor_yrs" not in df.columns:
+        raise ValueError(f"{parquet_path} missing 'ts' or 'tenor_yrs'.")
+
+    df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
+    df = df.dropna(subset=["ts", "tenor_yrs"])
+
+    freq = str(cr.DECISION_FREQ).upper()
+    if freq == "D":
+        df["bucket"] = df["ts"].dt.floor("D")
+    elif freq == "H":
+        df["bucket"] = df["ts"].dt.floor("H")
+    else:
+        raise ValueError("cr.DECISION_FREQ must be 'D' or 'H'.")
+
+    if "z_comb" not in df.columns:
+        raise ValueError(f"{parquet_path} has no 'z_comb' column.")
+
+    have_z_pca    = ("z_pca" in df.columns) and df["z_pca"].notna().any()
+    have_z_spline = ("z_spline" in df.columns) and df["z_spline"].notna().any()
+
+    if have_z_pca and have_z_spline:
+        df["abs_resid"] = (df["z_spline"] - df["z_pca"]).abs()
+    else:
+        df["abs_resid"] = np.nan
+
+    g = df.groupby("bucket", sort=True)
+
+    stats = g.apply(
+        lambda g_: pd.Series({
+            "n_tenors": g_["tenor_yrs"].nunique(),
+            "z_std": g_["z_comb"].std(skipna=True),
+            "z_iqr": g_["z_comb"].quantile(0.75) - g_["z_comb"].quantile(0.25),
+            "z_max_abs": g_["z_comb"].abs().max(),
+            "median_abs_resid": g_["abs_resid"].median(skipna=True),
+            "p95_abs_resid": (
+                g_["abs_resid"].quantile(0.95)
+                if g_["abs_resid"].notna().any()
+                else np.nan
+            ),
+            "mean_z": g_["z_comb"].mean(skipna=True),
+        })
+    ).reset_index()
+
+    return stats
+
+
+# ---------- STREAM ALL FILES & BUILD GLOBAL STATS ----------
+
+def build_global_stats_streaming() -> pd.DataFrame:
+    """
+    Iterate over all enhanced files, compute small per-bucket stats per file,
+    and concatenate them. This keeps memory usage low.
+    """
+    all_stats = []
+    for f in iter_enhanced_files():
+        print(f"[INFO] Processing {f.name} ...")
+        s = compute_file_stats(f)
+        if not s.empty:
+            all_stats.append(s)
+
+    if not all_stats:
+        raise ValueError("No non-empty per-bucket stats produced from enhanced files.")
+
+    stats = pd.concat(all_stats, ignore_index=True)
+
+    # Ensure sorted by time
+    stats = stats.sort_values("bucket").reset_index(drop=True)
+    return stats
+
+
+# ---------- STRESS / HEALTH METRICS (NO RAW PANEL NEEDED) ----------
+
+def add_signal_health(stats: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given per-bucket stats with columns:
+      bucket, z_std, median_abs_resid, mean_z
+    compute:
+      - z_stress
+      - resid_stress
+      - trend_stress (from Δ mean_z autocorr)
+      - signal_health (PCA+z)
+      - signal_health_combined (incl. trend)
+    """
+    out = stats.copy()
+
+    # Robust scale for z_std
+    z_std_med = out["z_std"].median(skipna=True)
+    z_std_hi  = out["z_std"].quantile(0.9) if out["z_std"].notna().any() else np.nan
+
+    resid_med = out["median_abs_resid"].median(skipna=True)
+    resid_hi  = out["median_abs_resid"].quantile(0.9) if out["median_abs_resid"].notna().any() else np.nan
+
+    def _normalize(x, mid, hi):
+        if not np.isfinite(mid) or not np.isfinite(hi) or hi <= mid:
+            return np.zeros_like(x)
+        return np.clip((x - mid) / (hi - mid), 0.0, 1.0)
+
+    out["z_stress"] = _normalize(out["z_std"].values, z_std_med, z_std_hi)
+    out["resid_stress"] = _normalize(out["median_abs_resid"].values, resid_med, resid_hi)
+
+    out["stress_score"] = 0.5 * out["z_stress"] + 0.5 * out["resid_stress"]
+    out["signal_health"] = 1.0 - out["stress_score"]
+
+    # --- trend / persistence based only on mean_z series ---
+    out = out.sort_values("bucket").reset_index(drop=True)
+    out["d_mean_z"] = out["mean_z"].diff()
+
+    window = 20  # you can tune this
+    ac_vals = []
+    d = out["d_mean_z"]
+    for i in range(len(d)):
+        if i < window:
+            ac_vals.append(np.nan)
+            continue
+        x = d.iloc[i-window+1:i+1]
+        if x.isna().any():
+            ac_vals.append(np.nan)
+            continue
+        ac_vals.append(x.autocorr(lag=1))
+
+    out["d_mean_z_ac1"] = ac_vals
+
+    ac_series = out["d_mean_z_ac1"]
+    ac_med = ac_series.median(skipna=True)
+    ac_hi  = ac_series.quantile(0.9) if ac_series.notna().any() else np.nan
+
+    if np.isfinite(ac_med) and np.isfinite(ac_hi) and ac_hi > ac_med:
+        trend_stress = np.clip((ac_series - ac_med) / (ac_hi - ac_med), 0.0, 1.0)
+    else:
+        trend_stress = pd.Series(np.zeros(len(ac_series)), index=ac_series.index)
+
+    out["trend_stress"] = trend_stress
+    out["trend_health"] = 1.0 - out["trend_stress"]
+
+    # Combined health
+    out["stress_score_combined"] = (
+        0.4 * out["z_stress"] +
+        0.4 * out["resid_stress"] +
+        0.2 * out["trend_stress"].fillna(0.0)
+    )
+    out["signal_health_combined"] = 1.0 - out["stress_score_combined"]
+
+    return out
+
+
+# ---------- RUN & PLOT ----------
+
+stats = build_global_stats_streaming()
+stats = add_signal_health(stats)
+
+display(stats.head())
+
+# Signal health
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["signal_health"], label="PCA / z signal_health")
+ax.plot(stats["bucket"], stats["signal_health_combined"], label="Combined (incl. trend)", alpha=0.7)
+ax.set_title("Signal Health Over Time")
+ax.set_ylabel("Health (1 = good, 0 = bad)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# PCA residuals
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["median_abs_resid"], label="median |z_spline - z_pca|")
+ax.set_title("PCA Residuals Over Time")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Trend metric
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["d_mean_z_ac1"], label="AC1 of Δ mean_z")
+ax.set_title("Trendiness of z_comb (higher = more trending / less mean-reverting)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
 # --- imports & config ---
 import numpy as np
 import pandas as pd
