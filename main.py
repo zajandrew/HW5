@@ -1,3 +1,219 @@
+# --- imports & config ---
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+import cr_config as cr  # assumes cr_config.py is importable from this notebook
+
+plt.rcParams["figure.figsize"] = (12, 4)
+
+# --- helper: load all enhanced parquet files into one panel ---
+
+def load_enhanced_panel():
+    """
+    Load all enhanced files from PATH_ENH that match ENH_SUFFIX.
+    Returns a single DataFrame with ts, tenor_yrs, z_spline, z_pca, z_comb, etc.
+    """
+    enh_path = Path(cr.PATH_ENH)
+    pattern = f"*{cr.ENH_SUFFIX}.parquet"  # e.g. *_d.parquet or *_h.parquet
+    files = sorted(enh_path.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No enhanced parquet files matching {pattern} in {enh_path}")
+
+    dfs = []
+    for f in files:
+        df = pd.read_parquet(f)
+        if df.empty:
+            continue
+        df["src_file"] = f.name
+        dfs.append(df)
+
+    if not dfs:
+        raise ValueError("All enhanced parquet files are empty.")
+
+    panel = pd.concat(dfs, ignore_index=True)
+    if "ts" not in panel.columns or "tenor_yrs" not in panel.columns:
+        raise ValueError("Enhanced files must contain at least 'ts' and 'tenor_yrs' columns.")
+
+    panel["ts"] = pd.to_datetime(panel["ts"], utc=False, errors="coerce")
+    panel = panel.dropna(subset=["ts", "tenor_yrs"])
+
+    # decision bucket consistent with backtest
+    freq = str(cr.DECISION_FREQ).upper()
+    if freq == "D":
+        panel["bucket"] = panel["ts"].dt.floor("D")
+    elif freq == "H":
+        panel["bucket"] = panel["ts"].dt.floor("H")
+    else:
+        raise ValueError("cr.DECISION_FREQ must be 'D' or 'H'.")
+
+    return panel
+
+
+# --- helper: compute diagnostics per decision bucket ---
+
+def compute_signal_diagnostics(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each decision bucket, compute:
+      - cross-sectional dispersion of z_comb
+      - PCA residual stats: |z_spline - z_pca|
+      - basic counts
+      And build a simple signal_health index in [0, 1].
+    """
+    have_z_pca = ("z_pca" in panel.columns) and panel["z_pca"].notna().any()
+    have_z_spline = ("z_spline" in panel.columns) and panel["z_spline"].notna().any()
+
+    if "z_comb" not in panel.columns:
+        raise ValueError("Expected 'z_comb' in enhanced panel.")
+
+    if not have_z_pca or not have_z_spline:
+        print("[WARN] z_pca and/or z_spline not present/usable. PCA residual diagnostics will be skipped.")
+
+    df = panel.copy()
+
+    if have_z_pca and have_z_spline:
+        df["resid"] = df["z_spline"] - df["z_pca"]
+        df["abs_resid"] = df["resid"].abs()
+    else:
+        df["abs_resid"] = np.nan
+
+    # group by decision bucket
+    grouped = df.groupby("bucket", sort=True)
+
+    stats = grouped.apply(
+        lambda g: pd.Series({
+            "n_tenors": g["tenor_yrs"].nunique(),
+            "z_std": g["z_comb"].std(skipna=True),
+            "z_iqr": (g["z_comb"].quantile(0.75) - g["z_comb"].quantile(0.25)),
+            "z_max_abs": g["z_comb"].abs().max(),
+            "median_abs_resid": g["abs_resid"].median(skipna=True),
+            "p95_abs_resid": g["abs_resid"].quantile(0.95) if g["abs_resid"].notna().any() else np.nan,
+        })
+    ).reset_index()
+
+    # --- build a very simple "signal_health" index ---
+    # Higher dispersion and larger residuals => worse health.
+
+    # robust scales (avoid division by zero)
+    z_std_med = stats["z_std"].median(skipna=True)
+    z_std_hi = stats["z_std"].quantile(0.9) if stats["z_std"].notna().any() else np.nan
+
+    resid_med = stats["median_abs_resid"].median(skipna=True)
+    resid_hi = stats["median_abs_resid"].quantile(0.9) if stats["median_abs_resid"].notna().any() else np.nan
+
+    def _normalize(x, mid, hi):
+        if not np.isfinite(mid) or not np.isfinite(hi) or hi <= mid:
+            return np.zeros_like(x)
+        # 0 near mid, 1 near hi, clipped
+        return np.clip((x - mid) / (hi - mid), 0.0, 1.0)
+
+    stats["z_stress"] = _normalize(stats["z_std"].values, z_std_med, z_std_hi)  # shape change / stress
+    stats["resid_stress"] = _normalize(stats["median_abs_resid"].values, resid_med, resid_hi)
+
+    # composite stress and health
+    stats["stress_score"] = 0.5 * stats["z_stress"] + 0.5 * stats["resid_stress"]
+    stats["signal_health"] = 1.0 - stats["stress_score"]
+
+    return stats.sort_values("bucket").reset_index(drop=True)
+
+
+# --- helper: rough "trending vs reversion" metric using z_comb changes ---
+
+def add_trend_metric(stats: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a simple trending metric based on cross-sectional mean z_comb changes.
+    This is very coarse but gives a sense of whether z moves are persistent.
+    """
+    df = panel.copy()
+    # cross-sectional mean z per bucket
+    mean_z = df.groupby("bucket")["z_comb"].mean().rename("mean_z").to_frame().reset_index()
+    mean_z["d_mean_z"] = mean_z["mean_z"].diff()
+
+    # rolling window for autocorr / trendiness
+    window = 20  # ~1 month if daily, or adjust
+    d = mean_z["d_mean_z"]
+
+    ac_vals = []
+    for i in range(len(d)):
+        if i < window:
+            ac_vals.append(np.nan)
+            continue
+        x = d.iloc[i-window+1:i+1]
+        if x.isna().any():
+            ac_vals.append(np.nan)
+            continue
+        # lag-1 autocorr approx
+        ac = x.autocorr(lag=1)
+        ac_vals.append(ac)
+
+    mean_z["d_mean_z_ac1"] = ac_vals
+
+    # normalize trendiness into [0,1] "trend_stress"
+    ac_series = mean_z["d_mean_z_ac1"]
+    ac_med = ac_series.median(skipna=True)
+    ac_hi = ac_series.quantile(0.9) if ac_series.notna().any() else np.nan
+
+    if np.isfinite(ac_med) and np.isfinite(ac_hi) and ac_hi > ac_med:
+        trend_stress = np.clip((ac_series - ac_med) / (ac_hi - ac_med), 0.0, 1.0)
+    else:
+        trend_stress = pd.Series(np.zeros(len(ac_series)), index=ac_series.index)
+
+    mean_z["trend_stress"] = trend_stress
+    mean_z["trend_health"] = 1.0 - mean_z["trend_stress"]
+
+    # merge into stats
+    out = stats.merge(mean_z[["bucket", "mean_z", "d_mean_z", "d_mean_z_ac1", "trend_stress", "trend_health"]],
+                      on="bucket", how="left")
+    # update overall signal_health to include trend
+    out["stress_score_combined"] = (
+        0.4 * out["z_stress"] +
+        0.4 * out["resid_stress"] +
+        0.2 * out["trend_stress"].fillna(0.0)
+    )
+    out["signal_health_combined"] = 1.0 - out["stress_score_combined"]
+
+    return out
+
+
+# --- run everything and plot ---
+
+panel = load_enhanced_panel()
+stats = compute_signal_diagnostics(panel)
+stats = add_trend_metric(stats, panel)
+
+display(stats.head())
+
+# Plot basic signal health over time
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["signal_health"], label="PCA/residual signal_health")
+ax.plot(stats["bucket"], stats["signal_health_combined"], label="Combined (incl. trend)", alpha=0.7)
+ax.set_title("Signal Health Over Time")
+ax.set_ylabel("Health (1 = good, 0 = bad)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Optionally look at residual stress directly
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["median_abs_resid"], label="median |z_spline - z_pca|")
+ax.set_title("PCA Residuals Over Time")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Optionally inspect trending metric
+fig, ax = plt.subplots()
+ax.plot(stats["bucket"], stats["d_mean_z_ac1"], label="AC1 of Δ mean z_comb")
+ax.set_title("Trendiness of z_comb (higher = more trending / less mean-reverting)")
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+
+
+
+
 import cr_analytics as cra
 
 cra.overlay_full_report(pos_overlay, diag_overlay, label="overlay_D")
