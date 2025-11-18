@@ -34,6 +34,9 @@ TENOR_YEARS = {
 # }
 BBG_DICT = {}
 
+RUN_MODE = "overlay"
+TRADE_TYPES = "synth_trades"
+
 # ========= Calendar filtering =========
 USE_QL_CALENDAR = True
 QL_US_MARKET    = "FederalReserve"
@@ -67,43 +70,44 @@ else:  # 'H'
     PCA_LOOKBACK = max(1, min(PCA_LOOKBACK_DAYS * 24, PCA_LOOKBACK_CAP_HOURS))
 
 # ========= Backtest decision layer =========
-Z_ENTRY       = 0.75     # enter when cheap-rich z-spread >= Z_ENTRY
-Z_EXIT        = 0.40     # take profit when |z-spread| <= Z_EXIT
-Z_STOP        = 3.00     # stop if divergence since entry >= Z_STOP
+Z_ENTRY       = 2.00     # enter when cheap-rich z-spread >= Z_ENTRY
+Z_EXIT        = 0.75     # take profit when |z-spread| <= Z_EXIT
+Z_STOP        = 1.00     # stop if divergence since entry >= Z_STOP
 MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
-MIN_LEG_TENOR_YEARS = 0.4
+ALT_LEG_TENOR_YEARS = 0.0
+EXEC_LEG_TENOR_YEARS = 0.084
 
 # ========= Risk & selection =========
 BUCKETS = {
-    "short": (0.4, 1.0),   # ~6M–<2Y
+    "short": (0.0, 0.99),   # ~6M–<2Y
     "front": (1.0, 3.0),
     "belly": (3.1, 9.0),
     "long" : (10.0, 40.0),
 }
-MIN_SEP_YEARS        = 0.5
+MIN_SEP_YEARS        = 0.05
 MAX_SPAN_YEARS = 10
-MAX_CONCURRENT_PAIRS = 3
-PER_BUCKET_DV01_CAP  = 1.0
-TOTAL_DV01_CAP       = 3.0
-FRONT_END_DV01_CAP   = 1.0
+MAX_CONCURRENT_PAIRS = 100_000
+PER_BUCKET_DV01_CAP  = 1e10
+TOTAL_DV01_CAP       = 1e10
+FRONT_END_DV01_CAP   = 1e10
 
 # ========= Fly-alignment gate (curvature sanity) =========
 FLY_ENABLE            = True          # master on/off
-FLY_MODE              = "tolerant"    # "off" | "loose" | "tolerant" | "strict"
+FLY_MODE              = "strict"    # "off" | "loose" | "tolerant" | "strict"
 
 # Which flies to evaluate (triplets in years, sorted a<b<c)
 FLY_DEFS              = [(1.0, 3.0, 7.0), (2.0, 5.0, 10.0), (3.0, 7.0, 15.0), (4.0, 8.0, 20.0)]
 
 # Strength and locality
-FLY_Z_MIN             = 0.8           # require |fly_z| >= this to consider it “strong”
+FLY_Z_MIN             = 1.0           # require |fly_z| >= this to consider it “strong”
 FLY_NEIGHBOR_ONLY     = True          # only evaluate flies near the leg tenor
-FLY_WINDOW_YEARS      = 3.0           # neighborhood half-width in years (± around leg tenor)
+FLY_WINDOW_YEARS      = 2.0           # neighborhood half-width in years (± around leg tenor)
 
 # Robust blocking logic
-FLY_REQUIRE_COUNT     = 2             # need ≥K contradictory strong flies to block (tolerant)
-FLY_SKIP_SHORT_UNDER  = 2.0           # skip gate entirely for legs < this tenor (yrs)
+FLY_REQUIRE_COUNT     = 1             # need ≥K contradictory strong flies to block (tolerant)
+FLY_SKIP_SHORT_UNDER  = 1.0           # skip gate entirely for legs < this tenor (yrs)
 FLY_ALLOW_BIG_ZDISP   = True          # never block if pair dispersion already big
-FLY_BIG_ZDISP_MARGIN  = 0.20          # allow when zdisp ≥ Z_ENTRY + margin
+FLY_BIG_ZDISP_MARGIN  = 0.10          # allow when zdisp ≥ Z_ENTRY + margin
 FLY_TENOR_TOL_YEARS   = 0.02
 
 # Extra entry threshold if any leg is in short bucket (kept from earlier design)
@@ -113,37 +117,37 @@ SHORT_END_EXTRA_Z     = 0.30
 OVERLAY_SWITCH_COST_BP = 0.10   # 0.10 bp × DV01 per round-trip switch
 
 # 1) Hard per-trade DV01 cap (absolute DV01 used in overlay pair)
-OVERLAY_DV01_CAP_PER_TRADE = 20_000.0   # good first pass
+OVERLAY_DV01_CAP_PER_TRADE = 1e10   # good first pass
 
 # 2) Per-bucket per-trade DV01 caps (overrides global cap when present)
 OVERLAY_DV01_CAP_PER_TRADE_BUCKET = {
-    "short": 7_000.0,
-    "front": 10_000.0,
-    "belly": 6_000.0,
-    "long": 5_000.0,
-    "other": 10_000.0,
+    "short": 1e10,
+    "front": 1e10,
+    "belly": 1e10,
+    "long": 1e10,
+    "other": 1e10,
 }
 
 # 3) Per decision timestamp DV01 gate (skip overlay on extreme flow days)
 # This is sum(abs(dv01)) across hedge tape at that decision timestamp.
-OVERLAY_DV01_TS_CAP = 300_000.0         # try 300k; later test 200k vs 500k
+OVERLAY_DV01_TS_CAP = 1e10         # try 300k; later test 200k vs 500k
 
 # ======== Overlay Z-entry scaling with DV01 =======
 
 # Base reference DV01 for which Z_ENTRY applies "as-is"
-OVERLAY_Z_ENTRY_DV01_REF = 5_000.0      # roughly median hedge size
+OVERLAY_Z_ENTRY_DV01_REF = 1e10      # roughly median hedge size
 
 # Slope for DV01 scaling:
 # Z_ENTRY_eff = Z_ENTRY + k * log(dv01 / OVERLAY_Z_ENTRY_DV01_REF)
-OVERLAY_Z_ENTRY_DV01_K = 0.45           # try 0.45 first; 0.35–0.55 reasonable
+OVERLAY_Z_ENTRY_DV01_K = 0.0           # try 0.45 first; 0.35–0.55 reasonable
 
 # ======== Overlay max-hold scaling with DV01 ======
 
 # For small trades: use global MAX_HOLD_DAYS (your existing config)
 # For medium/large trades: tighten max-hold.
 
-OVERLAY_MAX_HOLD_DV01_MED  = 20_000.0   # dv01 >= this → use MED max-hold
-OVERLAY_MAX_HOLD_DAYS_MED  = 5          # instead of 10
+OVERLAY_MAX_HOLD_DV01_MED  = 1e10   # dv01 >= this → use MED max-hold
+OVERLAY_MAX_HOLD_DAYS_MED  = 10          # instead of 10
 
-OVERLAY_MAX_HOLD_DV01_HI   = 50_000.0   # dv01 >= this → use HI max-hold
-OVERLAY_MAX_HOLD_DAYS_HI   = 2          # very tight leash on big trades
+OVERLAY_MAX_HOLD_DV01_HI   = 1e10   # dv01 >= this → use HI max-hold
+OVERLAY_MAX_HOLD_DAYS_HI   = 10          # very tight leash on big trades
