@@ -1,4 +1,93 @@
 import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# --- Assumes you already have these from regime_filter.build_regime_state(...) ---
+# signals_df: DataFrame indexed by decision_ts (or date), with signal columns
+# regime_df : DataFrame indexed similarly, with at least a 'regime' column (0/1)
+
+# 1) Basic safety copies
+signals_df = signals_df.copy()
+regime_df = regime_df.copy()
+
+# 2) Ensure DateTimeIndex if possible
+if not isinstance(signals_df.index, pd.DatetimeIndex):
+    signals_df.index = pd.to_datetime(signals_df.index)
+
+if not isinstance(regime_df.index, pd.DatetimeIndex):
+    regime_df.index = pd.to_datetime(regime_df.index)
+
+# 3) Align on common index to avoid mismatches
+common_index = signals_df.index.intersection(regime_df.index)
+signals_df = signals_df.loc[common_index].sort_index()
+regime_df  = regime_df.loc[common_index].sort_index()
+
+# 4) Pull the regime series (required)
+if "regime" not in regime_df.columns:
+    raise ValueError("regime_df must contain a 'regime' column (0/1).")
+
+reg = regime_df["regime"].astype(float).fillna(0.0)
+
+# 5) Determine which signal columns to plot (all numeric, excluding 'regime' if present)
+signal_cols = []
+for col in signals_df.columns:
+    if col == "regime":
+        continue
+    if pd.api.types.is_numeric_dtype(signals_df[col]):
+        signal_cols.append(col)
+
+if not signal_cols:
+    raise ValueError("No numeric signal columns found in signals_df to plot.")
+
+n_plots = len(signal_cols) + 1  # signals + regime
+
+# 6) Find contiguous blocked intervals (regime == 1) to shade
+starts = (reg == 1) & (reg.shift(1, fill_value=0) == 0)
+ends   = (reg == 0) & (reg.shift(1, fill_value=0) == 1)
+
+start_times = reg.index[starts]
+end_times   = reg.index[ends]
+
+# If regime ends in blocked state, close last interval at final timestamp
+if len(end_times) < len(start_times):
+    end_times = end_times.append(pd.Index([reg.index[-1]]))
+
+blocked_intervals = list(zip(start_times, end_times))
+
+def shade_blocked(ax):
+    """Shade regime==1 intervals on the given axis."""
+    for s, e in blocked_intervals:
+        ax.axvspan(s, e, alpha=0.15)  # let Matplotlib choose color; just a light band
+
+# 7) Build figure with all signal panels + regime panel
+fig, axes = plt.subplots(n_plots, 1, figsize=(16, 3 * n_plots), sharex=True)
+if n_plots == 1:
+    axes = [axes]  # make iterable if only one
+
+# 7a) Plot each signal column with blocked shading
+for i, col in enumerate(signal_cols):
+    ax = axes[i]
+    ax.plot(signals_df.index, signals_df[col], linewidth=1.6, label=col)
+    shade_blocked(ax)
+    ax.set_ylabel(col)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+
+# 7b) Final panel: regime itself (0/1) as a step function
+ax_reg = axes[-1]
+ax_reg.step(reg.index, reg.values, where="post", linewidth=1.6, label="regime (0=OK, 1=blocked)")
+shade_blocked(ax_reg)
+ax_reg.set_ylabel("regime")
+ax_reg.set_ylim(-0.1, 1.1)
+ax_reg.grid(True, alpha=0.3)
+ax_reg.legend(loc="upper left")
+
+plt.suptitle("Signals and Regime (shaded = blocked regime)", y=0.99)
+plt.tight_layout()
+plt.show()
+
+
+import matplotlib.pyplot as plt
 
 # Assuming these exist:
 # signals_df, regime_df
