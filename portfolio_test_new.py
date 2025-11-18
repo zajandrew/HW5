@@ -79,9 +79,9 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
 
     decision_freq = str(decision_freq).upper()
     if decision_freq == "D":
-        df["decision_ts"] = df["trade_ts"].dt.floor("D")
+        df["decision_ts"] = df["trade_ts"].dt.floor("d")
     elif decision_freq == "H":
-        df["decision_ts"] = df["trade_ts"].dt.floor("H")
+        df["decision_ts"] = df["trade_ts"].dt.floor("h")
     else:
         raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
@@ -552,11 +552,11 @@ def run_month(
     # Decision buckets & decisions-per-day
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     if decision_freq == "D":
-        df["decision_ts"] = df["ts"].dt.floor("D")
+        df["decision_ts"] = df["ts"].dt.floor("d")
         decisions_per_day = 1
     elif decision_freq == "H":
-        df["decision_ts"] = df["ts"].dt.floor("H")
-        per_day_counts = df.groupby(df["decision_ts"].dt.floor("D"))["decision_ts"].nunique()
+        df["decision_ts"] = df["ts"].dt.floor("h")
+        per_day_counts = df.groupby(df["decision_ts"].dt.floor("d"))["decision_ts"].nunique()
         decisions_per_day = int(per_day_counts.mean()) if len(per_day_counts) else 24
     else:
         raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
@@ -679,6 +679,11 @@ def run_month(
                     # 2) Stop: same side, but materially further from zero than entry
                     elif moved_away:
                         exit_flag = "stop"
+
+            if exit_flag is None and BPS_PNL_STOP > 0.0:
+                pnl_bp = float(getattr(pos, "pnl_bp", np.nan))
+                if np.isfinite(pnl_bp) and pnl_bp <= -BPS_PNL_STOP:
+                    exit_flag = "pnl_stop"
 
             # 3) Max-hold if nothing else triggered
             if exit_flag is None:
@@ -818,7 +823,7 @@ def run_month(
                     break
 
                 trade_tenor = float(h["tenor_yrs"])
-                if trade_tenor < MIN_LEG_TENOR:
+                if trade_tenor < EXEC_LEG_TENOR_YEARS:
                     continue
 
                 side = str(h["side"]).upper()
@@ -863,7 +868,7 @@ def run_month(
                     if alt_tenor == exec_tenor:
                         continue
 
-                    if (alt_tenor < MIN_LEG_TENOR) or (exec_tenor < MIN_LEG_TENOR):
+                    if alt_tenor < ALT_LEG_TENOR_YEARS:
                         continue
 
                     diff = abs(alt_tenor - exec_tenor)
@@ -954,7 +959,7 @@ def run_month(
     # PnL by bucket from marks (aggregate in cash terms)
     if not ledger.empty:
         marks = ledger[ledger["event"] == "mark"].copy()
-        idx = marks["decision_ts"].dt.floor("D" if decision_freq == "D" else "H")
+        idx = marks["decision_ts"].dt.floor("d" if decision_freq == "D" else "h")
         pnl_by = marks.groupby(idx)["pnl_cash"].sum().rename("pnl_cash").to_frame().reset_index()
         pnl_by = pnl_by.rename(columns={"decision_ts": "bucket"})
     else:
@@ -1088,7 +1093,8 @@ if __name__ == "__main__":
         sys.exit(1)
     months = sys.argv[1:]
     # CLI uses strategy mode by default (no hedge tape)
-    pos, led, by = run_all(months, carry=True, force_close_end=False, mode="strategy")
+    trades = pd.read_pickle(f"{cr.TRADE_TYPES}.pkl")
+    pos, led, by = run_all(months, carry=True, force_close_end=False, mode=cr.RUN_MODE, hedge_df=trades)
     out_dir = Path(cr.PATH_OUT); out_dir.mkdir(parents=True, exist_ok=True)
     suffix = getattr(cr, "OUT_SUFFIX", "")
     if not pos.empty: pos.to_parquet(out_dir / f"positions_ledger{suffix}.parquet")
