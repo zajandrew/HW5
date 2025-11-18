@@ -4,6 +4,161 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 import cr_config as cr
+import hybrid_filter as hf  # combined regime + shock filter
+
+# -------------------------
+# 1) Discover months and build/load signals
+# -------------------------
+enh_dir = Path(cr.PATH_ENH)
+
+# Assumes filenames like "202404_enh_d.parquet"
+yymms = sorted({
+    p.stem.split("_")[0]
+    for p in enh_dir.glob(f"*{cr.ENH_SUFFIX}.parquet")
+})
+print("YYMMs detected:", yymms)
+
+# This matches the expected signature in hybrid_filter.py:
+# def build_hybrid_signals(yymms, decision_freq, force_rebuild=False, cache_path=None)
+signals = hf.build_hybrid_signals(
+    yymms=yymms,
+    decision_freq=cr.DECISION_FREQ,
+    force_rebuild=False,   # set True if you want to rebuild from scratch
+)
+print("Signals shape:", signals.shape)
+print("Signal columns:", signals.columns.tolist())
+
+# -------------------------
+# 2) Load overlay PnL from your backtest
+# -------------------------
+out_dir = Path(cr.PATH_OUT)
+
+# Adjust filename if your ledger name differs
+ledger_path = out_dir / f"ledger_overlay{cr.OUT_SUFFIX}.parquet"
+ledger = pd.read_parquet(ledger_path)
+
+# We only care about overlay trades
+pos_overlay = ledger[ledger["mode"] == "overlay"].copy()
+pos_overlay["decision_ts"] = pd.to_datetime(pos_overlay["decision_ts"])
+pos_overlay = pos_overlay.sort_values("decision_ts")
+
+print("Overlay marks:", len(pos_overlay))
+
+# -------------------------
+# 3) Run the hybrid filter (regime + shock)
+# -------------------------
+# This matches the expected signature:
+# def run_hybrid_filter(signals, pos_overlay, shock_method="B", shock_block_days=10,
+#                       use_regime_filter=True, use_shock_blocker=True, **kwargs)
+results = hf.run_hybrid_filter(
+    signals=signals,
+    pos_overlay=pos_overlay,
+    # shock-blocker knobs
+    shock_method="B",          # "A" = all strong, "B" = top-K, "C" = single best
+    shock_block_days=10,       # how long to block after a shock
+    # regime filter knobs
+    use_regime_filter=True,
+    use_shock_blocker=True,
+)
+
+pnl_original = results["pnl_original"]   # pd.Series indexed by date
+pnl_filtered = results["pnl_filtered"]   # same index
+flags       = results["flags"]           # DataFrame with boolean columns
+summary     = results["summary"]         # DataFrame of stats
+
+print("\n=== Hybrid summary ===")
+print(summary)
+
+print("\nFlag columns:", flags.columns.tolist())
+print(flags.head())
+
+# -------------------------
+# 4) Plot original vs hybrid-filtered cumulative PnL
+# -------------------------
+plt.figure()
+pnl_original.cumsum().plot(label="Original", linewidth=1.2)
+pnl_filtered.cumsum().plot(label="Hybrid-filtered", linewidth=1.2)
+plt.title("Overlay PnL: original vs hybrid-filtered")
+plt.xlabel("Date")
+plt.ylabel("Cumulative PnL (bp or cash)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# -------------------------
+# 5) Quick look at where the filter blocks
+# -------------------------
+diag = pd.concat(
+    [
+        pnl_original.rename("pnl_orig"),
+        pnl_filtered.rename("pnl_filt"),
+        flags,
+    ],
+    axis=1,
+).dropna(subset=["pnl_orig"])
+
+blocked_days = diag[diag["hybrid_block"]].copy() if "hybrid_block" in diag.columns else pd.DataFrame()
+print("\nFirst few blocked days:")
+print(blocked_days.head(10))
+
+# -------------------------
+# 6) Compare average daily PnL on vs off hybrid blocks (using ORIGINAL PnL)
+# -------------------------
+if "hybrid_block" in diag.columns:
+    on_block  = diag[diag["hybrid_block"]]
+    off_block = diag[~diag["hybrid_block"]]
+else:
+    # Fallback: treat no blocks if column missing
+    on_block  = diag.iloc[0:0]
+    off_block = diag
+
+def pnl_stats(x, label):
+    if len(x) == 0:
+        return {"label": label, "n_days": 0, "mean_pnl": np.nan,
+                "median_pnl": np.nan, "p05": np.nan, "p95": np.nan}
+    return {
+        "label": label,
+        "n_days": len(x),
+        "mean_pnl": x["pnl_orig"].mean(),
+        "median_pnl": x["pnl_orig"].median(),
+        "p05": x["pnl_orig"].quantile(0.05),
+        "p95": x["pnl_orig"].quantile(0.95),
+    }
+
+stats_on  = pnl_stats(on_block,  "on_block (hybrid_block=True)")
+stats_off = pnl_stats(off_block, "off_block (hybrid_block=False)")
+
+print("\n=== PnL per day: on vs off hybrid blocks (using ORIGINAL PnL) ===")
+print(pd.DataFrame([stats_on, stats_off]).set_index("label"))
+
+# -------------------------
+# 7) Optional: visualize blocks as vertical stripes
+# -------------------------
+plt.figure()
+cum_orig = pnl_original.cumsum()
+cum_filt = pnl_filtered.cumsum()
+
+ax = cum_orig.plot(label="Original", linewidth=1.0)
+cum_filt.plot(ax=ax, label="Hybrid-filtered", linewidth=1.0)
+
+if "hybrid_block" in flags.columns:
+    for dt, row in flags.iterrows():
+        if row.get("hybrid_block", False):
+            ax.axvspan(dt, dt, alpha=0.15)  # thin vertical stripe
+
+ax.set_title("Cumulative PnL with hybrid block days shaded")
+ax.set_xlabel("Date")
+ax.set_ylabel("Cumulative PnL")
+ax.legend()
+ax.grid(True)
+plt.show()
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+import cr_config as cr
 import hybrid_filter as hf  # <- your new hybrid filter file
 
 # -------------------------
