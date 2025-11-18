@@ -5,6 +5,210 @@ def analyze_regime_and_overlay(
     signals: pd.DataFrame,
     pos_overlay: pd.DataFrame,
     *,
+    pnl_col: str = "pnl_net_bp",
+    regime_quantiles: tuple[float, float] = (0.25, 0.75),
+    fwd_windows: tuple[int, ...] = (1, 3, 5, 10),
+):
+    """
+    Analyze how overlay PnL depends on regime signals.
+
+    Parameters
+    ----------
+    signals : DataFrame
+        From regime_filter.py. Index must be dates (bucket), columns are signal series
+        like mean_z_comb, trendiness, health_core, health_combined, etc.
+    pos_overlay : DataFrame
+        Closed overlay positions from portfolio_test_new (pos_overlay).
+        Must contain 'close_ts' and the PnL column (default 'pnl_net_bp').
+    pnl_col : str
+        Column in pos_overlay to use as PnL (bp). We'll sum by close date.
+    regime_quantiles : (low_q, high_q)
+        Quantile cutoffs for low/mid/high regimes per signal.
+    fwd_windows : tuple of ints
+        Horizons (in days) for forward cumulative PnL from each date t
+        (t+1 .. t+k), used to assess predictability without lookahead.
+
+    Returns
+    -------
+    results : dict
+        {
+          "daily_pnl": daily_pnl_df,
+          "merged": merged_df,
+          "regime_stats": regime_stats_df,
+          "forward_stats": forward_stats_df,
+        }
+    """
+
+    # --- 1) Build daily PnL series from pos_overlay ---
+    po = pos_overlay.copy()
+    po["close_ts"] = pd.to_datetime(po["close_ts"])
+    po["bucket"] = po["close_ts"].dt.floor("D")
+
+    daily_pnl = (
+        po.groupby("bucket")[pnl_col]
+        .sum()
+        .rename("pnl_daily")
+        .to_frame()
+        .sort_index()
+    )
+
+    # --- 2) Align with signals on date index ---
+    sig = signals.copy()
+    # your signals index is already "bucket", but ensure datetime:
+    sig.index = pd.to_datetime(sig.index)
+
+    merged = sig.join(daily_pnl, how="left")
+    # days with no overlay trades → 0 pnl
+    merged["pnl_daily"] = merged["pnl_daily"].fillna(0.0)
+
+    # Automatically pick numeric signal columns
+    signal_cols = [
+        c for c in merged.columns
+        if c != "pnl_daily" and np.issubdtype(merged[c].dtype, np.number)
+    ]
+
+    low_q, high_q = regime_quantiles
+
+    # --- 3) Build regimes for each signal ---
+    for col in signal_cols:
+        series = merged[col].dropna()
+        if series.empty:
+            continue
+        lo = series.quantile(low_q)
+        hi = series.quantile(high_q)
+
+        reg_col = f"{col}_regime"
+        merged[reg_col] = np.where(
+            merged[col] <= lo,
+            "low",
+            np.where(merged[col] >= hi, "high", "mid"),
+        )
+
+    # --- 4) Per-regime same-day PnL stats ---
+    regime_rows = []
+    for col in signal_cols:
+        reg_col = f"{col}_regime"
+        if reg_col not in merged.columns:
+            continue
+
+        tmp = merged[[col, reg_col, "pnl_daily"]].dropna(subset=[col])
+        for regime in ["low", "mid", "high"]:
+            sub = tmp[tmp[reg_col] == regime]
+            if sub.empty:
+                continue
+
+            pnl = sub["pnl_daily"]
+            mean_pnl = pnl.mean()
+            std_pnl = pnl.std(ddof=0)
+            sharpe = (
+                mean_pnl / std_pnl * np.sqrt(252)
+                if std_pnl > 0
+                else np.nan
+            )
+            hit_rate = (pnl > 0).mean()
+            avg_signal = sub[col].mean()
+
+            regime_rows.append(
+                {
+                    "signal": col,
+                    "regime": regime,
+                    "n_days": len(sub),
+                    "mean_pnl_bp": mean_pnl,
+                    "std_pnl_bp": std_pnl,
+                    "sharpe_252": sharpe,
+                    "hit_rate": hit_rate,
+                    "avg_signal": avg_signal,
+                }
+            )
+
+    regime_stats = pd.DataFrame(regime_rows).set_index(["signal", "regime"]).sort_index()
+
+    # --- 5) Forward-window PnL stats (no lookahead) ---
+    merged = merged.sort_index()
+    for k in fwd_windows:
+        # forward PnL from t+1 .. t+k
+        merged[f"pnl_fwd_{k}d"] = (
+            merged["pnl_daily"]
+            .shift(-1)
+            .rolling(window=k, min_periods=k)
+            .sum()
+        )
+
+    fwd_rows = []
+    for col in signal_cols:
+        reg_col = f"{col}_regime"
+        if reg_col not in merged.columns:
+            continue
+
+        base = merged[[col, reg_col, "pnl_daily"] +
+                      [f"pnl_fwd_{k}d" for k in fwd_windows]].dropna(subset=[col])
+
+        for regime in ["low", "mid", "high"]:
+            sub = base[base[reg_col] == regime]
+            if sub.empty:
+                continue
+
+            for k in fwd_windows:
+                fwd_col = f"pnl_fwd_{k}d"
+                pnl = sub[fwd_col].dropna()
+                if pnl.empty:
+                    continue
+
+                mean_pnl = pnl.mean()
+                std_pnl = pnl.std(ddof=0)
+                sharpe = (
+                    mean_pnl / std_pnl * np.sqrt(252 / k)
+                    if std_pnl > 0
+                    else np.nan
+                )
+                hit_rate = (pnl > 0).mean()
+
+                fwd_rows.append(
+                    {
+                        "signal": col,
+                        "regime": regime,
+                        "horizon_days": k,
+                        "n_obs": len(pnl),
+                        "mean_fwd_pnl_bp": mean_pnl,
+                        "std_fwd_pnl_bp": std_pnl,
+                        "sharpe_252_scaled": sharpe,
+                        "hit_rate": hit_rate,
+                    }
+                )
+
+    forward_stats = (
+        pd.DataFrame(fwd_rows)
+        .set_index(["signal", "regime", "horizon_days"])
+        .sort_index()
+    )
+
+    # --- 6) Print a quick summary for inspection ---
+    print("\n=== Same-day PnL by regime (bp) ===")
+    print(regime_stats[["n_days", "mean_pnl_bp", "sharpe_252", "hit_rate"]])
+
+    print("\n=== Forward PnL by regime & horizon (bp) ===")
+    print(
+        forward_stats[["mean_fwd_pnl_bp", "sharpe_252_scaled", "hit_rate"]]
+        .groupby(level=[0, 1, 2])
+        .first()
+    )
+
+    return {
+        "daily_pnl": daily_pnl,
+        "merged": merged,
+        "regime_stats": regime_stats,
+        "forward_stats": forward_stats,
+    }
+    
+results = analyze_regime_and_overlay(signals, pos_overlay)
+
+import numpy as np
+import pandas as pd
+
+def analyze_regime_and_overlay(
+    signals: pd.DataFrame,
+    pos_overlay: pd.DataFrame,
+    *,
     signal_col: str = "signal_health",
     pnl_col: str = "pnl_cash",
     horizons=(1, 5, 10),
