@@ -1,3 +1,91 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+def backtest_regime_filter(signals, pos_overlay,
+                           thresholds=None,
+                           verbose=True):
+    """
+    Apply regime filter to overlay positions and compute:
+    - cumulative pnl ON vs OFF
+    - sharpe, hit rate
+    - distribution plots
+
+    signals: df indexed by 'bucket' (date)
+    pos_overlay: df with open_ts, close_ts, pnl_net_bp
+    """
+
+    # -------------------------------------------------
+    # 1. Default thresholds if not provided
+    # -------------------------------------------------
+    if thresholds is None:
+        thresholds = {
+            'z_change_high': signals['d_mean_z_comb'].quantile(0.70),
+            'z_change_low':  signals['d_mean_z_comb'].quantile(0.30),
+
+            'trend_low':    signals['trendiness'].quantile(0.30),
+            'trend_high':   signals['trendiness'].quantile(0.70),
+
+            'resid_high':   signals['median_abs_resid'].quantile(0.70),
+            'absz_max':     signals['mean_abs_z_comb'].quantile(0.80),
+
+            'health_bad':   signals['health_core'].quantile(0.70),
+            'health_good':  signals['health_core'].quantile(0.30),
+        }
+
+    # -------------------------------------------------
+    # 2. Merge signals onto positions at entry
+    # -------------------------------------------------
+    pos = pos_overlay.copy()
+    pos['open_date'] = pos['open_ts'].dt.floor('D')
+
+    merged = pos.merge(
+        signals,
+        left_on='open_date',
+        right_index=True,
+        how='left'
+    )
+
+    # -------------------------------------------------
+    # 3. Apply regime ON/OFF rules
+    # -------------------------------------------------
+    m = merged
+
+    regime_on = (
+        (m['d_mean_z_comb'] > thresholds['z_change_high']) &
+        (m['trendiness'] < thresholds['trend_low']) &
+        (m['median_abs_resid'] > thresholds['resid_high']) &
+        (m['mean_abs_z_comb'] < thresholds['absz_max'])
+    )
+
+    m['regime'] = np.where(regime_on, 'ON', 'OFF')
+
+    # -------------------------------------------------
+    # 4. Compute stats
+    # -------------------------------------------------
+    stats = m.groupby('regime')['pnl_net_bp'].agg(['count','mean','std'])
+    stats['sharpe_252'] = (stats['mean'] / stats['std']) * np.sqrt(252)
+
+    if verbose:
+        print("\n=== Regime Summary ===")
+        print(stats)
+
+    # -------------------------------------------------
+    # 5. Plots
+    # -------------------------------------------------
+    m['cum_pnl'] = m.groupby('regime')['pnl_net_bp'].cumsum()
+
+    plt.figure(figsize=(12,6))
+    for r in ['ON','OFF']:
+        tmp = m[m['regime']==r]
+        plt.plot(tmp['close_ts'], tmp['cum_pnl'], label=r)
+    plt.legend(); plt.title("Cumulative PnL by Regime")
+    plt.grid(True)
+    plt.show()
+
+    return m, stats, thresholds
+
+
 import numpy as np
 import pandas as pd
 
