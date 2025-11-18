@@ -1,3 +1,275 @@
+import numpy as np
+import pandas as pd
+
+def analyze_shock_blocker(
+    signals: pd.DataFrame,
+    pos_overlay: pd.DataFrame,
+    *,
+    pnl_col: str = "pnl_net_bp",
+    horizon_days: int = 7,             # Q1: short-term horizon (we chose 7)
+    cool_off_days: int = 10,           # Q4: default cooling period
+    trigger_mode: str = "A",           # Q2: "A" (any), "B" (confirm), "C" (weighted)
+    min_signals_confirm: int = 2,      # for mode "B"
+    score_threshold: float = 0.7,      # for mode "C"
+    quantile_bad: float = 0.8,         # which tail to use for "danger" (80% tail)
+    signal_cols: list[str] | None = None,
+    verbose: bool = True,
+):
+    """
+    Analyze short-term 'shock' regimes and build an intermittent blocking rule
+    based on your signal dataframe and overlay PnL.
+
+    Parameters
+    ----------
+    signals : DataFrame
+        Index: daily bucket (DatetimeIndex, e.g. 'bucket' from regime_filter).
+        Columns: signal series like:
+            ['mean_z_comb', 'mean_abs_z_comb', 'median_abs_resid',
+             'd_mean_z_comb', 'trendiness', 'resid_smoothed',
+             'health_core', 'health_combined', ...]
+    pos_overlay : DataFrame
+        Closed overlay positions from portfolio_test_new.
+        Must contain:
+            - 'open_ts'  (datetime)
+            - 'close_ts' (datetime)
+            - pnl_col    (default 'pnl_net_bp')
+    trigger_mode : {"A","B","C"}
+        A: block if ANY signal is in its danger zone on a given day.
+        B: block if >= min_signals_confirm signals are in danger.
+        C: block if weighted danger-score >= score_threshold,
+           with weights ~ |corr(signal, future_pnl)|.
+    Lookahead handling
+    ------------------
+    - We build a 7d *future* PnL target for analysis ONLY.
+    - The actual block flag for a given date t uses ONLY signals up to t-1:
+          raw_trigger_t-1  -> block starting at t for cool_off_days.
+    Returns
+    -------
+    results : dict with keys:
+        'signal_stats' : per-signal regression / threshold info
+        'block_series' : Boolean Series (index = dates, True = blocked)
+        'daily_pnl'    : original daily pnl series (bp)
+        'daily_pnl_filtered' : daily pnl with blocks applied
+        'pos_filtered' : pos_overlay with blocked trades removed
+        'summary'      : small DataFrame comparing before/after stats
+    """
+    # ----- 0) Basic setup -----
+    if signal_cols is None:
+        signal_cols = list(signals.columns)
+
+    # Ensure datetime index
+    sig = signals.copy()
+    if not isinstance(sig.index, pd.DatetimeIndex):
+        sig = sig.copy()
+        sig.index = pd.to_datetime(sig.index)
+
+    # ----- 1) Build daily PnL series from pos_overlay -----
+    po = pos_overlay.copy()
+    po["close_date"] = pd.to_datetime(po["close_ts"]).dt.floor("D")
+    daily_pnl = (
+        po.groupby("close_date")[pnl_col]
+          .sum()
+          .sort_index()
+    )
+
+    # Align daily pnl to signal index (fill missing days with 0 pnl)
+    daily_pnl = daily_pnl.reindex(sig.index).fillna(0.0)
+
+    # ----- 2) Build 7-day forward PnL target for analysis -----
+    # future_pnl_t = sum_{d=1..horizon} pnl[t+d]
+    future_pnl = (
+        daily_pnl.shift(-1)
+                 .rolling(horizon_days, min_periods=1)
+                 .sum()
+    )
+
+    # Align with signals (drop last horizon_days where future_pnl is incomplete)
+    valid_idx = future_pnl.index[:-horizon_days] if horizon_days > 0 else future_pnl.index
+    future_pnl = future_pnl.loc[valid_idx]
+    sig_aligned = sig.loc[valid_idx]
+
+    # ----- 3) Per-signal analysis: sign of correlation & danger threshold -----
+    stats_rows = []
+    for col in signal_cols:
+        x = sig_aligned[col].astype(float)
+        y = future_pnl.astype(float)
+
+        mask = x.notna() & y.notna()
+        x = x[mask]
+        y = y[mask]
+        if len(x) < 50:  # not enough points
+            continue
+
+        x_mean = x.mean()
+        y_mean = y.mean()
+        cov_xy = ((x - x_mean) * (y - y_mean)).mean()
+        var_x = ((x - x_mean) ** 2).mean()
+        var_y = ((y - y_mean) ** 2).mean()
+
+        if var_x <= 0 or var_y <= 0:
+            continue
+
+        beta = cov_xy / var_x
+        corr = cov_xy / np.sqrt(var_x * var_y)
+
+        # direction: which tail is "bad" (more negative future pnl)
+        # If corr < 0: higher x -> lower y (worse PnL) -> high tail is bad
+        if corr < 0:
+            bad_side = "high"
+            q = quantile_bad
+        else:
+            bad_side = "low"
+            q = 1.0 - quantile_bad
+
+        thr = x.quantile(q)
+
+        if bad_side == "high":
+            bad_mask = x >= thr
+        else:
+            bad_mask = x <= thr
+
+        mean_pnl_bad = y[bad_mask].mean()
+        mean_pnl_good = y[~bad_mask].mean()
+
+        stats_rows.append({
+            "signal": col,
+            "beta": beta,
+            "corr": corr,
+            "bad_side": bad_side,
+            "quantile": q,
+            "threshold": thr,
+            "mean_future_pnl_bad": mean_pnl_bad,
+            "mean_future_pnl_good": mean_pnl_good,
+            "n_bad": int(bad_mask.sum()),
+            "n_good": int((~bad_mask).sum())
+        })
+
+    if not stats_rows:
+        raise ValueError("No usable signals for shock analysis (too few points or zero variance).")
+
+    signal_stats = pd.DataFrame(stats_rows).sort_values("mean_future_pnl_bad")
+
+    if verbose:
+        print("=== Shock-blocker signal stats (sorted by worst future pnl in danger zone) ===")
+        display(signal_stats)
+
+    # ----- 4) Build per-day 'danger' indicators using these thresholds -----
+    danger_df = pd.DataFrame(index=sig.index)
+    for _, row in signal_stats.iterrows():
+        col = row["signal"]
+        bad_side = row["bad_side"]
+        thr = row["threshold"]
+        x_full = sig[col].astype(float)
+
+        if bad_side == "high":
+            danger_df[col] = x_full >= thr
+        else:
+            danger_df[col] = x_full <= thr
+
+    # ----- 5) Combine into a raw trigger series (today, pre-lookahead adjustment) -----
+    trigger_mode = trigger_mode.upper()
+    if trigger_mode == "A":
+        # Block if ANY signal in danger
+        raw_trigger = danger_df.any(axis=1)
+
+    elif trigger_mode == "B":
+        # Block if >= min_signals_confirm in danger
+        raw_trigger = (danger_df.sum(axis=1) >= int(min_signals_confirm))
+
+    elif trigger_mode == "C":
+        # Weighted score: weights ~ |corr|
+        w = signal_stats.set_index("signal")["corr"].abs()
+        w = w / w.sum()
+        # align to columns
+        w_vec = w.reindex(danger_df.columns).fillna(0.0)
+        risk_score = (danger_df.astype(float) * w_vec).sum(axis=1)
+        raw_trigger = risk_score >= float(score_threshold)
+    else:
+        raise ValueError("trigger_mode must be 'A', 'B', or 'C'.")
+
+    # ----- 6) MAKE IT LOOKAHEAD-SAFE + apply cool-off -----
+    # Important:
+    #  - raw_trigger_t = function of signals_t (end of day t info)
+    #  - block should start at t+1 (decisions from next day onward)
+    # So we shift by +1: block_base_{t+1} = raw_trigger_t
+    block_base = raw_trigger.shift(1).fillna(False)
+
+    # Now expand each trigger forward by cool_off_days
+    block = block_base.copy().astype(bool)
+    for i in range(1, cool_off_days):
+        block |= block_base.shift(i).fillna(False)
+
+    block = block.reindex(sig.index).fillna(False)
+
+    if verbose:
+        print("\n=== Shock-blocker summary ===")
+        print(f"Total days: {len(block)}")
+        print(f"Blocked days: {int(block.sum())} ({block.mean()*100:.1f}%)")
+
+    # ----- 7) Apply block to trades by OPEN DATE (not close) -----
+    po = pos_overlay.copy()
+    po["open_date"] = pd.to_datetime(po["open_ts"]).dt.floor("D")
+    blocked_dates = set(block[block].index)
+    po["blocked"] = po["open_date"].isin(blocked_dates)
+
+    pos_filtered = po[~po["blocked"]].copy()
+
+    # Rebuild daily pnl from filtered trades
+    daily_pnl_filtered = (
+        pos_filtered.groupby("close_date")[pnl_col]
+                    .sum()
+                    .reindex(sig.index)
+                    .fillna(0.0)
+    )
+
+    # ----- 8) Summary stats before / after -----
+    def _stats(series):
+        series = series.astype(float)
+        mean = series.mean()
+        std = series.std(ddof=1)
+        sharpe_252 = (mean / std) * np.sqrt(252) if std > 0 else np.nan
+        return mean, std, sharpe_252
+
+    mean0, std0, sh0 = _stats(daily_pnl)
+    mean1, std1, sh1 = _stats(daily_pnl_filtered)
+
+    summary = pd.DataFrame({
+        "mean_pnl_bp": [mean0, mean1],
+        "std_pnl_bp": [std0, std1],
+        "sharpe_252": [sh0, sh1],
+        "n_trades": [len(pos_overlay), len(pos_filtered)],
+        "n_days_blocked": [0, int(block.sum())],
+        "pct_days_blocked": [0.0, block.mean()*100],
+    }, index=["original", "with_shock_blocker"])
+
+    if verbose:
+        print("\n=== PnL summary (bp per day) ===")
+        display(summary)
+
+    return {
+        "signal_stats": signal_stats,
+        "block_series": block,
+        "daily_pnl": daily_pnl,
+        "daily_pnl_filtered": daily_pnl_filtered,
+        "pos_filtered": pos_filtered,
+        "summary": summary,
+    }
+    
+results = analyze_shock_blocker(
+    signals=signals,
+    pos_overlay=pos_overlay,
+    trigger_mode="A",          # or "B" / "C"
+    cool_off_days=10,
+    horizon_days=7,
+    quantile_bad=0.8,
+    verbose=True,
+)
+
+block = results["block_series"]
+summary = results["summary"]
+signal_stats = results["signal_stats"]
+
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
