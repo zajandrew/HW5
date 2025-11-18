@@ -1,3 +1,91 @@
+import matplotlib.pyplot as plt
+
+# Assuming these exist:
+# signals_df, regime_df
+
+fig, ax = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+# --- 1) Signal Health ---
+ax[0].plot(signals_df.index, signals_df["health"], label="Signal Health", linewidth=1.8)
+ax[0].axhline(0, color='black', linewidth=0.8)
+ax[0].set_title("Signal Health Over Time")
+ax[0].grid(True, alpha=0.3)
+ax[0].legend()
+
+# --- 2) Raw shocks (day-over-day) ---
+ax[1].plot(signals_df.index, signals_df["shock_raw"].astype(int), 
+           drawstyle="steps-post", label="Raw Shock Flags")
+ax[1].set_title("Shock Flags (Before Moving Window)")
+ax[1].grid(True, alpha=0.3)
+ax[1].legend()
+
+# --- 3) Final regime ---
+ax[2].plot(regime_df.index, regime_df["regime"].astype(int),
+           drawstyle="steps-post", label="Final Regime")
+ax[2].set_title("Final Regime State (0 = OK, 1 = Blocked)")
+ax[2].grid(True, alpha=0.3)
+ax[2].legend()
+
+plt.tight_layout()
+plt.show()
+
+fig, ax = plt.subplots(figsize=(14, 5))
+
+# Signal health line
+ax.plot(signals_df.index, signals_df["health"], label="Signal Health", linewidth=1.8)
+
+# Add shaded regions where regime == 1 (blocked)
+for ts, val in regime_df["regime"].iteritems():
+    if val == 1:
+        ax.axvspan(ts, ts, color="red", alpha=0.15)
+
+ax.set_title("Signal Health with Regime Blocking")
+ax.grid(True, alpha=0.3)
+ax.legend()
+plt.show()
+
+# If you have z_comb series for comparison:
+z_comb = signals_df["z_comb"] if "z_comb" in signals_df else None
+
+if z_comb is not None:
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(z_comb.index, z_comb, label="z_comb", linewidth=1.5)
+
+    # Shade blocks
+    for ts, val in regime_df["regime"].items():
+        if val == 1:
+            ax.axvspan(ts, ts, color="red", alpha=0.15)
+
+    ax.set_title("z_comb with Regime Filter")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.show()
+    
+fig, ax = plt.subplots(figsize=(15, 5))
+
+# main signal — pick whichever you rely on most.
+ax.plot(signals_df.index, signals_df["health"], label="Health", linewidth=1.8)
+
+# Regime shading
+reg = regime_df["regime"]
+starts = reg[(reg == 1) & (reg.shift(1, fill_value=0) == 0)].index
+ends   = reg[(reg == 0) & (reg.shift(1, fill_value=0) == 1)].index
+
+# ensure ends align
+if len(ends) < len(starts):
+    ends = ends.append(pd.Index([reg.index[-1]]))
+
+for s, e in zip(starts, ends):
+    ax.axvspan(s, e, color='red', alpha=0.15)
+
+ax.set_title("Regime Filter Applied to Signal Health")
+ax.legend()
+ax.grid(True)
+plt.show()
+
+
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
