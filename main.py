@@ -1,3 +1,44 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# Extract outputs
+daily_pnl = results["daily_pnl"]
+daily_pnl_f = results["daily_pnl_filtered"]
+block = results["block_series"]
+
+# Cumulative PnL
+cum_pnl = daily_pnl.cumsum()
+cum_pnl_f = daily_pnl_f.cumsum()
+
+fig, (ax1, ax2) = plt.subplots(
+    2, 1, figsize=(14, 10), sharex=True,
+    gridspec_kw={"height_ratios": [3, 1]}
+)
+
+# --- Top panel: cumulative PnL ---
+ax1.plot(cum_pnl.index, cum_pnl.values, label="Original", linewidth=2)
+ax1.plot(cum_pnl_f.index, cum_pnl_f.values, label="With Shock Blocker", linewidth=2)
+
+# Shade blocked days
+for d in block[block].index:
+    ax1.axvspan(d, d + pd.Timedelta(days=1), color="red", alpha=0.08)
+
+ax1.set_title("Cumulative PnL (bp/day) Before vs After Shock Blocker")
+ax1.set_ylabel("Cumulative PnL (bp)")
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# --- Bottom panel: block indicator ---
+ax2.plot(block.index, block.astype(int), drawstyle="steps-post", color="red")
+ax2.set_ylim(-0.1, 1.1)
+ax2.set_ylabel("Blocked")
+ax2.set_title("Shock Block Regime")
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
 import numpy as np
 import pandas as pd
 
