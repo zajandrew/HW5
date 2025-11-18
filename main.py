@@ -1,3 +1,242 @@
+import numpy as np
+import pandas as pd
+
+def analyze_regime_and_overlay(
+    signals: pd.DataFrame,
+    pos_overlay: pd.DataFrame,
+    *,
+    signal_col: str = "signal_health",
+    pnl_col: str = "pnl_cash",
+    horizons=(1, 5, 10),
+    thresholds: list[float] | None = None,
+    K_grid: list[int] | None = None,
+):
+    """
+    Drop-in analysis:
+      - Builds daily overlay PnL series from pos_overlay ledger.
+      - Aligns with signals by timestamp index.
+      - 1) Threshold vs future PnL stats on `signal_col`.
+      - 2) Regime blocking sims: if signal <= threshold, block for K days.
+
+    Returns dict:
+      {
+        "baseline": {...},
+        "threshold_results": DataFrame,
+        "blocking_results": DataFrame,
+        "aligned_signals": DataFrame,
+        "aligned_pnl": Series
+      }
+    """
+
+    # --------- Helpers inside so it's fully self-contained ---------
+    def _max_drawdown(series: pd.Series) -> float:
+        cum = series.cumsum()
+        running_max = cum.cummax()
+        dd = cum - running_max
+        return dd.min()  # negative
+
+    def _simple_sharpe(pnl: pd.Series) -> float:
+        if len(pnl) < 2:
+            return np.nan
+        mu = pnl.mean()
+        sig = pnl.std(ddof=1)
+        return np.nan if sig == 0 else mu / sig
+
+    def _make_future_pnl(pnl: pd.Series, horizons_):
+        fut = {}
+        for H in horizons_:
+            fut[f"future_{H}d_pnl"] = (
+                pnl.rolling(H, min_periods=H).sum().shift(-H)
+            )
+        return pd.DataFrame(fut)
+
+    # --------- 1) Build pnl_series from pos_overlay ---------
+    df_ledger = pos_overlay.copy()
+
+    # If ledger has both strategy + overlay, keep only overlay marks
+    if "mode" in df_ledger.columns:
+        df_ledger = df_ledger[df_ledger["mode"] == "overlay"]
+    if "event" in df_ledger.columns:
+        df_ledger = df_ledger[df_ledger["event"] == "mark"]
+
+    # Ensure we have decision_ts + pnl_col
+    if "decision_ts" not in df_ledger.columns:
+        raise ValueError("pos_overlay must have a 'decision_ts' column.")
+    if pnl_col not in df_ledger.columns:
+        raise ValueError(f"pos_overlay must have '{pnl_col}' column.")
+
+    df_ledger = df_ledger.copy()
+    df_ledger["decision_ts"] = pd.to_datetime(df_ledger["decision_ts"])
+
+    # Aggregate to one PnL number per decision bucket (usually daily)
+    pnl_series = (
+        df_ledger
+        .groupby("decision_ts")[pnl_col]
+        .sum()
+        .sort_index()
+    )
+
+    # --------- 2) Align with signals ---------
+    sig = signals.copy()
+
+    # If signal_ts is a column, move it to index
+    if signal_col not in sig.columns:
+        raise ValueError(f"{signal_col} not found in signals columns.")
+
+    if not isinstance(sig.index, pd.DatetimeIndex):
+        # Try to infer a time column if index is not datetime
+        if "decision_ts" in sig.columns:
+            sig_index = pd.to_datetime(sig["decision_ts"])
+            sig = sig.set_index(sig_index)
+        else:
+            sig.index = pd.to_datetime(sig.index)
+
+    if not isinstance(pnl_series.index, pd.DatetimeIndex):
+        pnl_series.index = pd.to_datetime(pnl_series.index)
+
+    common_index = sig.index.intersection(pnl_series.index)
+    sig = sig.loc[common_index].sort_index()
+    pnl_series = pnl_series.loc[common_index].sort_index()
+
+    if sig.empty or pnl_series.empty:
+        raise ValueError("No overlapping dates between signals and pos_overlay PnL.")
+
+    # --------- 3) Baseline stats (no regime filter) ---------
+    baseline = {
+        "total_pnl": float(pnl_series.sum()),
+        "pnl_per_day": float(pnl_series.mean()),
+        "max_drawdown": float(_max_drawdown(pnl_series)),
+        "sharpe_like": float(_simple_sharpe(pnl_series)),
+        "n_days": int(len(pnl_series)),
+    }
+
+    # --------- 4) Threshold vs future PnL analysis ---------
+    df = pd.concat(
+        [
+            sig[[signal_col]].rename(columns={signal_col: "signal"}),
+            pnl_series.rename("pnl"),
+        ],
+        axis=1,
+    ).dropna()
+
+    fut = _make_future_pnl(df["pnl"], horizons)
+    df = df.join(fut).dropna()
+
+    if thresholds is None:
+        # Use lower quantiles as candidate grid
+        qs = np.linspace(0.05, 0.95, 19)
+        thresholds = list(np.quantile(df["signal"], qs))
+
+    rows_thr = []
+    for thr in thresholds:
+        bad_mask = df["signal"] <= thr
+        frac_bad = bad_mask.mean()
+
+        stats = {"threshold": thr, "frac_bad": frac_bad}
+
+        for H in horizons:
+            col = f"future_{H}d_pnl"
+            x_bad = df.loc[bad_mask, col]
+            x_good = df.loc[~bad_mask, col]
+
+            if len(x_bad) < 20 or len(x_good) < 20:
+                mu_bad = mu_good = tstat = np.nan
+            else:
+                mu_bad = x_bad.mean()
+                mu_good = x_good.mean()
+                s_bad = x_bad.var(ddof=1)
+                s_good = x_good.var(ddof=1)
+                denom = np.sqrt(s_bad / len(x_bad) + s_good / len(x_good))
+                tstat = np.nan if denom == 0 else (mu_bad - mu_good) / denom
+
+            stats[f"mu_bad_{H}d"] = mu_bad
+            stats[f"mu_good_{H}d"] = mu_good
+            stats[f"tstat_bad_vs_good_{H}d"] = tstat
+
+        rows_thr.append(stats)
+
+    threshold_results = (
+        pd.DataFrame(rows_thr)
+        .sort_values("threshold")
+        .reset_index(drop=True)
+    )
+
+    # --------- 5) Regime blocking simulation (threshold + K) ---------
+    if K_grid is None:
+        K_grid = [2, 5, 10, 15, 20]
+
+    idx = df.index
+    n = len(df)
+    blocking_rows = []
+
+    triggers_all = {thr: (df["signal"] <= thr) for thr in thresholds}
+
+    for thr, triggers in triggers_all.items():
+        for K in K_grid:
+            blocked = np.zeros(n, dtype=bool)
+            block_until = -1
+
+            # If signal is bad at t, block PnL starting at t+1 for K days
+            for i, (_, is_bad) in enumerate(triggers.items()):
+                if i <= block_until:
+                    blocked[i] = True
+                    continue
+
+                if is_bad:
+                    start_idx = i + 1
+                    end_idx = min(n - 1, start_idx + K - 1)
+                    if start_idx < n:
+                        blocked[start_idx : end_idx + 1] = True
+                        block_until = end_idx
+
+            df_blocked = df.copy()
+            df_blocked["blocked"] = blocked
+            df_blocked["pnl_effective"] = np.where(
+                df_blocked["blocked"], 0.0, df_blocked["pnl"]
+            )
+
+            pnl_eff = df_blocked["pnl_effective"]
+            pnl_total = pnl_eff.sum()
+            pnl_per_day = pnl_total / len(pnl_eff)
+            dd = _max_drawdown(pnl_eff)
+            sharpe = _simple_sharpe(pnl_eff)
+            frac_blocked = df_blocked["blocked"].mean()
+            frac_trading = 1.0 - frac_blocked
+
+            blocking_rows.append(
+                {
+                    "threshold": thr,
+                    "K_days": K,
+                    "total_pnl": pnl_total,
+                    "pnl_per_day": pnl_per_day,
+                    "max_drawdown": dd,
+                    "sharpe_like": sharpe,
+                    "frac_blocked": frac_blocked,
+                    "frac_trading": frac_trading,
+                }
+            )
+
+    blocking_results = (
+        pd.DataFrame(blocking_rows)
+        .sort_values(by=["sharpe_like", "total_pnl"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    return {
+        "baseline": baseline,
+        "threshold_results": threshold_results,
+        "blocking_results": blocking_results,
+        "aligned_signals": sig,
+        "aligned_pnl": pnl_series,
+    }
+    
+res = analyze_regime_and_overlay(signals_df, pos_overlay)
+
+res["baseline"]           # raw overlay PnL stats
+res["threshold_results"]  # where signal actually predicts bad forward PnL
+res["blocking_results"]   # candidate (threshold, K) combos to try
+
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
