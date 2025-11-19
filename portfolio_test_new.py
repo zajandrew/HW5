@@ -207,6 +207,33 @@ def fly_alignment_ok(
         return contradictions <= int(FLY_REQUIRE_COUNT)
     return True
 
+def tenor_to_ticker(tenor_yrs: float, tol: float = 1e-6) -> Optional[str]:
+    """
+    Reverse lookup: given tenor_yrs, find the curve ticker in TENOR_YEARS
+    whose tenor is nearest, within tolerance tol.
+
+    Returns the ticker string or None if nothing within tol.
+    """
+    if tenor_yrs is None or not np.isfinite(tenor_yrs):
+        return None
+
+    t = float(tenor_yrs)
+    best_key = None
+    best_diff = float("inf")
+
+    for k, v in cr.TENOR_YEARS.items():
+        try:
+            vv = float(v)
+        except Exception:
+            continue
+        diff = abs(vv - t)
+        if diff < best_diff:
+            best_diff = diff
+            best_key = k
+
+    if best_key is not None and best_diff <= tol:
+        return best_key
+    return None
 
 # ------------------------
 # Pair object
@@ -228,6 +255,8 @@ class PairPos:
         mode: str = "strategy",
         meta: Optional[Dict] = None,
         dir_sign: Optional[float] = None,
+        entry_rate_i: Optional[float] = None,
+        entry_rate_j: Optional[float] = None,
     ):
         """
         cheap_row / rich_row naming is historical; in overlay mode, these can be
@@ -237,13 +266,31 @@ class PairPos:
         dir_sign:
           - If provided, this is the "direction" in z-space we care about for exits.
           - If None, we default to sign(entry_zspread) (cheap minus rich).
+
+        entry_rate_i / entry_rate_j:
+          - If provided, these are the TRUE trade-time entry rates per leg.
+          - If None, we fall back to cheap_row['rate'] / rich_row['rate'].
         """
         self.open_ts = open_ts
 
         self.tenor_i = _to_float(cheap_row["tenor_yrs"])
-        self.rate_i  = _to_float(cheap_row["rate"])
         self.tenor_j = _to_float(rich_row["tenor_yrs"])
-        self.rate_j  = _to_float(rich_row["rate"])
+
+        # Default entry rates from snapshot rows
+        default_rate_i = _to_float(cheap_row["rate"])
+        default_rate_j = _to_float(rich_row["rate"])
+
+        # Trade-time entry rates (can be overridden in overlay mode)
+        self.entry_rate_i = _to_float(entry_rate_i, default=default_rate_i) if entry_rate_i is not None else default_rate_i
+        self.entry_rate_j = _to_float(entry_rate_j, default=default_rate_j) if entry_rate_j is not None else default_rate_j
+
+        # For PnL we treat these as the fixed entry anchors
+        self.rate_i = self.entry_rate_i
+        self.rate_j = self.entry_rate_j
+
+        # Current / last marked rates (updated in mark)
+        self.last_rate_i = self.entry_rate_i
+        self.last_rate_j = self.entry_rate_j
 
         self.w_i = float(w_i)
         self.w_j = float(w_j)
@@ -294,13 +341,24 @@ class PairPos:
         self.conv_pnl_proxy = 0.0
 
     def mark(self, snap_last: pd.DataFrame):
-        """Mark-to-market at decision time using last rate per tenor; update convergence proxy."""
+        """
+        Mark-to-market at decision time using last rate per tenor; update convergence proxy.
+
+        PnL is computed versus the trade-time entry rates (entry_rate_i/j),
+        NOT versus the decision-bucket curve (we only use decision buckets
+        for exit logic and regime timing).
+        """
+        # Current curve rates at this decision bucket
         ri = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "rate"])
         rj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "rate"])
 
-        # Pair PnL per unit: (old - new) * weight * 100  (rates in % → *100 to bps)
-        d_i = (self.rate_i - ri) * self.w_i * 100.0
-        d_j = (self.rate_j - rj) * self.w_j * 100.0
+        # Store current marks for diagnostics
+        self.last_rate_i = ri
+        self.last_rate_j = rj
+
+        # Pair PnL per unit: (entry - current) * weight * 100  (rates in % → *100 to bps)
+        d_i = (self.entry_rate_i - ri) * self.w_i * 100.0
+        d_j = (self.entry_rate_j - rj) * self.w_j * 100.0
         pnl_bp = d_i + d_j
         self.pnl_bp = pnl_bp
 
@@ -508,7 +566,6 @@ def _pnl_curve_png(yymm: str) -> Path:
         name = f"pnl_curve_{yymm}{suffix}.png" if suffix else f"pnl_curve_{yymm}.png"
     return Path(getattr(cr, "PATH_OUT", ".")) / name
 
-
 # ------------------------
 # Month runner
 # ------------------------
@@ -605,6 +662,9 @@ def run_month(
             return float(bucket_caps["other"])
         return OVERLAY_DV01_CAP_PER_TRADE
 
+    # Optional pnl stop (bps)
+    BPS_PNL_STOP = float(getattr(cr, "BPS_PNL_STOP", 0.0))
+
     # Carry-in
     open_positions = (open_positions or []) if carry_in else []
 
@@ -680,6 +740,7 @@ def run_month(
                     elif moved_away:
                         exit_flag = "stop"
 
+            # NEW: PnL-based hard stop in bps
             if exit_flag is None and BPS_PNL_STOP > 0.0:
                 pnl_bp = float(getattr(pos, "pnl_bp", np.nan))
                 if np.isfinite(pnl_bp) and pnl_bp <= -BPS_PNL_STOP:
@@ -700,12 +761,20 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
-            # Ledger mark (pnl in bps and cash)
+            # Ledger mark (pnl in bps and cash) + entry/current rates + leg dirs
             ledger_rows.append({
                 "decision_ts": dts,
                 "event": "mark",
-                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
-                "w_i": pos.w_i, "w_j": pos.w_j,
+                "tenor_i": pos.tenor_i,
+                "tenor_j": pos.tenor_j,
+                "w_i": pos.w_i,
+                "w_j": pos.w_j,
+                "leg_dir_i": float(np.sign(pos.w_i)),
+                "leg_dir_j": float(np.sign(pos.w_j)),
+                "entry_rate_i": pos.entry_rate_i,
+                "entry_rate_j": pos.entry_rate_j,
+                "rate_i": getattr(pos, "last_rate_i", np.nan),
+                "rate_j": getattr(pos, "last_rate_j", np.nan),
                 "pnl_bp": pos.pnl_bp,
                 "pnl_cash": pos.pnl_cash,
                 "z_spread": zsp,
@@ -714,7 +783,7 @@ def run_month(
                 "closed": pos.closed,
                 "exit_reason": pos.exit_reason,
                 "mode": pos.mode,
-                "scale_dv01": pos.scale_dv01
+                "scale_dv01": pos.scale_dv01,
             })
 
             if pos.closed:
@@ -736,6 +805,12 @@ def run_month(
                     "tenor_j": pos.tenor_j,
                     "w_i": pos.w_i,
                     "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)),
+                    "leg_dir_j": float(np.sign(pos.w_j)),
+                    "entry_rate_i": pos.entry_rate_i,
+                    "entry_rate_j": pos.entry_rate_j,
+                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
+                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
                     "entry_zspread": pos.entry_zspread,
                     "pnl_gross_bp": pos.pnl_bp,
                     "pnl_gross_cash": pos.pnl_cash,
@@ -746,7 +821,7 @@ def run_month(
                     "days_held_equiv": pos.age_decisions / decisions_per_day,
                     "conv_proxy": pos.conv_pnl_proxy,
                     "mode": pos.mode,
-                    "scale_dv01": pos.scale_dv01
+                    "scale_dv01": pos.scale_dv01,
                 })
             else:
                 still_open.append(pos)
@@ -786,7 +861,7 @@ def run_month(
                     decisions_per_day=decisions_per_day,
                     scale_dv01=1.0,
                     mode="strategy",
-                    meta={}
+                    meta={},
                 )
                 open_positions.append(pos)
                 ledger_rows.append({
@@ -796,9 +871,13 @@ def run_month(
                     "tenor_j": pos.tenor_j,
                     "w_i": pos.w_i,
                     "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)),
+                    "leg_dir_j": float(np.sign(pos.w_j)),
+                    "entry_rate_i": pos.entry_rate_i,
+                    "entry_rate_j": pos.entry_rate_j,
                     "entry_zspread": pos.entry_zspread,
                     "mode": pos.mode,
-                    "scale_dv01": pos.scale_dv01
+                    "scale_dv01": pos.scale_dv01,
                 })
 
         elif mode == "overlay":
@@ -823,12 +902,13 @@ def run_month(
                     break
 
                 trade_tenor = float(h["tenor_yrs"])
-                if trade_tenor < EXEC_LEG_TENOR_YEARS:
+                if trade_tenor < MIN_LEG_TENOR:
                     continue
 
                 side = str(h["side"]).upper()
                 dv01_cash = float(h["dv01"])
                 trade_id = h.get("trade_id", None)
+                trade_ts = h.get("trade_ts", None)  # trade-time for curve entry
 
                 if side == "CRCV":
                     side_sign = +1.0
@@ -868,7 +948,7 @@ def run_month(
                     if alt_tenor == exec_tenor:
                         continue
 
-                    if alt_tenor < ALT_LEG_TENOR_YEARS:
+                    if alt_tenor < MIN_LEG_TENOR:
                         continue
 
                     diff = abs(alt_tenor - exec_tenor)
@@ -919,6 +999,29 @@ def run_month(
                 alt_tenor = float(alt_row["tenor_yrs"])
                 exec_tenor = float(exec_row["tenor_yrs"])
 
+                # --- NEW: trade-time entry rates from hedge tape curve snapshot ---
+                entry_rate_i = None
+                entry_rate_j = None
+
+                # Map tenors back to tickers and pull *_mid from hedge row
+                ticker_i = tenor_to_ticker(alt_tenor)
+                ticker_j = tenor_to_ticker(exec_tenor)
+
+                if ticker_i is not None:
+                    col_i = f"{ticker_i}_mid"
+                    if col_i in h:
+                        entry_rate_i = _to_float(h[col_i])
+                if ticker_j is not None:
+                    col_j = f"{ticker_j}_mid"
+                    if col_j in h:
+                        entry_rate_j = _to_float(h[col_j])
+
+                # Fallback: if for some reason we didn't get trade-time rates, use snapshot rates
+                if entry_rate_i is None or not np.isfinite(entry_rate_i):
+                    entry_rate_i = _to_float(alt_row["rate"])
+                if entry_rate_j is None or not np.isfinite(entry_rate_j):
+                    entry_rate_j = _to_float(exec_row["rate"])
+
                 # DV01-native unit pair (weights ±1, scaling via dv01_cash)
                 w_alt = side_sign * 1.0
                 w_exec = side_sign * -1.0
@@ -932,7 +1035,9 @@ def run_month(
                     decisions_per_day=decisions_per_day,
                     scale_dv01=dv01_cash,
                     mode="overlay",
-                    meta={"trade_id": trade_id, "side": side}
+                    meta={"trade_id": trade_id, "side": side, "trade_ts": trade_ts},
+                    entry_rate_i=entry_rate_i,
+                    entry_rate_j=entry_rate_j,
                 )
                 open_positions.append(pos)
 
@@ -943,11 +1048,15 @@ def run_month(
                     "tenor_j": pos.tenor_j,
                     "w_i": pos.w_i,
                     "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)),
+                    "leg_dir_j": float(np.sign(pos.w_j)),
+                    "entry_rate_i": pos.entry_rate_i,
+                    "entry_rate_j": pos.entry_rate_j,
                     "entry_zspread": pos.entry_zspread,
                     "mode": pos.mode,
                     "scale_dv01": pos.scale_dv01,
                     "trade_id": trade_id,
-                    "side": side
+                    "side": side,
                 })
 
         # else: unknown mode – nothing opened
