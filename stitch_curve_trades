@@ -1,0 +1,194 @@
+from pathlib import Path
+from typing import Optional
+import pandas as pd
+import numpy as np
+
+import cr_config as cr
+
+
+def _require_cols(df: pd.DataFrame, cols, where: str = ""):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{where}: missing required columns: {missing}")
+
+
+def _curve_path_for_yymm(yymm: str) -> Path:
+    """
+    Find the raw curve file for a given yymm under PATH_DATA.
+
+    Adjust the glob pattern if your raw naming is more specific.
+    """
+    root = Path(cr.PATH_DATA)
+    candidates = list(root.glob(f"*{yymm}*.parquet")) or list(root.glob(f"*{yymm}*.pkl"))
+    if not candidates:
+        raise FileNotFoundError(f"No raw curve file found under {cr.PATH_DATA} for yymm={yymm}")
+    if len(candidates) > 1:
+        print(f"[WARN] Multiple raw files for {yymm}, using {candidates[0].name}")
+    return candidates[0]
+
+
+def stitch_trades_with_raw_curve(
+    trades: pd.DataFrame,
+    *,
+    out_path: Optional[str | Path] = None,
+) -> pd.DataFrame:
+    """
+    Stitch raw tick curve mid onto trade tape month-by-month.
+
+    Raw parquet structure:
+      - Index: timestamp (tick-level)
+      - Columns: '<curve_symbol>_mid' for each curve ticker
+        e.g. 'USOSFR5 BGN Curncy_mid' with values like 4.25 for 4.25%.
+
+    Trades:
+      - 'tradetimeUTC' : timestamp of trade
+      - 'instrument'   : trade instrument (e.g. 'USSWAP5 Curncy')
+      - We map instrument -> curve ticker via cr.BBG_DICT.
+
+    Output:
+      - Original trade columns +
+      - 'curve_symbol' : mapped curve ticker
+      - 'curve_ts'     : last tick timestamp <= tradetimeUTC
+      - 'curve_mid'    : corresponding mid at curve_ts
+    """
+    if trades is None or trades.empty:
+        raise ValueError("trades is empty; nothing to stitch.")
+
+    _require_cols(trades, ["tradetimeUTC", "instrument"], where="trades")
+
+    df_tr = trades.copy()
+
+    # Parse trade timestamps
+    df_tr["tradetimeUTC"] = pd.to_datetime(df_tr["tradetimeUTC"], utc=False, errors="coerce")
+    if df_tr["tradetimeUTC"].isna().any():
+        bad = df_tr[df_tr["tradetimeUTC"].isna()]
+        raise ValueError(
+            "Some tradetimeUTC values could not be parsed as datetime. "
+            f"Examples:\n{bad.head()}"
+        )
+
+    # Map trade instrument -> curve symbol in raw files
+    df_tr["curve_symbol"] = df_tr["instrument"].map(cr.BBG_DICT).fillna(df_tr["instrument"])
+
+    # Month bucket (yymm) for per-month processing
+    df_tr["yymm"] = df_tr["tradetimeUTC"].dt.strftime("%y%m")
+
+    stitched_chunks: list[pd.DataFrame] = []
+
+    for yymm, trades_month in df_tr.groupby("yymm", sort=True):
+        trades_month = trades_month.sort_values("tradetimeUTC").reset_index(drop=True)
+
+        curve_path = _curve_path_for_yymm(yymm)
+
+        if curve_path.suffix.lower() == ".parquet":
+            curve = pd.read_parquet(curve_path)
+        else:
+            curve = pd.read_pickle(curve_path)
+
+        if curve is None or curve.empty:
+            print(f"[stitch_trades_with_raw_curve] Empty curve file for {yymm} at {curve_path}")
+            continue
+
+        # curve index is the timestamp; normalize
+        curve = curve.copy()
+        if curve.index.name is None:
+            # rename unnamed index to 'curve_ts'
+            curve.index.name = "curve_ts"
+        curve.index = pd.to_datetime(curve.index, utc=False, errors="coerce")
+        curve = curve[~curve.index.isna()]
+        if curve.empty:
+            print(f"[stitch_trades_with_raw_curve] Curve {curve_path} has no valid timestamps.")
+            continue
+
+        # Time window trim for memory
+        t_min = trades_month["tradetimeUTC"].min()
+        t_max = trades_month["tradetimeUTC"].max()
+        curve = curve.loc[t_min - pd.Timedelta("1D") : t_max + pd.Timedelta("1D")]
+        if curve.empty:
+            print(f"[stitch_trades_with_raw_curve] No curve ticks near trade window for {yymm}.")
+            continue
+
+        # For each curve_symbol used this month, do a local merge_asof
+        merged_list: list[pd.DataFrame] = []
+        symbols_here = trades_month["curve_symbol"].unique().tolist()
+
+        for sym in symbols_here:
+            col = f"{sym}_mid"
+            trades_sym = trades_month[trades_month["curve_symbol"] == sym].copy()
+            if trades_sym.empty:
+                continue
+
+            if col not in curve.columns:
+                print(f"[stitch_trades_with_raw_curve] No column {col} in {curve_path}; skipping {sym}.")
+                # Keep the trades but with NaN for curve_mid / curve_ts
+                trades_sym["curve_ts"] = pd.NaT
+                trades_sym["curve_mid"] = np.nan
+                merged_list.append(trades_sym)
+                continue
+
+            # Make a 2-col DataFrame: curve_ts + curve_mid for this symbol
+            s = curve[col].dropna()
+            if s.empty:
+                trades_sym["curve_ts"] = pd.NaT
+                trades_sym["curve_mid"] = np.nan
+                merged_list.append(trades_sym)
+                continue
+
+            df_sym_curve = (
+                s.to_frame("curve_mid")
+                 .reset_index()
+                 .rename(columns={curve.index.name: "curve_ts"})
+                 .sort_values("curve_ts")
+            )
+
+            trades_sym = trades_sym.sort_values("tradetimeUTC")
+
+            merged_sym = pd.merge_asof(
+                trades_sym,
+                df_sym_curve,
+                left_on="tradetimeUTC",
+                right_on="curve_ts",
+                direction="backward",
+                allow_exact_matches=True,
+            )
+
+            merged_list.append(merged_sym)
+
+        if not merged_list:
+            continue
+
+        stitched_month = pd.concat(merged_list, ignore_index=True)
+        stitched_chunks.append(stitched_month)
+
+    if not stitched_chunks:
+        raise RuntimeError(
+            "No stitched rows produced. "
+            "Check that tradetimeUTC overlaps raw curve files and BBG_DICT mappings."
+        )
+
+    stitched = pd.concat(stitched_chunks, ignore_index=True)
+    stitched = stitched.sort_values("tradetimeUTC").reset_index(drop=True)
+    stitched = stitched.drop(columns=["yymm"], errors="ignore")
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        if out_path.suffix.lower() == ".pkl":
+            stitched.to_pickle(out_path)
+        else:
+            stitched.to_parquet(out_path, index=False)
+        print(f"[stitch_trades_with_raw_curve] Wrote stitched trades to {out_path}")
+
+    return stitched
+
+import pandas as pd
+import trade_curve_stitch_raw as tcsr
+
+trades = pd.read_pickle("trades.pkl")
+
+trades_stitched = tcsr.stitch_trades_with_raw_curve(
+    trades,
+    out_path="trades_with_curve.parquet",
+)
+
+trades_stitched[["tradetimeUTC", "instrument", "curve_symbol", "curve_ts", "curve_mid"]].head()
