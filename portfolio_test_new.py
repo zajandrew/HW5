@@ -238,9 +238,6 @@ def tenor_to_ticker(tenor_yrs: float, tol: float = 1e-6) -> Optional[str]:
 # ------------------------
 # Pair object
 # ------------------------
-# ------------------------
-# Pair object
-# ------------------------
 class PairPos:
     def __init__(
         self,
@@ -270,19 +267,46 @@ class PairPos:
         entry_rate_i / entry_rate_j:
           - If provided, these are the TRUE trade-time entry rates per leg.
           - If None, we fall back to cheap_row['rate'] / rich_row['rate'].
+
+        DV01 semantics (overlay mode only):
+          - scale_dv01 = hedge-tape DV01 (per 1bp) for the pair.
+          - Per-leg entry DV01:
+                dv01_i_entry = w_i * scale_dv01
+                dv01_j_entry = w_j * scale_dv01
+          - At mark t, we compute remaining tenor in years via actual/360:
+                years_passed = days(open_ts -> decision_ts) / 360
+                rem_i = max(tenor_i_orig - years_passed, 0)
+                rem_j = max(tenor_j_orig - years_passed, 0)
+                frac_i = rem_i / tenor_i_orig
+                frac_j = rem_j / tenor_j_orig
+                dv01_i_curr = dv01_i_entry * frac_i
+                dv01_j_curr = dv01_j_entry * frac_j
+          - PnL cash:
+                (entry_rate_i - rate_i_t)*100*dv01_i_curr
+              + (entry_rate_j - rate_j_t)*100*dv01_j_curr
+          - pnl_bp = pnl_cash / scale_dv01  (matches old behavior at t=0).
         """
         self.open_ts = open_ts
 
+        # Tenors
         self.tenor_i = _to_float(cheap_row["tenor_yrs"])
         self.tenor_j = _to_float(rich_row["tenor_yrs"])
+        self.tenor_i_orig = self.tenor_i
+        self.tenor_j_orig = self.tenor_j
 
         # Default entry rates from snapshot rows
         default_rate_i = _to_float(cheap_row["rate"])
         default_rate_j = _to_float(rich_row["rate"])
 
         # Trade-time entry rates (can be overridden in overlay mode)
-        self.entry_rate_i = _to_float(entry_rate_i, default=default_rate_i) if entry_rate_i is not None else default_rate_i
-        self.entry_rate_j = _to_float(entry_rate_j, default=default_rate_j) if entry_rate_j is not None else default_rate_j
+        self.entry_rate_i = (
+            _to_float(entry_rate_i, default=default_rate_i)
+            if entry_rate_i is not None else default_rate_i
+        )
+        self.entry_rate_j = (
+            _to_float(entry_rate_j, default=default_rate_j)
+            if entry_rate_j is not None else default_rate_j
+        )
 
         # For PnL we treat these as the fixed entry anchors
         self.rate_i = self.entry_rate_i
@@ -316,13 +340,33 @@ class PairPos:
         self.close_ts = None
         self.exit_reason = None
 
-        # PnL bookkeeping
-        self.pnl_bp: float = 0.0      # per-unit in bps (bp × unit-DV01)
-        self.pnl_cash: float = 0.0    # scaled by scale_dv01
-        self.pnl: float = 0.0         # alias, for backward compatibility (cash units)
+        # Mode / DV01 setup
         self.scale_dv01: float = float(scale_dv01)
         self.mode: str = str(mode)
         self.meta: Dict = meta or {}
+
+        # Pair-level "initial dv01" (signed, per pair)
+        # For overlay, this is the hedge-tape DV01; for strategy, typically 1.0.
+        self.initial_dv01: float = self.scale_dv01
+
+        # Per-leg DV01 at entry
+        # Overlay: dv01_i_entry = w_i * dv01_pair, etc.
+        # Strategy: keep same definition for logging, even if not used for PnL.
+        self.dv01_i_entry: float = self.scale_dv01 * self.w_i
+        self.dv01_j_entry: float = self.scale_dv01 * self.w_j
+
+        # Current per-leg DV01 (updated at each mark)
+        self.dv01_i_curr: float = self.dv01_i_entry
+        self.dv01_j_curr: float = self.dv01_j_entry
+
+        # Remaining tenor (years) used for DV01 decay (overlay)
+        self.rem_tenor_i: float = self.tenor_i_orig
+        self.rem_tenor_j: float = self.tenor_j_orig
+
+        # PnL bookkeeping
+        self.pnl_bp: float = 0.0      # bp-equivalent
+        self.pnl_cash: float = 0.0    # cash units
+        self.pnl: float = 0.0         # alias
 
         # Transaction cost placeholders (overlay mode)
         self.tcost_bp: float = 0.0
@@ -340,13 +384,48 @@ class PairPos:
         self.last_z_dir = self.entry_z_dir
         self.conv_pnl_proxy = 0.0
 
-    def mark(self, snap_last: pd.DataFrame):
+    def _update_overlay_dv01(self, decision_ts: pd.Timestamp):
+        """
+        Overlay-only: update per-leg DV01 via linear decay in remaining tenor.
+        Uses actual/360 day count between open_ts and current decision_ts.
+        """
+        if not isinstance(decision_ts, pd.Timestamp):
+            return
+
+        # Calendar days difference (actual/360)
+        days = (decision_ts.normalize() - self.open_ts.normalize()).days
+        if days < 0:
+            days = 0
+        years_passed = days / 360.0
+
+        # Remaining tenor in years (floor at 0)
+        rem_i = max(self.tenor_i_orig - years_passed, 0.0)
+        rem_j = max(self.tenor_j_orig - years_passed, 0.0)
+        self.rem_tenor_i = rem_i
+        self.rem_tenor_j = rem_j
+
+        # Fractions of original tenor (0..1)
+        Ti0 = max(self.tenor_i_orig, 1e-6)
+        Tj0 = max(self.tenor_j_orig, 1e-6)
+        frac_i = rem_i / Ti0
+        frac_j = rem_j / Tj0
+
+        # Current per-leg DV01 in cash units (signed)
+        self.dv01_i_curr = self.dv01_i_entry * frac_i
+        self.dv01_j_curr = self.dv01_j_entry * frac_j
+
+    def mark(self, snap_last: pd.DataFrame, decision_ts: Optional[pd.Timestamp] = None):
         """
         Mark-to-market at decision time using last rate per tenor; update convergence proxy.
 
-        PnL is computed versus the trade-time entry rates (entry_rate_i/j),
-        NOT versus the decision-bucket curve (we only use decision buckets
-        for exit logic and regime timing).
+        Strategy mode:
+          - PnL is unchanged from your existing implementation
+            (unit world: bp × scale_dv01).
+
+        Overlay mode:
+          - Per-leg DV01 decays linearly with remaining tenor (actual/360),
+            and PnL is computed using those time-varying per-leg DV01s
+            against trade-time entry rates.
         """
         # Current curve rates at this decision bucket
         ri = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "rate"])
@@ -356,16 +435,41 @@ class PairPos:
         self.last_rate_i = ri
         self.last_rate_j = rj
 
-        # Pair PnL per unit: (entry - current) * weight * 100  (rates in % → *100 to bps)
-        d_i = (self.entry_rate_i - ri) * self.w_i * 100.0
-        d_j = (self.entry_rate_j - rj) * self.w_j * 100.0
-        pnl_bp = d_i + d_j
-        self.pnl_bp = pnl_bp
+        if self.mode == "overlay":
+            # --- Overlay: DV01-decaying PnL ---
+            if decision_ts is not None:
+                self._update_overlay_dv01(decision_ts)
 
-        pnl_cash = pnl_bp * self.scale_dv01
-        self.pnl_cash = pnl_cash
-        self.pnl = pnl_cash  # alias
+            # PnL cash using per-leg DV01 and entry→current rate change
+            d_i_cash = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
+            d_j_cash = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
+            pnl_cash = d_i_cash + d_j_cash
 
+            self.pnl_cash = pnl_cash
+            self.pnl = pnl_cash
+
+            if self.scale_dv01 != 0.0 and np.isfinite(self.scale_dv01):
+                self.pnl_bp = pnl_cash / self.scale_dv01
+            else:
+                self.pnl_bp = 0.0
+        else:
+            # --- Strategy mode: keep original bp-based logic ---
+            d_i = (self.entry_rate_i - ri) * self.w_i * 100.0
+            d_j = (self.entry_rate_j - rj) * self.w_j * 100.0
+            pnl_bp = d_i + d_j
+            self.pnl_bp = pnl_bp
+
+            pnl_cash = pnl_bp * self.scale_dv01
+            self.pnl_cash = pnl_cash
+            self.pnl = pnl_cash
+
+            # For logging, keep per-leg DV01 consistent (no decay in strategy)
+            self.dv01_i_curr = self.dv01_i_entry
+            self.dv01_j_curr = self.dv01_j_entry
+            self.rem_tenor_i = self.tenor_i_orig
+            self.rem_tenor_j = self.tenor_j_orig
+
+        # z-spread and convergence proxy (unchanged)
         zi = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "z_comb"])
         zj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "z_comb"])
         zsp = zi - zj
@@ -703,7 +807,8 @@ def run_month(
         # 1) Mark & evaluate exits on any open (carried + this month’s)
         still_open: list[PairPos] = []
         for pos in open_positions:
-            zsp = pos.mark(snap_last)
+            # PASS decision_ts so overlay DV01 aging uses calendar days
+            zsp = pos.mark(snap_last, decision_ts=dts)
             entry_z = pos.entry_zspread
 
             exit_flag = None
@@ -740,7 +845,7 @@ def run_month(
                     elif moved_away:
                         exit_flag = "stop"
 
-            # NEW: PnL-based hard stop in bps
+            # PnL-based hard stop in bps (unchanged)
             if exit_flag is None and BPS_PNL_STOP > 0.0:
                 pnl_bp = float(getattr(pos, "pnl_bp", np.nan))
                 if np.isfinite(pnl_bp) and pnl_bp <= -BPS_PNL_STOP:
@@ -761,7 +866,7 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
-            # Ledger mark (pnl in bps and cash) + entry/current rates + leg dirs
+            # Ledger mark (pnl in bps and cash) + entry/current rates + leg dirs + DV01s
             ledger_rows.append({
                 "decision_ts": dts,
                 "event": "mark",
@@ -775,6 +880,13 @@ def run_month(
                 "entry_rate_j": pos.entry_rate_j,
                 "rate_i": getattr(pos, "last_rate_i", np.nan),
                 "rate_j": getattr(pos, "last_rate_j", np.nan),
+                "dv01_i_entry": pos.dv01_i_entry,
+                "dv01_j_entry": pos.dv01_j_entry,
+                "dv01_i_curr": pos.dv01_i_curr,
+                "dv01_j_curr": pos.dv01_j_curr,
+                "rem_tenor_i": pos.rem_tenor_i,
+                "rem_tenor_j": pos.rem_tenor_j,
+                "initial_dv01": pos.initial_dv01,
                 "pnl_bp": pos.pnl_bp,
                 "pnl_cash": pos.pnl_cash,
                 "z_spread": zsp,
@@ -811,6 +923,11 @@ def run_month(
                     "entry_rate_j": pos.entry_rate_j,
                     "close_rate_i": getattr(pos, "last_rate_i", np.nan),
                     "close_rate_j": getattr(pos, "last_rate_j", np.nan),
+                    "dv01_i_entry": pos.dv01_i_entry,
+                    "dv01_j_entry": pos.dv01_j_entry,
+                    "dv01_i_close": pos.dv01_i_curr,
+                    "dv01_j_close": pos.dv01_j_curr,
+                    "initial_dv01": pos.initial_dv01,
                     "entry_zspread": pos.entry_zspread,
                     "pnl_gross_bp": pos.pnl_bp,
                     "pnl_gross_cash": pos.pnl_cash,
@@ -999,7 +1116,7 @@ def run_month(
                 alt_tenor = float(alt_row["tenor_yrs"])
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                # --- NEW: trade-time entry rates from hedge tape curve snapshot ---
+                # --- trade-time entry rates from hedge tape curve snapshot ---
                 entry_rate_i = None
                 entry_rate_j = None
 
@@ -1022,7 +1139,7 @@ def run_month(
                 if entry_rate_j is None or not np.isfinite(entry_rate_j):
                     entry_rate_j = _to_float(exec_row["rate"])
 
-                # DV01-native unit pair (weights ±1, scaling via dv01_cash)
+                # DV01-native unit pair (weights ±1), scaling via dv01_cash
                 w_alt = side_sign * 1.0
                 w_exec = side_sign * -1.0
 
