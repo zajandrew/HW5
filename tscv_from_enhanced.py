@@ -6,9 +6,9 @@ Time-series cross-validation on the enhanced curve panel.
 - Build decision calendar from enhanced files.
 - Define rolling train/test splits.
 - Run a simplified cheap–rich backtest (no caps) on the TRAIN window only,
-  governed solely by (z_entry, z_exit, z_stop, max_hold_days).
-- Optimize these parameters per split, outputing a parquet table of
-  (split_id, date ranges, params, train_pnl_bp, n_trades).
+  governed solely by (z_entry, z_exit, z_stop, max_hold_days, max_concurrent).
+- Optimize these parameters per split, outputting a parquet table of
+  (split_id, date ranges, params, train_pnl_bp).
 
 This is meant as a *training driver* from enhanced only (no hedge tape).
 """
@@ -21,6 +21,7 @@ from typing import List, Dict, Tuple, Iterable
 
 import numpy as np
 import pandas as pd
+from numba import njit
 
 import cr_config as cr
 
@@ -128,7 +129,7 @@ def build_time_splits_from_calendar(
         splits.append(
             SplitSpec(
                 split_id=split_id,
-                train_start=train_days and train_end and cur_train_start,
+                train_start=cur_train_start,
                 train_end=train_end,
                 test_start=test_start,
                 test_end=test_end,
@@ -252,162 +253,206 @@ def load_enhanced_panel_all(
 
 
 # ======================================================================
-# 3) Simplified cheap–rich strategy from enhanced only
+# 3) Numba-accelerated panel simulator (multiple concurrent pairs)
 # ======================================================================
 
-@dataclass
-class SimplePos:
-    tenor_i: float
-    tenor_j: float
-    entry_rate_i: float
-    entry_rate_j: float
-    entry_zspread: float
-    open_ts: pd.Timestamp
-    age: int = 0  # in decision buckets
-
-
-def _choose_best_pair_for_snapshot(
-    snap: pd.DataFrame,
+@njit
+def simulate_params_panel(
+    z_panel: np.ndarray,
+    rate_panel: np.ndarray,
+    tenors: np.ndarray,
     z_entry: float,
-    *,
-    min_sep_years: float = 0.5,
-    min_leg_tenor: float = 0.0,
-) -> SimplePos | None:
-    """
-    Given one cross-sectional snapshot (tenor_yrs, rate, z_comb),
-    find the single best cheap–rich pair with zspread >= z_entry.
-
-    - We ignore caps and all other desk knobs.
-    - Return None if no pair satisfies z_entry.
-    """
-    if snap.empty:
-        return None
-
-    s = snap[["tenor_yrs", "rate", "z_comb"]].dropna().copy()
-    if s.empty:
-        return None
-
-    ten = s["tenor_yrs"].to_numpy(float)
-    rate = s["rate"].to_numpy(float)
-    z = s["z_comb"].to_numpy(float)
-    n = len(s)
-
-    best_zdisp = -np.inf
-    best_pair = None
-
-    for i in range(n):
-        Ti, ri, zi = ten[i], rate[i], z[i]
-        if Ti < min_leg_tenor:
-            continue
-        for j in range(n):
-            if j == i:
-                continue
-            Tj, rj, zj = ten[j], rate[j], z[j]
-            if Tj < min_leg_tenor:
-                continue
-            if abs(Ti - Tj) < min_sep_years:
-                continue
-
-            # zspread = cheap - rich
-            zdisp = zi - zj
-            if zdisp < z_entry:
-                continue
-            if zdisp > best_zdisp:
-                best_zdisp = zdisp
-                best_pair = (Ti, Tj, ri, rj, zdisp)
-
-    if best_pair is None:
-        return None
-
-    Ti, Tj, ri, rj, zsp = best_pair
-    pos = SimplePos(
-        tenor_i=float(Ti),
-        tenor_j=float(Tj),
-        entry_rate_i=float(ri),
-        entry_rate_j=float(rj),
-        entry_zspread=float(zsp),
-        open_ts=pd.NaT,   # will be set by caller
-        age=0,
-    )
-    return pos
-
-
-def _mark_and_maybe_exit(
-    pos: SimplePos,
-    dts: pd.Timestamp,
-    snap: pd.DataFrame,
-    *,
     z_exit: float,
     z_stop: float,
     max_hold_days: int,
-) -> Tuple[SimplePos | None, float]:
+    decisions_per_day: int,
+    min_leg_tenor: float,
+    min_sep_years: float,
+    max_span_years: float,
+    max_concurrent: int,
+) -> float:
     """
-    Mark position at decision bucket dts using snapshot snap, and decide if it exits.
+    Numba core:
 
-    - PnL is measured in bps (per unit notional).
-    - Uses simplified directional z logic similar to portfolio_test_new:
-        * reversion: moves toward zero and inside |z_exit|
-        * stop: moves away from entry by at least z_stop
-        * max_hold: age >= max_hold_days (in decisions; daily => days)
+    Inputs:
+      - z_panel:   shape (T, N), z_comb per bucket × tenor
+      - rate_panel:shape (T, N), rate (%) per bucket × tenor
+      - tenors:    shape (N,), tenor_yrs per column
+      - z_entry, z_exit, z_stop, max_hold_days: strategy params
+      - decisions_per_day: currently not used (assume daily buckets)
+      - min_leg_tenor, min_sep_years, max_span_years: tenor constraints
+      - max_concurrent: max number of concurrent pairs
+
+    Logic:
+      - Greedy open up to max_concurrent pairs per bucket based on zspread,
+        respecting tenor separation and tenor reuse within that bucket.
+      - Long cheap (higher z), short rich (lower z).
+      - PnL in bps per unit notional (no DV01 scaling).
     """
-    # get current rates + zspread
-    ti, tj = pos.tenor_i, pos.tenor_j
+    T, N = z_panel.shape
+    max_pos = max_concurrent
 
-    def _lookup(s: pd.DataFrame, tenor: float) -> Tuple[float, float]:
-        r = s.loc[s["tenor_yrs"] == tenor]
-        if r.empty:
-            # fall back to nearest tenor if exact not present
-            s2 = s.assign(_dist=(s["tenor_yrs"] - tenor).abs())
-            row = s2.loc[s2["_dist"].idxmin()]
-        else:
-            row = r.iloc[0]
-        return float(row["rate"]), float(row["z_comb"])
+    open_flag = np.zeros(max_pos, dtype=np.bool_)
+    tenor_i_idx = np.zeros(max_pos, dtype=np.int64)
+    tenor_j_idx = np.zeros(max_pos, dtype=np.int64)
+    entry_rate_i = np.zeros(max_pos, dtype=np.float64)
+    entry_rate_j = np.zeros(max_pos, dtype=np.float64)
+    entry_zspread = np.zeros(max_pos, dtype=np.float64)
+    age = np.zeros(max_pos, dtype=np.int64)
 
-    ri, zi_cur = _lookup(snap, ti)
-    rj, zj_cur = _lookup(snap, tj)
-    zsp_cur = zi_cur - zj_cur
+    total_pnl_bp = 0.0
 
-    # PnL in bp relative to entry
-    d_i = (pos.entry_rate_i - ri) * 100.0
-    d_j = (pos.entry_rate_j - rj) * 100.0
-    pnl_bp = d_i - d_j  # long cheap (i), short rich (j)
+    for t in range(T):
+        # 1) Mark existing positions and decide exits
+        for k in range(max_pos):
+            if not open_flag[k]:
+                continue
 
-    # Exit logic
-    entry_z = pos.entry_zspread
-    exit_flag = False
+            i = tenor_i_idx[k]
+            j = tenor_j_idx[k]
 
-    if np.isfinite(zsp_cur) and np.isfinite(entry_z):
-        # directional z
-        dir_sign = np.sign(entry_z) if entry_z != 0 else 1.0
-        entry_dir = dir_sign * entry_z
-        curr_dir = dir_sign * zsp_cur
+            zi = z_panel[t, i]
+            zj = z_panel[t, j]
+            ri = rate_panel[t, i]
+            rj = rate_panel[t, j]
 
-        same_side = (np.sign(entry_dir) != 0) and (np.sign(entry_dir) == np.sign(curr_dir))
-        moved_towards_zero = abs(curr_dir) <= abs(entry_dir)
-        within_exit_band = abs(curr_dir) <= z_exit
-        dz_dir = curr_dir - entry_dir
-        moved_away = (
-            same_side
-            and (abs(curr_dir) >= abs(entry_dir))
-            and (abs(dz_dir) >= z_stop)
-        )
+            # If we don't have a valid mark, just age and possibly max-hold exit
+            if not (np.isfinite(zi) and np.isfinite(zj) and np.isfinite(ri) and np.isfinite(rj)):
+                age[k] += 1
+                if age[k] >= max_hold_days:
+                    open_flag[k] = False
+                continue
 
-        if same_side and moved_towards_zero and within_exit_band:
-            exit_flag = True
-        elif moved_away:
-            exit_flag = True
+            # PnL in bps relative to entry
+            d_i = (entry_rate_i[k] - ri) * 100.0
+            d_j = (entry_rate_j[k] - rj) * 100.0
+            pnl_bp = d_i - d_j  # long cheap (i), short rich (j)
 
-    # Max-hold
-    pos.age += 1
-    if not exit_flag and pos.age >= max_hold_days:
-        exit_flag = True
+            # Exit logic (directional z)
+            z_entry_val = entry_zspread[k]
+            exit_flag = False
 
-    if exit_flag:
-        # position closes here
-        return None, pnl_bp
-    else:
-        return pos, pnl_bp
+            if np.isfinite(z_entry_val):
+                # directional sign from entry z
+                if z_entry_val > 0.0:
+                    dir_sign = 1.0
+                elif z_entry_val < 0.0:
+                    dir_sign = -1.0
+                else:
+                    dir_sign = 1.0
 
+                entry_dir = dir_sign * z_entry_val
+                curr_dir = dir_sign * (zi - zj)
+
+                same_side = (entry_dir != 0.0) and (entry_dir * curr_dir > 0.0)
+                moved_towards_zero = abs(curr_dir) <= abs(entry_dir)
+                within_exit_band = abs(curr_dir) <= z_exit
+                dz_dir = curr_dir - entry_dir
+                moved_away = (
+                    same_side
+                    and (abs(curr_dir) >= abs(entry_dir))
+                    and (abs(dz_dir) >= z_stop)
+                )
+
+                if same_side and moved_towards_zero and within_exit_band:
+                    exit_flag = True
+                elif moved_away:
+                    exit_flag = True
+
+            # Max-hold
+            age[k] += 1
+            if (not exit_flag) and (age[k] >= max_hold_days):
+                exit_flag = True
+
+            if exit_flag:
+                open_flag[k] = False
+                total_pnl_bp += pnl_bp
+
+        # 2) Compute open_count and tenor usage
+        open_count = 0
+        tenor_used = np.zeros(N, dtype=np.bool_)
+        for k in range(max_pos):
+            if open_flag[k]:
+                open_count += 1
+                i = tenor_i_idx[k]
+                j = tenor_j_idx[k]
+                if 0 <= i < N:
+                    tenor_used[i] = True
+                if 0 <= j < N:
+                    tenor_used[j] = True
+
+        capacity = max_concurrent - open_count
+        if capacity <= 0:
+            continue
+
+        # 3) New entries: greedy fill capacity pairs
+        for _ in range(capacity):
+            best_i = -1
+            best_j = -1
+            best_zdisp = z_entry
+
+            for i in range(N):
+                if tenor_used[i]:
+                    continue
+                Ti = tenors[i]
+                if not np.isfinite(Ti) or (Ti < min_leg_tenor):
+                    continue
+
+                zi = z_panel[t, i]
+                ri = rate_panel[t, i]
+                if not (np.isfinite(zi) and np.isfinite(ri)):
+                    continue
+
+                for j in range(N):
+                    if j == i or tenor_used[j]:
+                        continue
+                    Tj = tenors[j]
+                    if not np.isfinite(Tj) or (Tj < min_leg_tenor):
+                        continue
+
+                    diff = abs(Ti - Tj)
+                    if diff < min_sep_years or diff > max_span_years:
+                        continue
+
+                    zj = z_panel[t, j]
+                    rj = rate_panel[t, j]
+                    if not (np.isfinite(zj) and np.isfinite(rj)):
+                        continue
+
+                    # cheap = higher z, rich = lower z
+                    zdisp = zi - zj
+                    if zdisp < z_entry:
+                        continue
+
+                    if zdisp > best_zdisp:
+                        best_zdisp = zdisp
+                        best_i = i
+                        best_j = j
+
+            if best_i == -1:
+                break  # no more candidates
+
+            # Open new position in first free slot
+            for k in range(max_pos):
+                if not open_flag[k]:
+                    open_flag[k] = True
+                    tenor_i_idx[k] = best_i
+                    tenor_j_idx[k] = best_j
+                    entry_rate_i[k] = rate_panel[t, best_i]
+                    entry_rate_j[k] = rate_panel[t, best_j]
+                    entry_zspread[k] = z_panel[t, best_i] - z_panel[t, best_j]
+                    age[k] = 0
+                    break
+
+            tenor_used[best_i] = True
+            tenor_used[best_j] = True
+
+    return total_pnl_bp
+
+
+# ======================================================================
+# 4) Wrapper: evaluate params on a train window
+# ======================================================================
 
 def evaluate_params_on_window(
     decisions: pd.DatetimeIndex,
@@ -421,64 +466,86 @@ def evaluate_params_on_window(
     max_hold_days: int,
     min_sep_years: float = 0.5,
     min_leg_tenor: float = 0.0,
-) -> Tuple[float, int]:
+    max_concurrent: int = 3,
+) -> float:
     """
     Evaluate a simple cheap–rich strategy on [train_start, train_end]
-    using given parameters. Returns (total_pnl_bp, n_trades).
+    using given parameters, with up to max_concurrent concurrent pairs.
 
-    - Only one position at a time (for simplicity).
-    - No caps, no fly gating, no overlay complexity.
-    - Uses snapshots per decision_ts.
+    - Uses a numba-accelerated panel simulator (simulate_params_panel).
+    - Returns total PnL in bps (per unit, no DV01 scaling).
     """
     # restrict to train range
     mask = (decisions >= train_start) & (decisions <= train_end)
     dts_list = decisions[mask]
     if len(dts_list) == 0:
-        return 0.0, 0
+        return 0.0
 
-    open_pos: SimplePos | None = None
-    total_pnl_bp = 0.0
-    n_trades = 0
-
+    # Build tenor universe: intersection of tenors across the window
+    tenor_sets = []
     for dts in dts_list:
         snap = snapshots.get(dts)
         if snap is None or snap.empty:
             continue
+        tenor_sets.append(set(snap["tenor_yrs"].astype(float)))
 
-        # Mark existing position
-        if open_pos is not None:
-            open_pos, pnl_bp = _mark_and_maybe_exit(
-                open_pos,
-                dts,
-                snap,
-                z_exit=z_exit,
-                z_stop=z_stop,
-                max_hold_days=max_hold_days,
-            )
-            total_pnl_bp += pnl_bp
-            if open_pos is None:
-                n_trades += 1  # we just closed one
+    if not tenor_sets:
+        return 0.0
 
-        # If flat after marking, consider new entry
-        if open_pos is None:
-            new_pos = _choose_best_pair_for_snapshot(
-                snap,
-                z_entry=z_entry,
-                min_sep_years=min_sep_years,
-                min_leg_tenor=min_leg_tenor,
-            )
-            if new_pos is not None:
-                new_pos.open_ts = dts
-                open_pos = new_pos
+    common = tenor_sets[0]
+    for s in tenor_sets[1:]:
+        common = common & s
+    if not common:
+        return 0.0
 
-    # If we end the train window with an open position, we *mark* it at last day
-    # (already done in the loop). We do NOT force an extra closure beyond train_end
-    # to keep it strictly in-sample.
-    return float(total_pnl_bp), int(n_trades)
+    tenors = np.array(sorted(common), dtype=np.float64)
+    T = len(dts_list)
+    N = len(tenors)
+
+    z_panel = np.full((T, N), np.nan, dtype=np.float64)
+    rate_panel = np.full((T, N), np.nan, dtype=np.float64)
+
+    # Fill panels
+    for ti, dts in enumerate(dts_list):
+        snap = snapshots.get(dts)
+        if snap is None or snap.empty:
+            continue
+        s = snap[["tenor_yrs", "rate", "z_comb"]].dropna().copy()
+        if s.empty:
+            continue
+
+        # vectorized-ish: map tenor -> row
+        for j in range(N):
+            Tj = tenors[j]
+            rows = s.loc[s["tenor_yrs"] == Tj]
+            if rows.empty:
+                continue
+            r = rows.iloc[0]
+            rate_panel[ti, j] = float(r["rate"])
+            z_panel[ti, j] = float(r["z_comb"])
+
+    decisions_per_day = 1  # we are using daily buckets for TSCV
+
+    pnl_bp = simulate_params_panel(
+        z_panel,
+        rate_panel,
+        tenors,
+        float(z_entry),
+        float(z_exit),
+        float(z_stop),
+        int(max_hold_days),
+        int(decisions_per_day),
+        float(min_leg_tenor),
+        float(min_sep_years),
+        float(getattr(cr, "MAX_SPAN_YEARS", 10.0)),
+        int(max_concurrent),
+    )
+
+    return float(pnl_bp)
 
 
 # ======================================================================
-# 4) Grid optimizer over splits
+# 5) Grid optimizer over splits
 # ======================================================================
 
 def run_tscv_optimization_from_enhanced(
@@ -493,6 +560,7 @@ def run_tscv_optimization_from_enhanced(
     step_days: int = 90,
     min_sep_years: float | None = None,
     min_leg_tenor: float | None = None,
+    max_concurrent_train: int = 3,
     out_name: str | None = None,
 ) -> pd.DataFrame:
     """
@@ -505,17 +573,18 @@ def run_tscv_optimization_from_enhanced(
       parquet dump to PATH_OUT/out_name.parquet.
 
     Arguments:
-      z_entry_grid : candidate z_entry thresholds
-      z_exit_grid  : candidate z_exit thresholds
-      z_stop_grid  : candidate z_stop thresholds
-      max_hold_grid: candidate max_hold_days
-      decision_freq: 'D' or 'H' (use 'D' for now)
-      train_days   : length of train window in calendar days
-      test_days    : length of test window
-      step_days    : roll step between splits
-      min_sep_years: override MIN_SEP_YEARS from cr_config if not None
-      min_leg_tenor: override MIN_LEG_TENOR_YEARS from cr_config if not None
-      out_name     : base filename (without suffix) for parquet; if None, no write.
+      z_entry_grid      : candidate z_entry thresholds
+      z_exit_grid       : candidate z_exit thresholds
+      z_stop_grid       : candidate z_stop thresholds
+      max_hold_grid     : candidate max_hold_days
+      decision_freq     : 'D' or 'H' (use 'D' for now)
+      train_days        : length of train window in calendar days
+      test_days         : length of test window
+      step_days         : roll step between splits
+      min_sep_years     : override MIN_SEP_YEARS from cr_config if not None
+      min_leg_tenor     : override MIN_LEG_TENOR_YEARS from cr_config if not None
+      max_concurrent_train : max concurrent pairs during training sim
+      out_name          : base filename (without suffix) for parquet; if None, no write.
     """
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     decisions_all, snapshots = load_enhanced_panel_all(decision_freq=decision_freq)
@@ -552,7 +621,7 @@ def run_tscv_optimization_from_enhanced(
             for zx in z_exit_grid:
                 for zs in z_stop_grid:
                     for mh in max_hold_grid:
-                        pnl_bp, n_trades = evaluate_params_on_window(
+                        pnl_bp = evaluate_params_on_window(
                             decisions,
                             snapshots,
                             train_start=s.train_start,
@@ -563,6 +632,7 @@ def run_tscv_optimization_from_enhanced(
                             max_hold_days=int(mh),
                             min_sep_years=min_sep_years,
                             min_leg_tenor=min_leg_tenor,
+                            max_concurrent=int(max_concurrent_train),
                         )
 
                         results.append(
@@ -576,8 +646,8 @@ def run_tscv_optimization_from_enhanced(
                                 "z_exit": float(zx),
                                 "z_stop": float(zs),
                                 "max_hold_days": int(mh),
+                                "max_concurrent": int(max_concurrent_train),
                                 "train_pnl_bp": float(pnl_bp),
-                                "n_trades": int(n_trades),
                             }
                         )
 
@@ -597,7 +667,7 @@ def run_tscv_optimization_from_enhanced(
 
 
 # ======================================================================
-# 5) CLI / quick usage example
+# 6) CLI / quick usage example
 # ======================================================================
 
 if __name__ == "__main__":
@@ -616,6 +686,7 @@ if __name__ == "__main__":
         train_days=365,
         test_days=90,
         step_days=90,
+        max_concurrent_train=3,
         out_name="tscv_params_enh",
     )
 
