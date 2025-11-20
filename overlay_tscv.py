@@ -382,73 +382,90 @@ def _eval_param_combo_for_split(
 # ======================================================================
 
 def run_overlay_grid_search_from_portfolio(
-    hedge_df: pd.DataFrame,
-    z_entry_grid: Iterable[float],
-    z_exit_grid: Iterable[float],
-    z_stop_grid: Iterable[float],
-    max_hold_grid: Iterable[int],
+    z_entry_grid,
+    z_exit_grid,
+    z_stop_grid,
+    max_hold_grid,
     *,
     decision_freq: str | None = None,
-    train_months: int = 6,
-    test_months: int = 3,
-    step_months: int = 3,
-    min_test_months: int = 1,
+    train_days: int = 365,
+    test_days: int = 90,
+    step_days: int = 90,
+    min_sep_years: float | None = None,
+    min_leg_tenor: float | None = None,
+    hedge_df: pd.DataFrame | None = None,
+    n_jobs: int = 1,
     out_name: str | None = None,
-    n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Main overlay TSCV driver (train-only, bps-based):
+    Grid search for (z_entry, z_exit, z_stop, max_hold_days) using portfolio_test_new
+    in overlay mode, optimized *only on train windows*.
 
-      - Discover available yymms from enhanced.
-      - Build monthly train/test splits.
-      - For each split and param tuple, run portfolio_test_new.run_all
-        on train+test months in overlay mode using hedge_df.
-      - Compute *train* PnL in bps and train trade count.
-      - Return a DataFrame with one row per (split, param) combo and optional
-        parquet dump to PATH_OUT/out_name.parquet.
-
-    Parallelism:
-      - If n_jobs is None or 1: run serially.
-      - If n_jobs > 1: use ProcessPoolExecutor with a global hedge_df per worker.
-
-    Arguments:
-      hedge_df      : full trade tape (side, instrument, EqVolDelta, tradetimeUTC, plus *_mid cols)
-      z_entry_grid  : candidate z_entry thresholds
-      z_exit_grid   : candidate z_exit thresholds
-      z_stop_grid   : candidate z_stop thresholds
-      max_hold_grid : candidate max_hold_days
-      decision_freq : 'D' or 'H' (use 'D' for your daily overlay calibration)
-      train_months  : number of months in each train window
-      test_months   : number of months in each test window
-      step_months   : how far to roll the window between splits
-      min_test_months: require at least this many test months for a split
-      out_name      : base filename (without suffix) for parquet; if None, no write.
-      n_jobs        : number of worker processes (None/1 = serial, >1 = parallel).
+    Important: we now trim the hedge tape per split to only trades whose
+    tradetimeUTC lies between train_start and test_end for that split.
     """
-    if hedge_df is None or hedge_df.empty:
-        raise ValueError("run_overlay_grid_search_from_portfolio requires a non-empty hedge_df.")
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
-    yymms = discover_yymms_from_enhanced()
-    splits = build_overlay_splits_from_yymms(
-        yymms,
-        train_months=train_months,
-        test_months=test_months,
-        step_months=step_months,
-        min_test_months=min_test_months,
+    # --- sanity checks / defaults ---
+    if hedge_df is None or hedge_df.empty:
+        raise ValueError("run_overlay_grid_search_from_portfolio requires a non-empty hedge_df.")
+
+    # normalize tradetimeUTC once
+    h = hedge_df.copy()
+    h["tradetimeUTC"] = (
+        pd.to_datetime(h["tradetimeUTC"], utc=True, errors="coerce")
+          .dt.tz_convert("UTC")
+          .dt.tz_localize(None)
+    )
+
+    # load enhanced & snapshots
+    decisions_all, snapshots = load_enhanced_panel_all(decision_freq=decision_freq)
+    decisions = pd.DatetimeIndex(decisions_all).sort_values().unique()
+
+    # build time splits (train/test windows + month lists)
+    splits = build_overlay_splits_from_calendar(
+        decisions,
+        train_days=train_days,
+        test_days=test_days,
+        step_days=step_days,
     )
     if not splits:
-        raise RuntimeError("No valid overlay splits constructed; check train/test/step months.")
+        raise RuntimeError("No valid splits constructed; check train/test/step days.")
 
-    # Build task list: one task per (split, param tuple)
-    tasks: List[Tuple[OverlaySplitSpec, float, float, float, int]] = []
+    # knob fallbacks
+    if min_sep_years is None:
+        min_sep_years = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
+    if min_leg_tenor is None:
+        min_leg_tenor = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+
+    # we’ll pass these via the split object into the worker
+    # (worker calls run_month / run_all with overlay mode, etc.)
+
+    tasks = []
+    results_rows: list[dict] = []
+
+    # ------------------------------------------------------------
+    # Build task list, trimming hedge tape per split
+    # ------------------------------------------------------------
     for split in splits:
         print(
             f"[SPLIT {split.split_id}] "
-            f"train {split.train_yymms} ({split.train_start.date()} → {split.train_end.date()}) | "
-            f"test {split.test_yymms} ({split.test_start.date()} → {split.test_end.date()})"
+            f"train {split.train_start.date()} → {split.train_end.date()} | "
+            f"test {split.test_start.date()} → {split.test_end.date()}"
         )
+
+        # NEW: restrict hedge tape to trades between train_start and test_end
+        hedge_sub = h[
+            (h["tradetimeUTC"] >= split.train_start)
+            & (h["tradetimeUTC"] <= split.test_end)
+        ].copy()
+
+        if hedge_sub.empty:
+            print(f"  [WARN] No trades in hedge tape for split {split.split_id}; skipping.")
+            continue
+
         for ze in z_entry_grid:
             for zx in z_exit_grid:
                 for zs in z_stop_grid:
@@ -460,34 +477,22 @@ def run_overlay_grid_search_from_portfolio(
                                 float(zx),
                                 float(zs),
                                 int(mh),
+                                decision_freq,
+                                hedge_sub,  # pass trimmed hedge
                             )
                         )
 
-    results: List[Dict] = []
+    if not tasks:
+        raise RuntimeError("No tasks constructed (likely no trades intersect any split windows).")
 
-    # Serial path
-    if n_jobs is None or n_jobs == 1:
-        for split, ze, zx, zs, mh in tasks:
-            row = _eval_param_combo_for_split(
-                split=split,
-                z_entry=ze,
-                z_exit=zx,
-                z_stop=zs,
-                max_hold_days=mh,
-                decision_freq=decision_freq,
-                hedge_df=hedge_df,
-            )
-            results.append(row)
-    else:
-        # Parallel path
-        max_workers = n_jobs if n_jobs > 0 else None
-        with ProcessPoolExecutor(
-            max_workers=max_workers,
-            initializer=_init_worker,
-            initargs=(hedge_df,),
-        ) as ex:
-            futures = []
-            for split, ze, zx, zs, mh in tasks:
+    # ------------------------------------------------------------
+    # Run tasks (serial or parallel)
+    # ------------------------------------------------------------
+    if n_jobs is not None and n_jobs > 1:
+        print(f"[INFO] Running grid search in parallel with n_jobs={n_jobs}")
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            fut_to_meta = {}
+            for (split, ze, zx, zs, mh, dfreq, hedge_sub) in tasks:
                 fut = ex.submit(
                     _eval_param_combo_for_split,
                     split,
@@ -495,16 +500,61 @@ def run_overlay_grid_search_from_portfolio(
                     zx,
                     zs,
                     mh,
-                    decision_freq,
-                    None,  # hedge_df -> use global in worker
+                    dfreq,
+                    hedge_sub,   # per-split trimmed tape
                 )
-                futures.append(fut)
+                fut_to_meta[fut] = (split, ze, zx, zs, mh)
 
-            for fut in as_completed(futures):
-                row = fut.result()
-                results.append(row)
+            for fut in as_completed(fut_to_meta):
+                split, ze, zx, zs, mh = fut_to_meta[fut]
+                train_pnl_bp, n_trades = fut.result()
+                results_rows.append(
+                    {
+                        "split_id": split.split_id,
+                        "train_start": split.train_start,
+                        "train_end": split.train_end,
+                        "test_start": split.test_start,
+                        "test_end": split.test_end,
+                        "z_entry": ze,
+                        "z_exit": zx,
+                        "z_stop": zs,
+                        "max_hold_days": mh,
+                        "train_pnl_bp": float(train_pnl_bp),
+                        "n_trades": int(n_trades),
+                    }
+                )
+    else:
+        print("[INFO] Running grid search in serial mode (n_jobs=1)")
+        for (split, ze, zx, zs, mh, dfreq, hedge_sub) in tasks:
+            train_pnl_bp, n_trades = _eval_param_combo_for_split(
+                split,
+                ze,
+                zx,
+                zs,
+                mh,
+                dfreq,
+                hedge_sub,   # per-split trimmed tape
+            )
+            results_rows.append(
+                {
+                    "split_id": split.split_id,
+                    "train_start": split.train_start,
+                    "train_end": split.train_end,
+                    "test_start": split.test_start,
+                    "test_end": split.test_end,
+                    "z_entry": ze,
+                    "z_exit": zx,
+                    "z_stop": zs,
+                    "max_hold_days": mh,
+                    "train_pnl_bp": float(train_pnl_bp),
+                    "n_trades": int(n_trades),
+                }
+            )
 
-    res_df = pd.DataFrame(results)
+    # ------------------------------------------------------------
+    # Collect results + optional write
+    # ------------------------------------------------------------
+    res_df = pd.DataFrame(results_rows)
     if not res_df.empty:
         res_df = res_df.sort_values(
             ["split_id", "train_pnl_bp"],
@@ -518,7 +568,7 @@ def run_overlay_grid_search_from_portfolio(
         fname = f"{out_name}{suffix}.parquet" if suffix else f"{out_name}.parquet"
         out_path = out_dir / fname
         res_df.to_parquet(out_path, index=False)
-        print(f"[WRITE] overlay grid-search results -> {out_path}")
+        print(f"[WRITE] Overlay TSCV optimization results -> {out_path}")
 
     return res_df
 
