@@ -317,23 +317,19 @@ def _eval_param_combo_for_split(
     hedge_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, object]:
     """
-    Evaluate a single param tuple on a single split:
-
-      - Set params in cr_config.
-      - Run portfolio_test_new.run_all on train+test months in overlay mode.
-      - Compute *train* metrics in bps only.
-      - Return a result row dict.
-
-    If hedge_df is None, we use the module-global _GLOBAL_HEDGE_DF
-    (for use with ProcessPoolExecutor + initializer).
+    Evaluate a single param tuple on a single split.
+    Uses the *passed per-split trimmed hedge_df* if provided.
+    Otherwise falls back to _GLOBAL_HEDGE_DF.
     """
     global _GLOBAL_HEDGE_DF
 
     decision_freq = decision_freq.upper()
-    if hedge_df is None:
-        hedge_df_local = _GLOBAL_HEDGE_DF
-    else:
+
+    # --- NEW: prefer the passed hedge_df (trimmed) ---
+    if hedge_df is not None:
         hedge_df_local = hedge_df
+    else:
+        hedge_df_local = _GLOBAL_HEDGE_DF
 
     if hedge_df_local is None or hedge_df_local.empty:
         raise ValueError("_eval_param_combo_for_split requires a non-empty hedge_df.")
@@ -342,7 +338,7 @@ def _eval_param_combo_for_split(
     try:
         _apply_param_tuple_to_cr(z_entry, z_exit, z_stop, max_hold_days)
 
-        # Train + test months so that positions can bleed into test window.
+        # Run portfolio_test_new on train+test months
         months_span = split.train_yymms + split.test_yymms
 
         pos_df, led_df, pnl_by = pt.run_all(
@@ -351,13 +347,13 @@ def _eval_param_combo_for_split(
             carry=True,
             force_close_end=False,
             mode="overlay",
-            hedge_df=hedge_df_local,
+            hedge_df=hedge_df_local,      # <-- NEW: pass trimmed hedges
             overlay_use_caps=None,
         )
 
         metrics = _compute_train_metrics_bp(pos_df, split)
 
-        row = {
+        return {
             "split_id": split.split_id,
             "train_yymms": ",".join(split.train_yymms),
             "test_yymms": ",".join(split.test_yymms),
@@ -372,7 +368,7 @@ def _eval_param_combo_for_split(
             "train_pnl_bp": metrics["train_pnl_bp"],
             "n_trades_train": metrics["n_trades_train"],
         }
-        return row
+
     finally:
         _restore_cr_params(snap)
 
@@ -388,31 +384,21 @@ def run_overlay_grid_search_from_portfolio(
     max_hold_grid,
     *,
     decision_freq: str | None = None,
-    train_days: int = 365,
-    test_days: int = 90,
-    step_days: int = 90,
-    min_sep_years: float | None = None,
-    min_leg_tenor: float | None = None,
+    train_months: int = 6,
+    test_months: int = 3,
+    step_months: int = 3,
+    min_test_months: int = 1,
     hedge_df: pd.DataFrame | None = None,
     n_jobs: int = 1,
     out_name: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Grid search for (z_entry, z_exit, z_stop, max_hold_days) using portfolio_test_new
-    in overlay mode, optimized *only on train windows*.
-
-    Important: we now trim the hedge tape per split to only trades whose
-    tradetimeUTC lies between train_start and test_end for that split.
-    """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
-    # --- sanity checks / defaults ---
     if hedge_df is None or hedge_df.empty:
-        raise ValueError("run_overlay_grid_search_from_portfolio requires a non-empty hedge_df.")
+        raise ValueError("Need non-empty hedge_df.")
 
-    # normalize tradetimeUTC once
+    # normalize tradetimeUTC
     h = hedge_df.copy()
     h["tradetimeUTC"] = (
         pd.to_datetime(h["tradetimeUTC"], utc=True, errors="coerce")
@@ -420,50 +406,36 @@ def run_overlay_grid_search_from_portfolio(
           .dt.tz_localize(None)
     )
 
-    # load enhanced & snapshots
-    decisions_all, snapshots = load_enhanced_panel_all(decision_freq=decision_freq)
-    decisions = pd.DatetimeIndex(decisions_all).sort_values().unique()
+    # discover months
+    yymms = discover_yymms_from_enhanced()
 
-    # build time splits (train/test windows + month lists)
-    splits = build_overlay_splits_from_calendar(
-        decisions,
-        train_days=train_days,
-        test_days=test_days,
-        step_days=step_days,
+    # build month-based split specs
+    splits = build_overlay_splits_from_yymms(
+        yymms,
+        train_months=train_months,
+        test_months=test_months,
+        step_months=step_months,
+        min_test_months=min_test_months,
     )
-    if not splits:
-        raise RuntimeError("No valid splits constructed; check train/test/step days.")
-
-    # knob fallbacks
-    if min_sep_years is None:
-        min_sep_years = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-    if min_leg_tenor is None:
-        min_leg_tenor = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
-
-    # we’ll pass these via the split object into the worker
-    # (worker calls run_month / run_all with overlay mode, etc.)
 
     tasks = []
-    results_rows: list[dict] = []
+    results_rows = []
 
-    # ------------------------------------------------------------
-    # Build task list, trimming hedge tape per split
-    # ------------------------------------------------------------
+    # --------- NEW: TRIM HEDGE TAPE FOR EACH SPLIT ---------
     for split in splits:
         print(
             f"[SPLIT {split.split_id}] "
-            f"train {split.train_start.date()} → {split.train_end.date()} | "
-            f"test {split.test_start.date()} → {split.test_end.date()}"
+            f"train {split.train_yymms} ({split.train_start.date()} → {split.train_end.date()}) | "
+            f"test {split.test_yymms} ({split.test_start.date()} → {split.test_end.date()})"
         )
 
-        # NEW: restrict hedge tape to trades between train_start and test_end
         hedge_sub = h[
             (h["tradetimeUTC"] >= split.train_start)
             & (h["tradetimeUTC"] <= split.test_end)
         ].copy()
 
         if hedge_sub.empty:
-            print(f"  [WARN] No trades in hedge tape for split {split.split_id}; skipping.")
+            print(f"  [WARN] No trades for split {split.split_id}; skipping.")
             continue
 
         for ze in z_entry_grid:
@@ -478,94 +450,57 @@ def run_overlay_grid_search_from_portfolio(
                                 float(zs),
                                 int(mh),
                                 decision_freq,
-                                hedge_sub,  # pass trimmed hedge
+                                hedge_sub,   # <-- pass trimmed hedge tape
                             )
                         )
 
     if not tasks:
-        raise RuntimeError("No tasks constructed (likely no trades intersect any split windows).")
+        raise RuntimeError("No tasks to run.")
 
-    # ------------------------------------------------------------
-    # Run tasks (serial or parallel)
-    # ------------------------------------------------------------
-    if n_jobs is not None and n_jobs > 1:
-        print(f"[INFO] Running grid search in parallel with n_jobs={n_jobs}")
-        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-            fut_to_meta = {}
-            for (split, ze, zx, zs, mh, dfreq, hedge_sub) in tasks:
-                fut = ex.submit(
+    # --------- Parallel execution ----------
+    if n_jobs > 1:
+        with ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_init_worker,
+            initargs=(None,),     # unused now, because we pass hedge_sub explicitly
+        ) as ex:
+            fut_to_meta = {
+                ex.submit(
                     _eval_param_combo_for_split,
-                    split,
-                    ze,
-                    zx,
-                    zs,
-                    mh,
-                    dfreq,
-                    hedge_sub,   # per-split trimmed tape
-                )
-                fut_to_meta[fut] = (split, ze, zx, zs, mh)
+                    split, ze, zx, zs, mh,
+                    decision_freq,
+                    hedge_sub         # <-- pass trimmed hedge tape
+                ): (split, ze, zx, zs, mh)
+                for (split, ze, zx, zs, mh, decision_freq, hedge_sub) in tasks
+            }
 
             for fut in as_completed(fut_to_meta):
                 split, ze, zx, zs, mh = fut_to_meta[fut]
-                train_pnl_bp, n_trades = fut.result()
-                results_rows.append(
-                    {
-                        "split_id": split.split_id,
-                        "train_start": split.train_start,
-                        "train_end": split.train_end,
-                        "test_start": split.test_start,
-                        "test_end": split.test_end,
-                        "z_entry": ze,
-                        "z_exit": zx,
-                        "z_stop": zs,
-                        "max_hold_days": mh,
-                        "train_pnl_bp": float(train_pnl_bp),
-                        "n_trades": int(n_trades),
-                    }
-                )
-    else:
-        print("[INFO] Running grid search in serial mode (n_jobs=1)")
-        for (split, ze, zx, zs, mh, dfreq, hedge_sub) in tasks:
-            train_pnl_bp, n_trades = _eval_param_combo_for_split(
-                split,
-                ze,
-                zx,
-                zs,
-                mh,
-                dfreq,
-                hedge_sub,   # per-split trimmed tape
-            )
-            results_rows.append(
-                {
-                    "split_id": split.split_id,
-                    "train_start": split.train_start,
-                    "train_end": split.train_end,
-                    "test_start": split.test_start,
-                    "test_end": split.test_end,
-                    "z_entry": ze,
-                    "z_exit": zx,
-                    "z_stop": zs,
-                    "max_hold_days": mh,
-                    "train_pnl_bp": float(train_pnl_bp),
-                    "n_trades": int(n_trades),
-                }
-            )
+                results_rows.append(fut.result())
 
-    # ------------------------------------------------------------
-    # Collect results + optional write
-    # ------------------------------------------------------------
+    else:
+        # ---------- Serial version ----------
+        for (split, ze, zx, zs, mh, dfreq, hedge_sub) in tasks:
+            row = _eval_param_combo_for_split(
+                split, ze, zx, zs, mh, dfreq, hedge_sub
+            )
+            results_rows.append(row)
+
+    # -------- results dataframe --------
     res_df = pd.DataFrame(results_rows)
     if not res_df.empty:
         res_df = res_df.sort_values(
             ["split_id", "train_pnl_bp"],
-            ascending=[True, False],
+            ascending=[True, False]
         )
 
     if out_name:
         out_dir = Path(getattr(cr, "PATH_OUT", "."))
         out_dir.mkdir(parents=True, exist_ok=True)
         suffix = getattr(cr, "OUT_SUFFIX", "")
-        fname = f"{out_name}{suffix}.parquet" if suffix else f"{out_name}.parquet"
+        fname = (
+            f"{out_name}{suffix}.parquet" if suffix else f"{out_name}.parquet"
+        )
         out_path = out_dir / fname
         res_df.to_parquet(out_path, index=False)
         print(f"[WRITE] Overlay TSCV optimization results -> {out_path}")
