@@ -1,31 +1,31 @@
 """
-overlay_tscv_from_portfolio.py
+overlay_tscv.py
 
-Time-series grid search for overlay mode using portfolio_test_new.
+Time-series cross-validation for overlay mode using portfolio_test_new.
 
-- Discover months (yymm) from enhanced files.
-- Build rolling month-based train/test splits.
-- For each split and parameter tuple (Z_ENTRY, Z_EXIT, Z_STOP, MAX_HOLD_DAYS),
-  run portfolio_test_new.run_all in overlay mode on train+test months.
-- Compute train/test PnL (cash) + trade counts from the resulting outputs.
-- Return a DataFrame of results and optionally write to parquet.
+- Uses monthly enhanced files to infer available yymm months.
+- Builds rolling train/test splits at the month level.
+- For each split and parameter tuple (z_entry, z_exit, z_stop, max_hold_days),
+  runs portfolio_test_new.run_all in overlay mode on TRAIN+TEST months
+  but **evaluates PnL only on the TRAIN window**, in **bps**:
 
-Intended usage:
-  - Optimize on synthetic hedge tape (hedge_df_synth).
-  - Inspect best params (especially by test_pnl_cash) per split.
-  - Optionally re-run on real hedge tape to assess OOS behavior.
+    train_pnl_bp = sum(pnl_gross_bp) for trades whose close_ts in [train_start, train_end]
+
+- Outputs a parquet with one row per (split, param) combination:
+    split_id, train_yymms, test_yymms,
+    train_start, train_end, test_start, test_end,
+    z_entry, z_exit, z_stop, max_hold_days,
+    train_pnl_bp, n_trades_train
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple, Iterable, Optional
+from typing import List, Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.offsets import MonthEnd
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cr_config as cr
 import portfolio_test_new as pt
@@ -35,37 +35,73 @@ import portfolio_test_new as pt
 # 1) Discover months (yymm) from enhanced files
 # ======================================================================
 
-def discover_yymms_from_enh() -> List[str]:
+def _iter_enhanced_paths_overlay() -> List[Path]:
     """
-    Discover available months (yymm) from enhanced files, mirroring the
-    naming convention used in portfolio_test_new._enhanced_in_path.
-
-    We assume enhanced files live under PATH_ENH and look like:
-      {yymm}_enh{ENH_SUFFIX}.parquet  (or similar).
+    Discover enhanced parquet files in PATH_ENH, mirroring portfolio_test_new
+    naming convention as much as possible.
     """
     root = Path(getattr(cr, "PATH_ENH", "."))
     suffix = getattr(cr, "ENH_SUFFIX", "")
-
     if suffix:
-        paths = sorted(root.glob(f"*{suffix}.parquet"))
+        return sorted(root.glob(f"*{suffix}.parquet"))
     else:
-        paths = sorted(root.glob("*_enh.parquet"))
+        # reasonably permissive fallback
+        return sorted(root.glob("*.parquet"))
 
+
+def _parse_yymm_from_stem(stem: str) -> Optional[str]:
+    """
+    Try to extract a 'yymm' prefix from a file stem, e.g.:
+
+      '2304_enh_v2' -> '2304'
+      '2304_enh'    -> '2304'
+
+    Returns None if we can't parse 4 leading digits into a valid month.
+    """
+    if len(stem) < 4:
+        return None
+    yymm = stem[:4]
+    if not yymm.isdigit():
+        return None
+    yy = int(yymm[:2])
+    mm = int(yymm[2:])
+    if mm < 1 or mm > 12:
+        return None
+    return yymm
+
+
+def discover_yymms_from_enhanced() -> List[str]:
+    """
+    Scan enhanced files and return sorted unique yymm strings.
+    """
+    paths = _iter_enhanced_paths_overlay()
     yymms: List[str] = []
     for p in paths:
-        stem = p.stem  # e.g. "2304_enh_v1"
-        # Take the first 4 characters if they are digits
-        cand = stem[:4]
-        if len(cand) == 4 and cand.isdigit():
-            yymms.append(cand)
-
-    # Remove duplicates, keep sorted in ascending chronological order
+        yymm = _parse_yymm_from_stem(p.stem)
+        if yymm is not None:
+            yymms.append(yymm)
     yymms = sorted(set(yymms))
+    if not yymms:
+        raise FileNotFoundError(f"No yymm months could be inferred from {cr.PATH_ENH}")
     return yymms
 
 
+def _yymm_to_month_bounds(yymm: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Given 'yymm' (e.g. '2304'), return (month_start, month_end) as Timestamps
+    in the local calendar (no timezone).
+    """
+    yy = int(yymm[:2])
+    mm = int(yymm[2:])
+    year = 2000 + yy
+    month_start = pd.Timestamp(year=year, month=mm, day=1)
+    # month_end = last day of the month
+    month_end = (month_start + pd.offsets.MonthEnd(1))
+    return month_start, month_end
+
+
 # ======================================================================
-# 2) Month-based split construction
+# 2) Split spec and split builder
 # ======================================================================
 
 @dataclass
@@ -79,73 +115,49 @@ class OverlaySplitSpec:
     test_end: pd.Timestamp
 
 
-def _yymm_to_month_start_end(yymm: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """
-    Map 'yymm' (e.g. '2304') → (month_start, month_end).
-    """
-    year = 2000 + int(yymm[:2])
-    month = int(yymm[2:])
-    start = pd.Timestamp(year=year, month=month, day=1)
-    end = start + MonthEnd(1)
-    return start, end
-
-
 def build_overlay_splits_from_yymms(
     yymms: List[str],
     *,
     train_months: int = 6,
     test_months: int = 3,
     step_months: int = 3,
-    min_test_months: int = 2,
+    min_test_months: int = 1,
 ) -> List[OverlaySplitSpec]:
     """
-    Build rolling month-based train/test splits over a list of yymms.
+    Build rolling month-based splits from an ordered yymm list.
 
-    Logic:
-      - We roll in steps of 'step_months'.
-      - For each base index, we try to allocate up to 'train_months' for train,
-        then up to 'test_months' for test.
-      - We always enforce at least 'min_test_months' in the test window.
-      - For the *last* split, the train window may be shorter than train_months
-        if needed to make room for at least 'min_test_months' test months.
+    Example (train_months=6, test_months=3, step_months=3):
+      - Split 1: train = first 6 months, test = next 3
+      - Split 2: train = months 4-9,      test = months 10-12
+      - etc.
 
-    Returns a list of OverlaySplitSpec.
+    We require at least `min_test_months` test months; otherwise we stop.
     """
+    yymms = sorted(yymms)
     n = len(yymms)
-    if n == 0:
-        return []
-
     splits: List[OverlaySplitSpec] = []
     split_id = 1
 
-    i = 0
-    while i < n:
-        # Remaining months from i
-        remaining = n - i
-
-        # If we can't even fit the minimum test window, break
-        if remaining < min_test_months + 1:
+    idx = 0
+    while True:
+        train_yymms = yymms[idx : idx + train_months]
+        if len(train_yymms) < train_months:
             break
 
-        # Max train length we can use at this starting point
-        max_train_len = min(train_months, remaining - min_test_months)
-        if max_train_len <= 0:
+        test_start_idx = idx + train_months
+        test_end_idx = test_start_idx + test_months
+        test_yymms = yymms[test_start_idx:test_end_idx]
+
+        if len(test_yymms) < min_test_months:
             break
 
-        # Actual train_len = max_train_len
-        train_len = max_train_len
-        test_len = min(test_months, remaining - train_len)
-        if test_len < min_test_months:
-            # If we can't get min_test_months, stop
-            break
+        # Bounds for train window
+        train_start, _ = _yymm_to_month_bounds(train_yymms[0])
+        _, train_end = _yymm_to_month_bounds(train_yymms[-1])
 
-        train_yymms = yymms[i : i + train_len]
-        test_yymms = yymms[i + train_len : i + train_len + test_len]
-
-        train_start, _ = _yymm_to_month_start_end(train_yymms[0])
-        _, train_end = _yymm_to_month_start_end(train_yymms[-1])
-        test_start, _ = _yymm_to_month_start_end(test_yymms[0])
-        _, test_end = _yymm_to_month_start_end(test_yymms[-1])
+        # Bounds for test window
+        test_start, _ = _yymm_to_month_bounds(test_yymms[0])
+        _, test_end = _yymm_to_month_bounds(test_yymms[-1])
 
         splits.append(
             OverlaySplitSpec(
@@ -158,28 +170,26 @@ def build_overlay_splits_from_yymms(
                 test_end=test_end,
             )
         )
-        split_id += 1
 
-        # Move forward by step_months
-        i += step_months
+        split_id += 1
+        idx += step_months
+        if idx >= n:
+            break
 
     return splits
 
 
 def describe_overlay_splits(
-    yymms: Optional[List[str]] = None,
     *,
     train_months: int = 6,
     test_months: int = 3,
     step_months: int = 3,
-    min_test_months: int = 2,
+    min_test_months: int = 1,
 ) -> List[OverlaySplitSpec]:
     """
-    Convenience helper to print and inspect overlay splits.
+    Convenience helper: discover yymms and print the overlay splits.
     """
-    if yymms is None:
-        yymms = discover_yymms_from_enh()
-
+    yymms = discover_yymms_from_enhanced()
     splits = build_overlay_splits_from_yymms(
         yymms,
         train_months=train_months,
@@ -188,33 +198,32 @@ def describe_overlay_splits(
         min_test_months=min_test_months,
     )
 
-    print(f"Available yymms: {yymms}")
-    print(f"train_months={train_months}, test_months={test_months}, step_months={step_months}, min_test_months={min_test_months}")
+    print(f"Available months (yymm): {yymms}")
+    print(f"train_months={train_months}, test_months={test_months}, step_months={step_months}")
     print(f"Number of splits: {len(splits)}\n")
-
     for s in splits:
         print(
             f"Split {s.split_id}: "
-            f"TRAIN {s.train_yymms} ({s.train_start.date()} → {s.train_end.date()}) | "
-            f"TEST {s.test_yymms} ({s.test_start.date()} → {s.test_end.date()})"
+            f"train {s.train_yymms} ({s.train_start.date()} → {s.train_end.date()}) | "
+            f"test {s.test_yymms} ({s.test_start.date()} → {s.test_end.date()})"
         )
-
     return splits
 
 
 # ======================================================================
-# 3) Helpers to temporarily set params in cr_config
+# 3) Config snapshot / restore and train-only metrics
 # ======================================================================
+
+_PARAM_NAMES = ["Z_ENTRY", "Z_EXIT", "Z_STOP", "MAX_HOLD_DAYS"]
+
 
 def _snapshot_cr_params() -> Dict[str, object]:
     """
-    Capture the relevant strategy parameters from cr_config so we can restore later.
+    Snapshot the Z-entry/exit/stop/max-hold params so we can restore after each run.
     """
-    keys = ["Z_ENTRY", "Z_EXIT", "Z_STOP", "MAX_HOLD_DAYS"]
-    snap = {}
-    for k in keys:
-        if hasattr(cr, k):
-            snap[k] = getattr(cr, k)
+    snap: Dict[str, object] = {}
+    for name in _PARAM_NAMES:
+        snap[name] = getattr(cr, name, None)
     return snap
 
 
@@ -223,77 +232,62 @@ def _apply_param_tuple_to_cr(
     z_exit: float,
     z_stop: float,
     max_hold_days: int,
-):
+) -> None:
     """
-    Apply parameters to cr_config in-place.
+    Apply one parameter tuple into cr_config.
     """
-    cr.Z_ENTRY = float(z_entry)
-    cr.Z_EXIT = float(z_exit)
-    cr.Z_STOP = float(z_stop)
-    cr.MAX_HOLD_DAYS = int(max_hold_days)
+    setattr(cr, "Z_ENTRY", float(z_entry))
+    setattr(cr, "Z_EXIT", float(z_exit))
+    setattr(cr, "Z_STOP", float(z_stop))
+    setattr(cr, "MAX_HOLD_DAYS", int(max_hold_days))
 
 
-def _restore_cr_params(snap: Dict[str, object]):
+def _restore_cr_params(snap: Dict[str, object]) -> None:
     """
-    Restore previously captured cr_config parameters.
+    Restore params in cr_config from a snapshot.
     """
-    for k, v in snap.items():
-        setattr(cr, k, v)
+    for name, val in snap.items():
+        if val is not None:
+            setattr(cr, name, val)
 
 
-# ======================================================================
-# 4) Metrics from run_all outputs
-# ======================================================================
-
-def _compute_train_test_metrics(
+def _compute_train_metrics_bp(
     pos_df: pd.DataFrame,
-    pnl_by: pd.DataFrame,
     split: OverlaySplitSpec,
 ) -> Dict[str, float]:
     """
-    Compute train/test PnL (cash) and trade counts from run_all outputs
+    Compute TRAIN PnL in *bps* and train trade count from positions_ledger
     for a given split.
 
-    - PnL is computed from pnl_by (pnl_cash by bucket).
-    - n_trades counts closed positions whose close_ts falls in train/test.
+    - PnL is sum of pnl_gross_bp for trades whose close_ts falls inside
+      the TRAIN window [train_start, train_end].
+    - n_trades_train is the number of such trades.
     """
-    # PnL by bucket
-    if pnl_by is None or pnl_by.empty:
-        train_pnl_cash = 0.0
-        test_pnl_cash = 0.0
-    else:
-        buckets = pd.to_datetime(pnl_by["bucket"], utc=False, errors="coerce")
-        pnl_vals = pnl_by["pnl_cash"].astype(float)
+    if (
+        pos_df is None
+        or pos_df.empty
+        or "close_ts" not in pos_df.columns
+        or "pnl_gross_bp" not in pos_df.columns
+    ):
+        return {
+            "train_pnl_bp": 0.0,
+            "n_trades_train": 0,
+        }
 
-        train_mask = (buckets >= split.train_start) & (buckets <= split.train_end)
-        test_mask = (buckets >= split.test_start) & (buckets <= split.test_end)
+    close_ts = pd.to_datetime(pos_df["close_ts"], utc=False, errors="coerce")
+    mask_train = (close_ts >= split.train_start) & (close_ts <= split.train_end)
 
-        train_pnl_cash = float(pnl_vals[train_mask].sum())
-        test_pnl_cash = float(pnl_vals[test_mask].sum())
-
-    # Trade counts by close_ts
-    if pos_df is None or pos_df.empty or "close_ts" not in pos_df.columns:
-        n_trades_train = 0
-        n_trades_test = 0
-    else:
-        close_ts = pd.to_datetime(pos_df["close_ts"], utc=False, errors="coerce")
-
-        train_trades_mask = (close_ts >= split.train_start) & (close_ts <= split.train_end)
-        test_trades_mask = (close_ts >= split.test_start) & (close_ts <= split.test_end)
-
-        n_trades_train = int(train_trades_mask.sum())
-        n_trades_test = int(test_trades_mask.sum())
+    train_pnl_bp = float(pos_df.loc[mask_train, "pnl_gross_bp"].sum())
+    n_trades_train = int(mask_train.sum())
 
     return {
-        "train_pnl_cash": train_pnl_cash,
-        "test_pnl_cash": test_pnl_cash,
+        "train_pnl_bp": train_pnl_bp,
         "n_trades_train": n_trades_train,
-        "n_trades_test": n_trades_test,
     }
 
 
 # ======================================================================
-# 5) Worker function for parallel evaluation
+# 4) Core worker: evaluate one (split, params) combo
 # ======================================================================
 
 def _eval_param_combo_for_split(
@@ -309,15 +303,16 @@ def _eval_param_combo_for_split(
     Evaluate a single param tuple on a single split:
 
       - Set params in cr_config.
-      - Run run_all on train+test months in overlay mode.
-      - Compute train/test metrics.
+      - Run portfolio_test_new.run_all on train+test months in overlay mode.
+      - Compute *train* metrics in bps only.
       - Return a result row dict.
     """
-    # Local snapshot/restore within worker for safety
+    decision_freq = decision_freq.upper()
     snap = _snapshot_cr_params()
     try:
         _apply_param_tuple_to_cr(z_entry, z_exit, z_stop, max_hold_days)
 
+        # Train + test months so that positions can bleed into test window.
         months_span = split.train_yymms + split.test_yymms
 
         pos_df, led_df, pnl_by = pt.run_all(
@@ -327,10 +322,10 @@ def _eval_param_combo_for_split(
             force_close_end=False,
             mode="overlay",
             hedge_df=hedge_df,
-            overlay_use_caps=None,  # uses cr_config caps if any
+            overlay_use_caps=None,
         )
 
-        metrics = _compute_train_test_metrics(pos_df, pnl_by, split)
+        metrics = _compute_train_metrics_bp(pos_df, split)
 
         row = {
             "split_id": split.split_id,
@@ -344,10 +339,8 @@ def _eval_param_combo_for_split(
             "z_exit": float(z_exit),
             "z_stop": float(z_stop),
             "max_hold_days": int(max_hold_days),
-            "train_pnl_cash": metrics["train_pnl_cash"],
-            "test_pnl_cash": metrics["test_pnl_cash"],
+            "train_pnl_bp": metrics["train_pnl_bp"],
             "n_trades_train": metrics["n_trades_train"],
-            "n_trades_test": metrics["n_trades_test"],
         }
         return row
     finally:
@@ -355,7 +348,7 @@ def _eval_param_combo_for_split(
 
 
 # ======================================================================
-# 6) Main driver: overlay grid search
+# 5) Top-level grid search driver
 # ======================================================================
 
 def run_overlay_grid_search_from_portfolio(
@@ -365,42 +358,43 @@ def run_overlay_grid_search_from_portfolio(
     z_stop_grid: Iterable[float],
     max_hold_grid: Iterable[int],
     *,
-    yymms: Optional[List[str]] = None,
     decision_freq: str | None = None,
     train_months: int = 6,
     test_months: int = 3,
     step_months: int = 3,
-    min_test_months: int = 2,
-    n_jobs: int = 1,
-    out_name: Optional[str] = None,
+    min_test_months: int = 1,
+    out_name: str | None = None,
 ) -> pd.DataFrame:
     """
-    Main grid-search driver using portfolio_test_new in overlay mode.
+    Main overlay TSCV driver (train-only, bps-based):
+
+      - Discover available yymms from enhanced.
+      - Build monthly train/test splits.
+      - For each split and param tuple, run portfolio_test_new.run_all
+        on train+test months in overlay mode using hedge_df.
+      - Compute *train* PnL in bps and train trade count.
+      - Return a DataFrame with one row per (split, param) combo and optional
+        parquet dump to PATH_OUT/out_name.parquet.
 
     Arguments:
-      hedge_df       : trade tape (synthetic or real) with columns expected by prepare_hedge_tape
-                       (side, instrument, EqVolDelta, tradetimeUTC, plus any *_mid curve cols
-                        already attached).
-      z_entry_grid   : iterable of candidate Z_ENTRY thresholds.
-      z_exit_grid    : iterable of candidate Z_EXIT thresholds.
-      z_stop_grid    : iterable of candidate Z_STOP thresholds.
-      max_hold_grid  : iterable of candidate MAX_HOLD_DAYS.
-      yymms          : optional explicit list of months; if None, discovered from PATH_ENH.
-      decision_freq  : 'D' or 'H'; typically 'D' here.
-      train_months   : number of months in each train window (max; last split may be shorter).
-      test_months    : number of months in each test window (desired).
-      step_months    : how many months to shift between splits.
-      min_test_months: minimum test months required for a split (default 2).
-      n_jobs         : number of processes for parallel evaluation (1 = sequential).
-      out_name       : if provided, write results to PATH_OUT/{out_name}{OUT_SUFFIX}.parquet.
-
-    Returns:
-      DataFrame with one row per (split, param) combination.
+      hedge_df      : full trade tape (side, instrument, EqVolDelta, tradetimeUTC, plus *_mid cols)
+      z_entry_grid  : candidate z_entry thresholds
+      z_exit_grid   : candidate z_exit thresholds
+      z_stop_grid   : candidate z_stop thresholds
+      max_hold_grid : candidate max_hold_days
+      decision_freq : 'D' or 'H' (use 'D' for your daily overlay calibration)
+      train_months  : number of months in each train window
+      test_months   : number of months in each test window
+      step_months   : how far to roll the window between splits
+      min_test_months: require at least this many test months for a split
+      out_name      : base filename (without suffix) for parquet; if None, no write.
     """
-    decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
-    if yymms is None:
-        yymms = discover_yymms_from_enh()
+    if hedge_df is None or hedge_df.empty:
+        raise ValueError("run_overlay_grid_search_from_portfolio requires a non-empty hedge_df.")
 
+    decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
+
+    yymms = discover_yymms_from_enhanced()
     splits = build_overlay_splits_from_yymms(
         yymms,
         train_months=train_months,
@@ -409,81 +403,37 @@ def run_overlay_grid_search_from_portfolio(
         min_test_months=min_test_months,
     )
     if not splits:
-        raise RuntimeError("No valid overlay splits constructed; check train/test/step parameters.")
+        raise RuntimeError("No valid overlay splits constructed; check train/test/step months.")
 
-    # Snapshot current cr_config params once at top-level (for main process)
-    base_snap = _snapshot_cr_params()
+    results: List[Dict] = []
 
-    results: List[Dict[str, object]] = []
+    for split in splits:
+        print(
+            f"[SPLIT {split.split_id}] "
+            f"train {split.train_yymms} ({split.train_start.date()} → {split.train_end.date()}) | "
+            f"test {split.test_yymms} ({split.test_start.date()} → {split.test_end.date()})"
+        )
 
-    try:
-        # Build all tasks
-        tasks = []
-        for s in splits:
-            for ze in z_entry_grid:
-                for zx in z_exit_grid:
-                    for zs in z_stop_grid:
-                        for mh in max_hold_grid:
-                            tasks.append((s, float(ze), float(zx), float(zs), int(mh)))
-
-        if n_jobs == 1:
-            # Sequential
-            for (s, ze, zx, zs, mh) in tasks:
-                print(
-                    f"[SPLIT {s.split_id}] "
-                    f"params: z_entry={ze}, z_exit={zx}, z_stop={zs}, max_hold_days={mh}"
-                )
-                row = _eval_param_combo_for_split(
-                    s,
-                    hedge_df=hedge_df,
-                    z_entry=ze,
-                    z_exit=zx,
-                    z_stop=zs,
-                    max_hold_days=mh,
-                    decision_freq=decision_freq,
-                )
-                results.append(row)
-        else:
-            # Parallel with ProcessPoolExecutor
-            # Note: cr_config is imported in each worker process; we still snapshot/restore there.
-            with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-                future_to_task = {
-                    ex.submit(
-                        _eval_param_combo_for_split,
-                        s,
-                        hedge_df,
-                        ze,
-                        zx,
-                        zs,
-                        mh,
-                        decision_freq,
-                    ): (s.split_id, ze, zx, zs, mh)
-                    for (s, ze, zx, zs, mh) in tasks
-                }
-
-                for fut in as_completed(future_to_task):
-                    split_id, ze, zx, zs, mh = future_to_task[fut]
-                    try:
-                        row = fut.result()
+        for ze in z_entry_grid:
+            for zx in z_exit_grid:
+                for zs in z_stop_grid:
+                    for mh in max_hold_grid:
+                        row = _eval_param_combo_for_split(
+                            split=split,
+                            hedge_df=hedge_df,
+                            z_entry=float(ze),
+                            z_exit=float(zx),
+                            z_stop=float(zs),
+                            max_hold_days=int(mh),
+                            decision_freq=decision_freq,
+                        )
                         results.append(row)
-                        print(
-                            f"[DONE] split={split_id}, "
-                            f"z_entry={ze}, z_exit={zx}, z_stop={zs}, max_hold_days={mh}"
-                        )
-                    except Exception as e:
-                        print(
-                            f"[ERROR] split={split_id}, params=({ze},{zx},{zs},{mh}): {e}"
-                        )
-
-    finally:
-        # Ensure we restore base cr_config params in the main process
-        _restore_cr_params(base_snap)
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
         res_df = res_df.sort_values(
-            ["split_id", "test_pnl_cash", "train_pnl_cash"],
-            ascending=[True, False, False],
+            ["split_id", "train_pnl_bp"],
+            ascending=[True, False],
         )
 
     if out_name:
@@ -499,55 +449,39 @@ def run_overlay_grid_search_from_portfolio(
 
 
 # ======================================================================
-# 7) CLI example
+# 6) CLI example
 # ======================================================================
 
 if __name__ == "__main__":
-    # Example usage with synthetic tape:
-    #   - Assumes you have a synthetic trades file like 'trades_synth.pkl'
-    #     in the working directory (adjust as needed).
-    synth_path = Path("trades_synth.pkl")
-    if not synth_path.exists():
-        raise FileNotFoundError(
-            f"Synthetic trades file not found: {synth_path} "
-            "(adjust path in overlay_tscv_from_portfolio.py __main__)."
-        )
+    # Example usage:
+    #   python overlay_tscv.py  (expects cr.TRADE_TYPES.pkl to exist)
+    trades_path = Path(f"{cr.TRADE_TYPES}.pkl")
+    if not trades_path.exists():
+        raise FileNotFoundError(f"Trade tape pickle not found: {trades_path}")
+    hedge_df = pd.read_pickle(trades_path)
 
-    hedge_df_synth = pd.read_pickle(synth_path)
-
-    # Small example grid – replace with your real search space
-    z_entry_grid = [0.75, 1.0, 1.25]
-    z_exit_grid = [0.30, 0.40]
+    # Small example grid – you’ll likely tighten/expand this in practice
+    z_entry_grid = [0.75, 1.0]
+    z_exit_grid = [0.25, 0.40]
     z_stop_grid = [1.5, 2.0]
-    max_hold_grid = [5, 9]
-
-    # Discover months and build splits (6m train, 3m test, rolling every 3m)
-    yymms = discover_yymms_from_enh()
-    describe_overlay_splits(
-        yymms,
-        train_months=6,
-        test_months=3,
-        step_months=3,
-        min_test_months=2,
-    )
+    max_hold_grid = [5, 10]
 
     df_res = run_overlay_grid_search_from_portfolio(
-        hedge_df=hedge_df_synth,
+        hedge_df=hedge_df,
         z_entry_grid=z_entry_grid,
         z_exit_grid=z_exit_grid,
         z_stop_grid=z_stop_grid,
         max_hold_grid=max_hold_grid,
-        yymms=yymms,
         decision_freq="D",
         train_months=6,
         test_months=3,
         step_months=3,
-        min_test_months=2,
-        n_jobs=1,  # bump this if you want parallel evaluation
+        min_test_months=1,
         out_name="overlay_grid_synth",
     )
 
-    # Show best params per split by test_pnl_cash
-    best_per_split = df_res.groupby("split_id").head(1)
-    print("\nBest params per split (by test_pnl_cash):")
-    print(best_per_split)
+    # Best combo per split by TRAIN PnL in bps
+    if not df_res.empty:
+        best_per_split = df_res.groupby("split_id").head(1)
+        print("\nBest params per split (by train_pnl_bp):")
+        print(best_per_split)
