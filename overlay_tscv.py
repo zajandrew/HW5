@@ -22,13 +22,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Iterable, Optional
+from typing import List, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cr_config as cr
 import portfolio_test_new as pt
+
+
+# ======================================================================
+# 0) Global hedge tape for worker processes
+# ======================================================================
+
+_GLOBAL_HEDGE_DF: Optional[pd.DataFrame] = None
+
+
+def _init_worker(hedge_df: pd.DataFrame) -> None:
+    """
+    Initializer for worker processes: store hedge_df in a module-level
+    global so we don't pickle it for every task.
+    """
+    global _GLOBAL_HEDGE_DF
+    _GLOBAL_HEDGE_DF = hedge_df
 
 
 # ======================================================================
@@ -86,7 +103,7 @@ def discover_yymms_from_enhanced() -> List[str]:
     return yymms
 
 
-def _yymm_to_month_bounds(yymm: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+def _yymm_to_month_bounds(yymm: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
     """
     Given 'yymm' (e.g. '2304'), return (month_start, month_end) as Timestamps
     in the local calendar (no timezone).
@@ -292,12 +309,12 @@ def _compute_train_metrics_bp(
 
 def _eval_param_combo_for_split(
     split: OverlaySplitSpec,
-    hedge_df: pd.DataFrame,
     z_entry: float,
     z_exit: float,
     z_stop: float,
     max_hold_days: int,
     decision_freq: str,
+    hedge_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, object]:
     """
     Evaluate a single param tuple on a single split:
@@ -306,8 +323,21 @@ def _eval_param_combo_for_split(
       - Run portfolio_test_new.run_all on train+test months in overlay mode.
       - Compute *train* metrics in bps only.
       - Return a result row dict.
+
+    If hedge_df is None, we use the module-global _GLOBAL_HEDGE_DF
+    (for use with ProcessPoolExecutor + initializer).
     """
+    global _GLOBAL_HEDGE_DF
+
     decision_freq = decision_freq.upper()
+    if hedge_df is None:
+        hedge_df_local = _GLOBAL_HEDGE_DF
+    else:
+        hedge_df_local = hedge_df
+
+    if hedge_df_local is None or hedge_df_local.empty:
+        raise ValueError("_eval_param_combo_for_split requires a non-empty hedge_df.")
+
     snap = _snapshot_cr_params()
     try:
         _apply_param_tuple_to_cr(z_entry, z_exit, z_stop, max_hold_days)
@@ -321,7 +351,7 @@ def _eval_param_combo_for_split(
             carry=True,
             force_close_end=False,
             mode="overlay",
-            hedge_df=hedge_df,
+            hedge_df=hedge_df_local,
             overlay_use_caps=None,
         )
 
@@ -348,7 +378,7 @@ def _eval_param_combo_for_split(
 
 
 # ======================================================================
-# 5) Top-level grid search driver
+# 5) Top-level grid search driver (with optional parallelism)
 # ======================================================================
 
 def run_overlay_grid_search_from_portfolio(
@@ -364,6 +394,7 @@ def run_overlay_grid_search_from_portfolio(
     step_months: int = 3,
     min_test_months: int = 1,
     out_name: str | None = None,
+    n_jobs: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Main overlay TSCV driver (train-only, bps-based):
@@ -375,6 +406,10 @@ def run_overlay_grid_search_from_portfolio(
       - Compute *train* PnL in bps and train trade count.
       - Return a DataFrame with one row per (split, param) combo and optional
         parquet dump to PATH_OUT/out_name.parquet.
+
+    Parallelism:
+      - If n_jobs is None or 1: run serially.
+      - If n_jobs > 1: use ProcessPoolExecutor with a global hedge_df per worker.
 
     Arguments:
       hedge_df      : full trade tape (side, instrument, EqVolDelta, tradetimeUTC, plus *_mid cols)
@@ -388,6 +423,7 @@ def run_overlay_grid_search_from_portfolio(
       step_months   : how far to roll the window between splits
       min_test_months: require at least this many test months for a split
       out_name      : base filename (without suffix) for parquet; if None, no write.
+      n_jobs        : number of worker processes (None/1 = serial, >1 = parallel).
     """
     if hedge_df is None or hedge_df.empty:
         raise ValueError("run_overlay_grid_search_from_portfolio requires a non-empty hedge_df.")
@@ -405,29 +441,68 @@ def run_overlay_grid_search_from_portfolio(
     if not splits:
         raise RuntimeError("No valid overlay splits constructed; check train/test/step months.")
 
-    results: List[Dict] = []
-
+    # Build task list: one task per (split, param tuple)
+    tasks: List[Tuple[OverlaySplitSpec, float, float, float, int]] = []
     for split in splits:
         print(
             f"[SPLIT {split.split_id}] "
             f"train {split.train_yymms} ({split.train_start.date()} → {split.train_end.date()}) | "
             f"test {split.test_yymms} ({split.test_start.date()} → {split.test_end.date()})"
         )
-
         for ze in z_entry_grid:
             for zx in z_exit_grid:
                 for zs in z_stop_grid:
                     for mh in max_hold_grid:
-                        row = _eval_param_combo_for_split(
-                            split=split,
-                            hedge_df=hedge_df,
-                            z_entry=float(ze),
-                            z_exit=float(zx),
-                            z_stop=float(zs),
-                            max_hold_days=int(mh),
-                            decision_freq=decision_freq,
+                        tasks.append(
+                            (
+                                split,
+                                float(ze),
+                                float(zx),
+                                float(zs),
+                                int(mh),
+                            )
                         )
-                        results.append(row)
+
+    results: List[Dict] = []
+
+    # Serial path
+    if n_jobs is None or n_jobs == 1:
+        for split, ze, zx, zs, mh in tasks:
+            row = _eval_param_combo_for_split(
+                split=split,
+                z_entry=ze,
+                z_exit=zx,
+                z_stop=zs,
+                max_hold_days=mh,
+                decision_freq=decision_freq,
+                hedge_df=hedge_df,
+            )
+            results.append(row)
+    else:
+        # Parallel path
+        max_workers = n_jobs if n_jobs > 0 else None
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=(hedge_df,),
+        ) as ex:
+            futures = []
+            for split, ze, zx, zs, mh in tasks:
+                fut = ex.submit(
+                    _eval_param_combo_for_split,
+                    split,
+                    ze,
+                    zx,
+                    zs,
+                    mh,
+                    decision_freq,
+                    None,  # hedge_df -> use global in worker
+                )
+                futures.append(fut)
+
+            for fut in as_completed(futures):
+                row = fut.result()
+                results.append(row)
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
@@ -478,6 +553,7 @@ if __name__ == "__main__":
         step_months=3,
         min_test_months=1,
         out_name="overlay_grid_synth",
+        n_jobs=4,  # <-- bump this up/down as you like
     )
 
     # Best combo per split by TRAIN PnL in bps
