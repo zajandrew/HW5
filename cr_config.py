@@ -100,6 +100,7 @@ SHOCK_REGRESSION_COLS   = [      # Columns from hybrid_signals to regress agains
     "z_xs_mean_roll_z"
 ]
 SHOCK_METRIC_TYPE       = "BPS"  # "BPS" or "CASH"
+SHOCK_MODE              = "ROLL_OFF" #"ROLL_OFF" or "EXIT_ALL"
 
 # ========= Risk & selection =========
 BUCKETS = {
