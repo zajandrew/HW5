@@ -11,6 +11,7 @@ from pandas.tseries.offsets import MonthEnd
 
 # All config access via module namespace
 import cr_config as cr
+from hybrid_filter import ShockConfig
 
 # ------------------------
 # Utilities / conventions
@@ -679,20 +680,19 @@ def run_month(
     yymm: str,
     *,
     decision_freq: str | None = None,
-    open_positions: Optional[List[PairPos]] | None = None,   # carry-in
+    open_positions: Optional[List[PairPos]] | None = None,
     carry_in: bool = True,
-    mode: str = "strategy",                                  # "strategy" or "overlay"
+    mode: str = "strategy",
     hedges: Optional[pd.DataFrame] = None,
-    overlay_use_caps: Optional[bool] = None,                 # kept for signature; not used
+    overlay_use_caps: Optional[bool] = None,
+    
+    # --- NEW ARGUMENTS ---
+    regime_mask: Optional[pd.Series] = None,       # Exogenous Curve Filter
+    hybrid_signals: Optional[pd.DataFrame] = None, # Required for Endogenous Regression
+    shock_cfg: Optional[ShockConfig] = None,       # Config for Endogenous Filter
 ):
     """
-    Run a single month.
-
-    mode="strategy": use cheap–rich selector (Mode A).
-    mode="overlay" : open pairs driven by hedge tape (hedges df) as an overlay.
-
-    Returns: (closed_positions_df, ledger_df, pnl_by_df, open_positions_out)
-    where open_positions_out are the still-open positions to carry into next month.
+    Run a single month with integrated Regime and Endogenous PnL Shock filtering.
     """
     import math
 
@@ -712,7 +712,7 @@ def run_month(
     if missing:
         raise ValueError(f"{enh_path} missing columns: {missing}")
 
-    # Decision buckets & decisions-per-day
+    # Decision buckets
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     if decision_freq == "D":
         df["decision_ts"] = df["ts"].dt.floor("d")
@@ -726,7 +726,7 @@ def run_month(
 
     base_max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
 
-    # DV01-scaled max-hold for overlay positions
+    # --- Overlay/Strategy Config ---
     OVERLAY_MAX_HOLD_DV01_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_MED", 20_000.0))
     OVERLAY_MAX_HOLD_DV01_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_HI", 50_000.0))
     OVERLAY_MAX_HOLD_DAYS_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_MED", 5.0))
@@ -735,14 +735,11 @@ def run_month(
     def _overlay_max_hold_decisions(dv01_cash: float) -> int:
         dv = abs(float(dv01_cash))
         if dv >= OVERLAY_MAX_HOLD_DV01_HI:
-            days = OVERLAY_MAX_HOLD_DAYS_HI
+            return int(round(OVERLAY_MAX_HOLD_DAYS_HI * decisions_per_day))
         elif dv >= OVERLAY_MAX_HOLD_DV01_MED:
-            days = OVERLAY_MAX_HOLD_DAYS_MED
-        else:
-            days = float(cr.MAX_HOLD_DAYS)
-        return int(round(days * decisions_per_day))
+            return int(round(OVERLAY_MAX_HOLD_DAYS_MED * decisions_per_day))
+        return int(round(float(cr.MAX_HOLD_DAYS) * decisions_per_day))
 
-    # DV01-scaled overlay Z-entry config
     BASE_Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
     Z_REF = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_REF", 5_000.0))
     Z_K = float(getattr(cr, "OVERLAY_Z_ENTRY_DV01_K", 0.0))
@@ -753,28 +750,37 @@ def run_month(
             return BASE_Z_ENTRY
         return BASE_Z_ENTRY + Z_K * math.log(dv / Z_REF)
 
-    # Overlay DV01 caps
     OVERLAY_DV01_CAP_PER_TRADE = float(getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE", float("inf")))
-    OVERLAY_DV01_CAP_PER_TRADE_BUCKET = dict(
-        getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE_BUCKET", {})
-    )
+    OVERLAY_DV01_CAP_PER_TRADE_BUCKET = dict(getattr(cr, "OVERLAY_DV01_CAP_PER_TRADE_BUCKET", {}))
     OVERLAY_DV01_TS_CAP = float(getattr(cr, "OVERLAY_DV01_TS_CAP", float("inf")))
 
     def _per_trade_dv01_cap_for_bucket(bucket: str) -> float:
-        bucket_caps = OVERLAY_DV01_CAP_PER_TRADE_BUCKET
-        if bucket in bucket_caps:
-            return float(bucket_caps[bucket])
-        if "other" in bucket_caps:
-            return float(bucket_caps["other"])
-        return OVERLAY_DV01_CAP_PER_TRADE
+        return float(OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get("other", OVERLAY_DV01_CAP_PER_TRADE)))
 
-    # Optional pnl stop (bps)
     BPS_PNL_STOP = float(getattr(cr, "BPS_PNL_STOP", 0.0))
+
+    # --- Shock Filter Setup ---
+    daily_pnl_history: list[float] = [] 
+    daily_pnl_dates: list[pd.Timestamp] = []
+    shock_block_remaining = 0
+    
+    # Determine valid regression columns from hybrid_signals
+    valid_reg_cols = []
+    sig_lookup = pd.DataFrame()
+    if shock_cfg is not None:
+        if hybrid_signals is not None:
+            if "decision_ts" in hybrid_signals.columns:
+                sig_lookup = hybrid_signals.set_index("decision_ts").sort_index()
+            else:
+                sig_lookup = hybrid_signals
+            
+            if shock_cfg.regression_cols:
+                valid_reg_cols = [c for c in shock_cfg.regression_cols if c in sig_lookup.columns]
 
     # Carry-in
     open_positions = (open_positions or []) if carry_in else []
 
-    # Filter hedges for the decision_ts that actually exist in this month
+    # Filter hedges
     if mode == "overlay" and hedges is not None and not hedges.empty:
         valid_decisions = df["decision_ts"].dropna().unique()
         hedges = hedges[hedges["decision_ts"].isin(valid_decisions)].copy()
@@ -784,7 +790,7 @@ def run_month(
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
 
-    # Strategy caps (unchanged)
+    # Standard Strategy Params
     PER_BUCKET_DV01_CAP = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
     TOTAL_DV01_CAP = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
     FRONT_END_DV01_CAP = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
@@ -806,61 +812,50 @@ def run_month(
         if snap_last.empty:
             continue
 
-        # 1) Mark & evaluate exits on any open (carried + this month’s)
+        # ----------------------------------------------------------
+        # 1) Mark positions & Calculate Period PnL
+        # ----------------------------------------------------------
+        period_pnl_cash = 0.0
         still_open: list[PairPos] = []
+        
         for pos in open_positions:
-            # PASS decision_ts so overlay DV01 aging uses calendar days
+            # Capture PnL state before mark
+            prev_pnl = pos.pnl_cash
+            
+            # Mark (updates internal pnl_cash)
             zsp = pos.mark(snap_last, decision_ts=dts)
-            entry_z = pos.entry_zspread
+            
+            # Add incremental PnL
+            period_pnl_cash += (pos.pnl_cash - prev_pnl)
 
+            entry_z = pos.entry_zspread
             exit_flag = None
 
             if np.isfinite(zsp) and np.isfinite(entry_z):
-                # Directional z at entry / current (cheap–rich space)
                 entry_dir = getattr(pos, "entry_z_dir", pos.dir_sign * entry_z)
                 curr_dir = getattr(pos, "last_z_dir", pos.dir_sign * zsp)
 
                 if np.isfinite(entry_dir) and np.isfinite(curr_dir):
                     sign_entry = np.sign(entry_dir)
                     sign_curr = np.sign(curr_dir)
-
                     same_side = (sign_entry != 0) and (sign_entry == sign_curr)
-
-                    # Has z moved toward zero relative to entry?
                     moved_towards_zero = abs(curr_dir) <= abs(entry_dir)
-
-                    # Is current z inside the exit band?
                     within_exit_band = abs(curr_dir) <= Z_EXIT
-
-                    # Directional change from entry
                     dz_dir = curr_dir - entry_dir
-                    moved_away = (
-                        same_side
-                        and (abs(curr_dir) >= abs(entry_dir))
-                        and (abs(dz_dir) >= Z_STOP)
-                    )
+                    moved_away = same_side and (abs(curr_dir) >= abs(entry_dir)) and (abs(dz_dir) >= Z_STOP)
 
-                    # 1) Reversion: same side of zero, closer to zero, inside exit band
                     if same_side and moved_towards_zero and within_exit_band:
                         exit_flag = "reversion"
-                    # 2) Stop: same side, but materially further from zero than entry
                     elif moved_away:
                         exit_flag = "stop"
 
-            # PnL-based hard stop in bps (unchanged)
             if exit_flag is None and BPS_PNL_STOP > 0.0:
-                pnl_bp = float(getattr(pos, "pnl_bp", np.nan))
-                if np.isfinite(pnl_bp) and pnl_bp <= -BPS_PNL_STOP:
+                if np.isfinite(pos.pnl_bp) and pos.pnl_bp <= -BPS_PNL_STOP:
                     exit_flag = "pnl_stop"
 
-            # 3) Max-hold if nothing else triggered
             if exit_flag is None:
-                if pos.mode == "overlay":
-                    eff_max_hold_decisions = _overlay_max_hold_decisions(pos.scale_dv01)
-                else:
-                    eff_max_hold_decisions = base_max_hold_decisions
-
-                if pos.age_decisions >= eff_max_hold_decisions:
+                limit = _overlay_max_hold_decisions(pos.scale_dv01) if pos.mode == "overlay" else base_max_hold_decisions
+                if pos.age_decisions >= limit:
                     exit_flag = "max_hold"
 
             if exit_flag is not None:
@@ -868,332 +863,203 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
-            # Ledger mark (pnl in bps and cash) + entry/current rates + leg dirs + DV01s
+            # Ledger logging
             ledger_rows.append({
-                "decision_ts": dts,
-                "event": "mark",
-                "tenor_i": pos.tenor_i,
-                "tenor_j": pos.tenor_j,
-                "w_i": pos.w_i,
-                "w_j": pos.w_j,
-                "leg_dir_i": float(np.sign(pos.w_i)),
-                "leg_dir_j": float(np.sign(pos.w_j)),
-                "entry_rate_i": pos.entry_rate_i,
-                "entry_rate_j": pos.entry_rate_j,
-                "rate_i": getattr(pos, "last_rate_i", np.nan),
-                "rate_j": getattr(pos, "last_rate_j", np.nan),
-                "dv01_i_entry": pos.dv01_i_entry,
-                "dv01_j_entry": pos.dv01_j_entry,
-                "dv01_i_curr": pos.dv01_i_curr,
-                "dv01_j_curr": pos.dv01_j_curr,
-                "rem_tenor_i": pos.rem_tenor_i,
-                "rem_tenor_j": pos.rem_tenor_j,
-                "initial_dv01": pos.initial_dv01,
-                "pnl_bp": pos.pnl_bp,
-                "pnl_cash": pos.pnl_cash,
-                "z_spread": zsp,
-                "conv_proxy": pos.conv_pnl_proxy,
-                "open_ts": pos.open_ts,
-                "closed": pos.closed,
-                "exit_reason": pos.exit_reason,
-                "mode": pos.mode,
-                "scale_dv01": pos.scale_dv01,
+                "decision_ts": dts, "event": "mark",
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
+                "z_spread": zsp, "closed": pos.closed, "mode": pos.mode
             })
 
             if pos.closed:
-                # Transaction cost only for overlay mode
-                if pos.mode == "overlay":
-                    tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
-                    tcost_cash = tcost_bp * pos.scale_dv01
-                else:
-                    tcost_bp = 0.0
-                    tcost_cash = 0.0
+                tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10)) if pos.mode == "overlay" else 0.0
+                tcost_cash = tcost_bp * pos.scale_dv01
+                
                 pos.tcost_bp = tcost_bp
                 pos.tcost_cash = tcost_cash
+                
+                # Deduct transaction cost from period PnL
+                period_pnl_cash -= tcost_cash
 
                 closed_rows.append({
-                    "open_ts": pos.open_ts,
-                    "close_ts": pos.close_ts,
-                    "exit_reason": pos.exit_reason,
-                    "tenor_i": pos.tenor_i,
-                    "tenor_j": pos.tenor_j,
-                    "w_i": pos.w_i,
-                    "w_j": pos.w_j,
-                    "leg_dir_i": float(np.sign(pos.w_i)),
-                    "leg_dir_j": float(np.sign(pos.w_j)),
-                    "entry_rate_i": pos.entry_rate_i,
-                    "entry_rate_j": pos.entry_rate_j,
-                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
-                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
-                    "dv01_i_entry": pos.dv01_i_entry,
-                    "dv01_j_entry": pos.dv01_j_entry,
-                    "dv01_i_close": pos.dv01_i_curr,
-                    "dv01_j_close": pos.dv01_j_curr,
-                    "initial_dv01": pos.initial_dv01,
-                    "entry_zspread": pos.entry_zspread,
-                    "pnl_gross_bp": pos.pnl_bp,
-                    "pnl_gross_cash": pos.pnl_cash,
-                    "tcost_bp": tcost_bp,
-                    "tcost_cash": tcost_cash,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp,
-                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    "days_held_equiv": pos.age_decisions / decisions_per_day,
-                    "conv_proxy": pos.conv_pnl_proxy,
-                    "mode": pos.mode,
-                    "scale_dv01": pos.scale_dv01,
+                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "mode": pos.mode, "scale_dv01": pos.scale_dv01
                 })
             else:
                 still_open.append(pos)
 
         open_positions = still_open
 
-        # 2) New entries under caps / hedge overlay
+        # ----------------------------------------------------------
+        # 2) Update Endogenous Shock State
+        # ----------------------------------------------------------
+        daily_pnl_history.append(period_pnl_cash)
+        daily_pnl_dates.append(dts)
+
+        is_shock_blocked = False
+        if shock_block_remaining > 0:
+            is_shock_blocked = True
+            shock_block_remaining -= 1
+        
+        # Check for new shocks if config enabled
+        if shock_cfg is not None:
+            win = int(shock_cfg.pnl_window)
+            if len(daily_pnl_history) >= win + 2:
+                # Slice recent PnL
+                pnl_slice = np.array(daily_pnl_history[-win:])
+                
+                # A) Raw PnL Z-Score
+                if shock_cfg.use_raw_pnl:
+                    mu = np.mean(pnl_slice)
+                    sd = np.std(pnl_slice, ddof=1)
+                    if sd > 1e-9:
+                        last_z = (pnl_slice[-1] - mu) / sd
+                        if last_z <= shock_cfg.raw_pnl_z_thresh:
+                            shock_block_remaining = int(shock_cfg.block_length)
+                            is_shock_blocked = True
+
+                # B) Residual Z-Score (Endogenous Regression)
+                # Check only if not already triggered and residuals enabled
+                if shock_cfg.use_residuals and not is_shock_blocked and valid_reg_cols:
+                    rel_dates = daily_pnl_dates[-win:]
+                    # Try/Except for alignment safety
+                    try:
+                        # Grab signal slice
+                        sig_slice = sig_lookup.loc[rel_dates, valid_reg_cols].values
+                        if len(sig_slice) == len(pnl_slice):
+                            # OLS: Y = Xb + e
+                            X = np.column_stack([np.ones(len(sig_slice)), sig_slice])
+                            Y = pnl_slice
+                            
+                            beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+                            y_hat = X @ beta
+                            resid = Y - y_hat
+                            
+                            r_mu = np.mean(resid)
+                            r_sd = np.std(resid, ddof=1)
+                            if r_sd > 1e-9:
+                                last_r_z = (resid[-1] - r_mu) / r_sd
+                                if last_r_z <= shock_cfg.resid_z_thresh:
+                                    shock_block_remaining = int(shock_cfg.block_length)
+                                    is_shock_blocked = True
+                    except KeyError:
+                        pass # Date mismatch in signals, skip regression
+
+        # ----------------------------------------------------------
+        # 3) Gate New Entries (Exogenous + Endogenous)
+        # ----------------------------------------------------------
+        regime_ok = True
+        if regime_mask is not None:
+            if dts in regime_mask.index:
+                regime_ok = bool(regime_mask.at[dts])
+            else:
+                regime_ok = False 
+
+        if (not regime_ok) or is_shock_blocked:
+            # Gated: Skip entry logic
+            continue
+
+        # ----------------------------------------------------------
+        # 4) Entry Logic (Strategy / Overlay)
+        # ----------------------------------------------------------
         remaining_slots = max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions))
         if remaining_slots <= 0:
             continue
 
         if mode == "strategy":
-            # Mode A: cheap–rich selector (unchanged logic)
             selected = choose_pairs_under_caps(
-                snap_last=snap_last,
-                max_pairs=remaining_slots,
-                per_bucket_cap=PER_BUCKET_DV01_CAP,
-                total_cap=TOTAL_DV01_CAP,
-                front_end_cap=FRONT_END_DV01_CAP,
-                extra_z_entry=0.0  # short-end extra handled inside chooser using SHORT_END_EXTRA_Z
+                snap_last, remaining_slots, PER_BUCKET_DV01_CAP, TOTAL_DV01_CAP, FRONT_END_DV01_CAP, 0.0
             )
-
             for (cheap, rich, w_i, w_j) in selected:
-                t_i = _to_float(cheap["tenor_yrs"])
-                t_j = _to_float(rich["tenor_yrs"])
-                if (assign_bucket(t_i) == "short") or (assign_bucket(t_j) == "short"):
-                    zdisp = _to_float(cheap["z_comb"]) - _to_float(rich["z_comb"])
-                    if not np.isfinite(zdisp) or (zdisp < (Z_ENTRY + SHORT_END_EXTRA_Z)):
-                        continue
-
-                pos = PairPos(
-                    open_ts=dts,
-                    cheap_row=cheap,
-                    rich_row=rich,
-                    w_i=w_i,
-                    w_j=w_j,
-                    decisions_per_day=decisions_per_day,
-                    scale_dv01=1.0,
-                    mode="strategy",
-                    meta={},
-                )
+                t_i, t_j = _to_float(cheap["tenor_yrs"]), _to_float(rich["tenor_yrs"])
+                if (assign_bucket(t_i) == "short" or assign_bucket(t_j) == "short"):
+                    zd = _to_float(cheap["z_comb"]) - _to_float(rich["z_comb"])
+                    if zd < (Z_ENTRY + SHORT_END_EXTRA_Z): continue
+                
+                pos = PairPos(dts, cheap, rich, w_i, w_j, decisions_per_day, scale_dv01=1.0, mode="strategy")
                 open_positions.append(pos)
-                ledger_rows.append({
-                    "decision_ts": dts,
-                    "event": "open",
-                    "tenor_i": pos.tenor_i,
-                    "tenor_j": pos.tenor_j,
-                    "w_i": pos.w_i,
-                    "w_j": pos.w_j,
-                    "leg_dir_i": float(np.sign(pos.w_i)),
-                    "leg_dir_j": float(np.sign(pos.w_j)),
-                    "entry_rate_i": pos.entry_rate_i,
-                    "entry_rate_j": pos.entry_rate_j,
-                    "entry_zspread": pos.entry_zspread,
-                    "mode": pos.mode,
-                    "scale_dv01": pos.scale_dv01,
-                })
+                ledger_rows.append({"decision_ts": dts, "event": "open", "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j, "mode": "strategy"})
 
         elif mode == "overlay":
-            # Mode B: hedge overlay – open synthetic pairs driven by hedge tape
-            if hedges is None or hedges.empty:
-                continue
-
+            if hedges is None or hedges.empty: continue
             hedges_here = hedges[hedges["decision_ts"] == dts]
-            if hedges_here.empty:
-                continue
+            if hedges_here.empty: continue
+            
+            if float(hedges_here["dv01"].abs().sum()) > OVERLAY_DV01_TS_CAP: continue
 
-            # Per-timestamp DV01 gate: skip overlay on extreme-flow decisions
-            ts_dv01_sum = float(hedges_here["dv01"].abs().sum())
-            if ts_dv01_sum > OVERLAY_DV01_TS_CAP:
-                # Entire timestamp blocked by overlay TS cap
-                continue
-
-            snap_last_sorted = snap_last.sort_values("tenor_yrs").reset_index(drop=True)
-
+            snap_srt = snap_last.sort_values("tenor_yrs").reset_index(drop=True)
+            
             for _, h in hedges_here.iterrows():
-                if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS:
-                    break
-
+                if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS: break
+                
                 trade_tenor = float(h["tenor_yrs"])
-                if trade_tenor < MIN_LEG_TENOR:
-                    continue
-
-                side = str(h["side"]).upper()
+                if trade_tenor < MIN_LEG_TENOR: continue
+                
                 dv01_cash = float(h["dv01"])
-                trade_id = h.get("trade_id", None)
-                trade_ts = h.get("trade_ts", None)  # trade-time for curve entry
+                if abs(dv01_cash) > _per_trade_dv01_cap_for_bucket(assign_bucket(trade_tenor)): continue
 
-                if side == "CRCV":
-                    side_sign = +1.0
-                elif side == "CPAY":
-                    side_sign = -1.0
-                else:
-                    continue
-
-                dv_abs = abs(dv01_cash)
-                if dv_abs <= 0.0:
-                    continue
-
-                # Per-trade DV01 caps (global + bucket-specific)
-                bucket = assign_bucket(trade_tenor)
-                per_trade_cap = _per_trade_dv01_cap_for_bucket(bucket)
-                if dv_abs > OVERLAY_DV01_CAP_PER_TRADE or dv_abs > per_trade_cap:
-                    continue
-
-                # Effective Z-entry for this hedge
+                side_sign = 1.0 if str(h["side"]).upper() == "CRCV" else -1.0
                 z_entry_eff = _overlay_effective_z_entry(dv01_cash)
 
-                # Find executed tenor row (nearest)
-                exec_z = _get_z_at_tenor(snap_last_sorted, trade_tenor)
-                if exec_z is None or not np.isfinite(exec_z):
-                    continue
-                exec_row = snap_last_sorted.iloc[
-                    (snap_last_sorted["tenor_yrs"] - trade_tenor).abs().idxmin()
-                ]
+                # Executed Tenor Z
+                exec_z = _get_z_at_tenor(snap_srt, trade_tenor)
+                if exec_z is None: continue
+                exec_row = snap_srt.iloc[(snap_srt["tenor_yrs"] - trade_tenor).abs().idxmin()]
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                # Scan alternative tenors
-                best_candidate = None
-                best_zdisp = 0.0
-
-                for _, alt_row in snap_last_sorted.iterrows():
+                # Find Best Alt
+                best_cand = None
+                best_zd = 0.0
+                
+                for _, alt_row in snap_srt.iterrows():
                     alt_tenor = float(alt_row["tenor_yrs"])
-                    if alt_tenor == exec_tenor:
-                        continue
-
-                    if alt_tenor < MIN_LEG_TENOR:
-                        continue
-
-                    diff = abs(alt_tenor - exec_tenor)
-                    if diff < MIN_SEP_YEARS or diff > MAX_SPAN_YEARS:
-                        continue
-
+                    if alt_tenor == exec_tenor or alt_tenor < MIN_LEG_TENOR: continue
+                    if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
+                    
                     z_alt = _to_float(alt_row["z_comb"])
-                    if not np.isfinite(z_alt):
+                    zdisp = (z_alt - exec_z) if side_sign > 0 else (exec_z - z_alt)
+                    
+                    if zdisp < z_entry_eff: continue
+
+                    # Short end extra
+                    if (assign_bucket(alt_tenor)=="short" or assign_bucket(exec_tenor)=="short") and (zdisp < z_entry_eff + SHORT_END_EXTRA_Z):
+                        continue
+                    
+                    # Fly checks
+                    c_t, r_t = (alt_tenor, exec_tenor) if z_alt > exec_z else (exec_tenor, alt_tenor)
+                    if not (fly_alignment_ok(c_t, 1, snap_srt, zdisp_for_pair=zdisp) and fly_alignment_ok(r_t, -1, snap_srt, zdisp_for_pair=zdisp)):
                         continue
 
-                    if side == "CRCV":
-                        if z_alt <= exec_z:
-                            continue
-                        zdisp = z_alt - exec_z
-                    else:  # CPAY
-                        if z_alt >= exec_z:
-                            continue
-                        zdisp = exec_z - z_alt
+                    if zdisp > best_zd:
+                        best_zd = zdisp
+                        best_cand = (alt_row, exec_row)
 
-                    if zdisp < z_entry_eff:
-                        continue
+                if best_cand:
+                    alt_row, exec_row = best_cand
+                    
+                    # Try getting trade rates
+                    rate_i, rate_j = None, None
+                    ti, tj = tenor_to_ticker(float(alt_row["tenor_yrs"])), tenor_to_ticker(float(exec_row["tenor_yrs"]))
+                    if ti and f"{ti}_mid" in h: rate_i = _to_float(h[f"{ti}_mid"])
+                    if tj and f"{tj}_mid" in h: rate_j = _to_float(h[f"{tj}_mid"])
+                    
+                    pos = PairPos(dts, alt_row, exec_row, side_sign*1.0, side_sign*-1.0, decisions_per_day, scale_dv01=dv01_cash, mode="overlay",
+                                  meta={"trade_id": h.get("trade_id"), "side": h.get("side")}, entry_rate_i=rate_i, entry_rate_j=rate_j)
+                    open_positions.append(pos)
+                    ledger_rows.append({"decision_ts": dts, "event": "open", "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j, "mode": "overlay"})
 
-                    # Cheap/rich by z
-                    if z_alt > exec_z:
-                        cheap_tenor, rich_tenor = alt_tenor, exec_tenor
-                    else:
-                        cheap_tenor, rich_tenor = exec_tenor, alt_tenor
-
-                    # Short-end extra hurdle
-                    b_alt = assign_bucket(alt_tenor)
-                    b_exec = assign_bucket(exec_tenor)
-                    if (b_alt == "short" or b_exec == "short") and (zdisp < (z_entry_eff + SHORT_END_EXTRA_Z)):
-                        continue
-
-                    ok_i = fly_alignment_ok(cheap_tenor, +1.0, snap_last_sorted, zdisp_for_pair=zdisp)
-                    ok_j = fly_alignment_ok(rich_tenor, -1.0, snap_last_sorted, zdisp_for_pair=zdisp)
-                    if not (ok_i and ok_j):
-                        continue
-
-                    if zdisp > best_zdisp:
-                        best_zdisp = zdisp
-                        best_candidate = (alt_row, exec_row, z_alt, exec_z)
-
-                if best_candidate is None:
-                    continue
-
-                alt_row, exec_row, z_alt, z_exec = best_candidate
-                alt_tenor = float(alt_row["tenor_yrs"])
-                exec_tenor = float(exec_row["tenor_yrs"])
-
-                # --- trade-time entry rates from hedge tape curve snapshot ---
-                entry_rate_i = None
-                entry_rate_j = None
-
-                # Map tenors back to tickers and pull *_mid from hedge row
-                ticker_i = tenor_to_ticker(alt_tenor)
-                ticker_j = tenor_to_ticker(exec_tenor)
-
-                if ticker_i is not None:
-                    col_i = f"{ticker_i}_mid"
-                    if col_i in h:
-                        entry_rate_i = _to_float(h[col_i])
-                if ticker_j is not None:
-                    col_j = f"{ticker_j}_mid"
-                    if col_j in h:
-                        entry_rate_j = _to_float(h[col_j])
-
-                # Fallback: if for some reason we didn't get trade-time rates, use snapshot rates
-                if entry_rate_i is None or not np.isfinite(entry_rate_i):
-                    entry_rate_i = _to_float(alt_row["rate"])
-                if entry_rate_j is None or not np.isfinite(entry_rate_j):
-                    entry_rate_j = _to_float(exec_row["rate"])
-
-                # DV01-native unit pair (weights ±1), scaling via dv01_cash
-                w_alt = side_sign * 1.0
-                w_exec = side_sign * -1.0
-
-                pos = PairPos(
-                    open_ts=dts,
-                    cheap_row=alt_row,
-                    rich_row=exec_row,
-                    w_i=w_alt,
-                    w_j=w_exec,
-                    decisions_per_day=decisions_per_day,
-                    scale_dv01=dv01_cash,
-                    mode="overlay",
-                    meta={"trade_id": trade_id, "side": side, "trade_ts": trade_ts},
-                    entry_rate_i=entry_rate_i,
-                    entry_rate_j=entry_rate_j,
-                )
-                open_positions.append(pos)
-
-                ledger_rows.append({
-                    "decision_ts": dts,
-                    "event": "open",
-                    "tenor_i": pos.tenor_i,
-                    "tenor_j": pos.tenor_j,
-                    "w_i": pos.w_i,
-                    "w_j": pos.w_j,
-                    "leg_dir_i": float(np.sign(pos.w_i)),
-                    "leg_dir_j": float(np.sign(pos.w_j)),
-                    "entry_rate_i": pos.entry_rate_i,
-                    "entry_rate_j": pos.entry_rate_j,
-                    "entry_zspread": pos.entry_zspread,
-                    "mode": pos.mode,
-                    "scale_dv01": pos.scale_dv01,
-                    "trade_id": trade_id,
-                    "side": side,
-                })
-
-        # else: unknown mode – nothing opened
-
-    # Outputs for this month (closed only)
+    # Output generation
     pos_df = pd.DataFrame(closed_rows)
     ledger = pd.DataFrame(ledger_rows)
-
-    # PnL by bucket from marks (aggregate in cash terms)
     if not ledger.empty:
-        marks = ledger[ledger["event"] == "mark"].copy()
-        idx = marks["decision_ts"].dt.floor("d" if decision_freq == "D" else "h")
-        pnl_by = marks.groupby(idx)["pnl_cash"].sum().rename("pnl_cash").to_frame().reset_index()
-        pnl_by = pnl_by.rename(columns={"decision_ts": "bucket"})
+        idx = ledger[ledger["event"]=="mark"]["decision_ts"].dt.floor("d" if decision_freq=="D" else "h")
+        pnl_by = ledger[ledger["event"]=="mark"].groupby(idx)["pnl_cash"].sum().reset_index(name="pnl_cash").rename(columns={"decision_ts": "bucket"})
     else:
         pnl_by = pd.DataFrame(columns=["bucket", "pnl_cash"])
 
-    return pos_df, ledger, pnl_by, open_positions  # carry-out
+    return pos_df, ledger, pnl_by, open_positions
 
 # ------------------------
 # Multi-month runner
@@ -1206,46 +1072,38 @@ def run_all(
     force_close_end: bool = False,
     mode: str = "strategy",
     hedge_df: Optional[pd.DataFrame] = None,
-    overlay_use_caps: Optional[bool] = None
+    overlay_use_caps: Optional[bool] = None,
+    
+    # --- NEW ARGUMENTS ---
+    regime_mask: Optional[pd.Series] = None,
+    hybrid_signals: Optional[pd.DataFrame] = None,
+    shock_cfg: Optional[ShockConfig] = None,
 ):
     """
-    Run multiple months, carrying open positions across months when carry=True.
-
-    mode="strategy": existing cheap–rich strategy (no hedge tape).
-    mode="overlay" : hedge-overlay mode driven by hedge_df (trade tape).
-                     hedge_df must contain: side, instrument, EqVolDelta, tradetimeUTC.
-
-    If force_close_end=True, anything still open after the last month is
-    closed at the final bucket time (exit_reason='eoc' end-of-cycle).
-
-    Returns concatenated (positions_closed, ledger, pnl_by).
+    Run multiple months with support for Regime and Shock filters.
     """
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     mode = mode.lower()
 
-    # Prepare hedge tape up front for overlay mode
     clean_hedges = None
     if mode == "overlay":
         if hedge_df is None or hedge_df.empty:
-            raise ValueError("Overlay mode requires a non-empty hedge_df (trade tape).")
+            raise ValueError("Overlay mode requires a non-empty hedge_df.")
         clean_hedges = prepare_hedge_tape(hedge_df, decision_freq)
 
     all_pos, all_ledger, all_by = [], [], []
     open_positions: List[PairPos] = []
 
-    print(f"[INFO] months: {len(yymms)} -> {yymms} | mode={mode}")
+    filter_status = "ON" if (regime_mask is not None or shock_cfg is not None) else "OFF"
+    print(f"[INFO] months: {len(yymms)} | mode={mode} | filter={filter_status}")
+    
     for yymm in yymms:
-        # Slice hedges for this month (overlay mode only)
         hedges_month = None
-        if mode == "overlay" and clean_hedges is not None and not clean_hedges.empty:
-            year = 2000 + int(yymm[:2])
-            month = int(yymm[2:])
-            start = pd.Timestamp(year=year, month=month, day=1)
+        if mode == "overlay" and clean_hedges is not None:
+            year, month = 2000 + int(yymm[:2]), int(yymm[2:])
+            start = pd.Timestamp(year, month, 1)
             end = (start + MonthEnd(1)) + pd.Timedelta(days=1)
-            hedges_month = clean_hedges[
-                (clean_hedges["decision_ts"] >= start) &
-                (clean_hedges["decision_ts"] < end)
-            ].copy()
+            hedges_month = clean_hedges[(clean_hedges["decision_ts"] >= start) & (clean_hedges["decision_ts"] < end)].copy()
 
         print(f"[RUN] month {yymm}")
         p, l, b, open_positions = run_month(
@@ -1255,62 +1113,42 @@ def run_all(
             carry_in=carry,
             mode=mode,
             hedges=hedges_month,
-            overlay_use_caps=overlay_use_caps
+            overlay_use_caps=overlay_use_caps,
+            
+            # Pass Filter Args
+            regime_mask=regime_mask,
+            hybrid_signals=hybrid_signals,
+            shock_cfg=shock_cfg
         )
-        if not p.empty:
-            all_pos.append(p.assign(yymm=yymm))
-        if not l.empty:
-            all_ledger.append(l.assign(yymm=yymm))
-        if not b.empty:
-            all_by.append(b.assign(yymm=yymm))
-        print(f"[DONE] {yymm} | closed={len(p)} | open_carry={len(open_positions)}")
+        
+        if not p.empty: all_pos.append(p.assign(yymm=yymm))
+        if not l.empty: all_ledger.append(l.assign(yymm=yymm))
+        if not b.empty: all_by.append(b.assign(yymm=yymm))
+        print(f"[DONE] {yymm} | closed={len(p)} | open={len(open_positions)}")
 
-    # Optionally force-close what's left after the last month for tidy reporting
     if force_close_end and open_positions:
-        # final timestamp = last bucket of last processed month (from ledger/by if present)
-        if all_ledger:
-            final_ts = max(x["decision_ts"].max() for x in all_ledger if not x.empty)
-        else:
-            # Fallback: synthesize month end
-            final_ts = pd.Timestamp.now()
+        final_ts = pd.Timestamp.now()
+        if all_ledger: final_ts = max(x["decision_ts"].max() for x in all_ledger if not x.empty)
+        
         closed_rows = []
         for pos in open_positions:
             pos.closed, pos.close_ts, pos.exit_reason = True, final_ts, "eoc"
-            # Transaction cost on forced close only for overlay
-            if pos.mode == "overlay":
-                tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
-                tcost_cash = tcost_bp * pos.scale_dv01
-            else:
-                tcost_bp = 0.0
-                tcost_cash = 0.0
+            tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10)) if pos.mode == "overlay" else 0.0
+            tcost_cash = tcost_bp * pos.scale_dv01
             closed_rows.append({
-                "open_ts": pos.open_ts,
-                "close_ts": pos.close_ts,
-                "exit_reason": pos.exit_reason,
-                "tenor_i": pos.tenor_i,
-                "tenor_j": pos.tenor_j,
-                "w_i": pos.w_i,
-                "w_j": pos.w_j,
-                "entry_zspread": pos.entry_zspread,
-                "pnl_gross_bp": pos.pnl_bp,
-                "pnl_gross_cash": pos.pnl_cash,
-                "tcost_bp": tcost_bp,
-                "tcost_cash": tcost_cash,
-                "pnl_net_bp": pos.pnl_bp - tcost_bp,
-                "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                "days_held_equiv": pos.age_decisions / max(1, pos.decisions_per_day),
-                "conv_proxy": pos.conv_pnl_proxy,
-                "mode": pos.mode,
-                "scale_dv01": pos.scale_dv01
+                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc",
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                "mode": pos.mode, "scale_dv01": pos.scale_dv01
             })
         if closed_rows:
             all_pos.append(pd.DataFrame(closed_rows).assign(yymm=yymms[-1]))
 
-    pos = pd.concat(all_pos, ignore_index=True) if all_pos else pd.DataFrame()
-    led = pd.concat(all_ledger, ignore_index=True) if all_ledger else pd.DataFrame()
-    by  = pd.concat(all_by,  ignore_index=True) if all_by  else pd.DataFrame()
-    return pos, led, by
-
+    return (
+        pd.concat(all_pos, ignore_index=True) if all_pos else pd.DataFrame(),
+        pd.concat(all_ledger, ignore_index=True) if all_ledger else pd.DataFrame(),
+        pd.concat(all_by, ignore_index=True) if all_by else pd.DataFrame()
+    )
 
 # ------------------------
 # CLI
