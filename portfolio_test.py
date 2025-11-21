@@ -1154,16 +1154,78 @@ def run_all(
 # CLI
 # ------------------------
 if __name__ == "__main__":
+    import hybrid_filter as hf  # Need access to signal builders
+    
     if len(sys.argv) < 2:
         print("Usage: python portfolio_test.py 2304 [2305 2306 ...]")
         sys.exit(1)
+        
     months = sys.argv[1:]
-    # CLI uses strategy mode by default (no hedge tape)
-    trades = pd.read_pickle(f"{cr.TRADE_TYPES}.pkl")
-    pos, led, by = run_all(months, carry=True, force_close_end=False, mode=cr.RUN_MODE, hedge_df=trades)
-    out_dir = Path(cr.PATH_OUT); out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Load Trade Tape
+    trades_path = Path(f"{cr.TRADE_TYPES}.pkl")
+    if not trades_path.exists():
+        print(f"[WARN] Trade tape {trades_path} not found. Running in Strategy mode (no overlay).")
+        trades = None
+        mode_ run = "strategy"
+    else:
+        trades = pd.read_pickle(trades_path)
+        mode_run = cr.RUN_MODE
+
+    # 2. Prepare Filters (Curve + Shock)
+    print(f"[INIT] Preparing Hybrid Filters using config settings...")
+    
+    # A) Get Signals (Feature Engineering)
+    signals = hf.get_or_build_hybrid_signals()
+    
+    # B) Build Regime Mask (Exogenous Curve Filter)
+    #    Uses thresholds from cr_config automatically (via hf defaults) or explicit pass:
+    regime_mask = hf.regime_mask_from_signals(
+        signals, 
+        thresholds=hf.RegimeThresholds(
+            min_signal_health_z=getattr(cr, "MIN_SIGNAL_HEALTH_Z", -0.5),
+            max_trendiness_abs=getattr(cr, "MAX_TRENDINESS_ABS", 2.0),
+            max_z_xs_mean_abs_z=getattr(cr, "MAX_Z_XS_MEAN_ABS_Z", 2.0),
+        )
+    )
+
+    # C) Configure Shock Filter (Endogenous PnL Filter)
+    #     Explicitly pull from cr_config so the config file is the boss.
+    shock_config = ShockConfig(
+        pnl_window=int(getattr(cr, "SHOCK_PNL_WINDOW", 10)),
+        use_raw_pnl=bool(getattr(cr, "SHOCK_USE_RAW_PNL", True)),
+        use_residuals=bool(getattr(cr, "SHOCK_USE_RESIDUALS", True)),
+        raw_pnl_z_thresh=float(getattr(cr, "SHOCK_RAW_PNL_Z_THRESH", -1.5)),
+        resid_z_thresh=float(getattr(cr, "SHOCK_RESID_Z_THRESH", -1.5)),
+        regression_cols=list(getattr(cr, "SHOCK_REGRESSION_COLS", [])),
+        block_length=int(getattr(cr, "SHOCK_BLOCK_LENGTH", 10)),
+    )
+
+    # 3. Run Backtest
+    print(f"[EXEC] Running {mode_run} on {len(months)} months with filters ACTIVE.")
+    pos, led, by = run_all(
+        months, 
+        carry=True, 
+        force_close_end=False, 
+        mode=mode_run, 
+        hedge_df=trades,
+        
+        # Inject the filters
+        regime_mask=regime_mask,
+        hybrid_signals=signals,
+        shock_cfg=shock_config
+    )
+
+    # 4. Save Outputs
+    out_dir = Path(cr.PATH_OUT)
+    out_dir.mkdir(parents=True, exist_ok=True)
     suffix = getattr(cr, "OUT_SUFFIX", "")
-    if not pos.empty: pos.to_parquet(out_dir / f"positions_ledger{suffix}.parquet")
-    if not led.empty: led.to_parquet(out_dir / f"marks_ledger{suffix}.parquet")
-    if not by.empty:  by.to_parquet(out_dir / f"pnl_by_bucket{suffix}.parquet")
-    print("[DONE]")
+    
+    if not pos.empty: 
+        pos.to_parquet(out_dir / f"positions_ledger{suffix}.parquet")
+    if not led.empty: 
+        led.to_parquet(out_dir / f"marks_ledger{suffix}.parquet")
+    if not by.empty:  
+        by.to_parquet(out_dir / f"pnl_by_bucket{suffix}.parquet")
+        
+    print(f"[DONE] Results saved to {out_dir}")
