@@ -673,9 +673,6 @@ def _pnl_curve_png(yymm: str) -> Path:
         name = f"pnl_curve_{yymm}{suffix}.png" if suffix else f"pnl_curve_{yymm}.png"
     return Path(getattr(cr, "PATH_OUT", ".")) / name
 
-# ------------------------
-# Month runner
-# ------------------------
 def run_month(
     yymm: str,
     *,
@@ -686,13 +683,14 @@ def run_month(
     hedges: Optional[pd.DataFrame] = None,
     overlay_use_caps: Optional[bool] = None,
     
-    # --- NEW ARGUMENTS ---
+    # --- FILTER ARGUMENTS ---
     regime_mask: Optional[pd.Series] = None,       # Exogenous Curve Filter
     hybrid_signals: Optional[pd.DataFrame] = None, # Required for Endogenous Regression
     shock_cfg: Optional[ShockConfig] = None,       # Config for Endogenous Filter
 ):
     """
     Run a single month with integrated Regime and Endogenous PnL Shock filtering.
+    Includes support for SHOCK_MODE ("ROLL_OFF" vs "EXIT_ALL").
     """
     import math
 
@@ -777,6 +775,9 @@ def run_month(
             if shock_cfg.regression_cols:
                 valid_reg_cols = [c for c in shock_cfg.regression_cols if c in sig_lookup.columns]
 
+    # Pull Shock Mode Global
+    SHOCK_MODE = str(getattr(cr, "SHOCK_MODE", "ROLL_OFF")).upper()
+
     # Carry-in
     open_positions = (open_positions or []) if carry_in else []
 
@@ -816,17 +817,20 @@ def run_month(
         # 1) Mark positions & Calculate Period PnL
         # ----------------------------------------------------------
         period_pnl_cash = 0.0
+        period_pnl_bps = 0.0
         still_open: list[PairPos] = []
         
         for pos in open_positions:
             # Capture PnL state before mark
-            prev_pnl = pos.pnl_cash
+            prev_pnl_cash = pos.pnl_cash
+            prev_pnl_bp = pos.pnl_bp
             
-            # Mark (updates internal pnl_cash)
+            # Mark (updates internal pnl_cash/bp)
             zsp = pos.mark(snap_last, decision_ts=dts)
             
             # Add incremental PnL
-            period_pnl_cash += (pos.pnl_cash - prev_pnl)
+            period_pnl_cash += (pos.pnl_cash - prev_pnl_cash)
+            period_pnl_bps += (pos.pnl_bp - prev_pnl_bp)
 
             entry_z = pos.entry_zspread
             exit_flag = None
@@ -878,8 +882,8 @@ def run_month(
                 pos.tcost_bp = tcost_bp
                 pos.tcost_cash = tcost_cash
                 
-                # Deduct transaction cost from period PnL
                 period_pnl_cash -= tcost_cash
+                period_pnl_bps -= tcost_bp
 
                 closed_rows.append({
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
@@ -895,7 +899,14 @@ def run_month(
         # ----------------------------------------------------------
         # 2) Update Endogenous Shock State
         # ----------------------------------------------------------
-        daily_pnl_history.append(period_pnl_cash)
+        
+        # Choose Metric
+        if shock_cfg is not None and getattr(shock_cfg, "metric_type", "BPS") == "BPS":
+            metric_val = period_pnl_bps
+        else:
+            metric_val = period_pnl_cash
+
+        daily_pnl_history.append(metric_val)
         daily_pnl_dates.append(dts)
 
         is_shock_blocked = False
@@ -907,10 +918,9 @@ def run_month(
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
             if len(daily_pnl_history) >= win + 2:
-                # Slice recent PnL
                 pnl_slice = np.array(daily_pnl_history[-win:])
                 
-                # A) Raw PnL Z-Score
+                # A) Raw Metric Z-Score
                 if shock_cfg.use_raw_pnl:
                     mu = np.mean(pnl_slice)
                     sd = np.std(pnl_slice, ddof=1)
@@ -921,22 +931,16 @@ def run_month(
                             is_shock_blocked = True
 
                 # B) Residual Z-Score (Endogenous Regression)
-                # Check only if not already triggered and residuals enabled
                 if shock_cfg.use_residuals and not is_shock_blocked and valid_reg_cols:
                     rel_dates = daily_pnl_dates[-win:]
-                    # Try/Except for alignment safety
                     try:
-                        # Grab signal slice
                         sig_slice = sig_lookup.loc[rel_dates, valid_reg_cols].values
                         if len(sig_slice) == len(pnl_slice):
-                            # OLS: Y = Xb + e
                             X = np.column_stack([np.ones(len(sig_slice)), sig_slice])
                             Y = pnl_slice
-                            
                             beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
                             y_hat = X @ beta
                             resid = Y - y_hat
-                            
                             r_mu = np.mean(resid)
                             r_sd = np.std(resid, ddof=1)
                             if r_sd > 1e-9:
@@ -945,10 +949,10 @@ def run_month(
                                     shock_block_remaining = int(shock_cfg.block_length)
                                     is_shock_blocked = True
                     except KeyError:
-                        pass # Date mismatch in signals, skip regression
+                        pass 
 
         # ----------------------------------------------------------
-        # 3) Gate New Entries (Exogenous + Endogenous)
+        # 3) Check Regime & Handle Shock Action (EXIT_ALL vs ROLL_OFF)
         # ----------------------------------------------------------
         regime_ok = True
         if regime_mask is not None:
@@ -957,8 +961,40 @@ def run_month(
             else:
                 regime_ok = False 
 
+        # Handle EXIT_ALL logic if shock is active
+        if is_shock_blocked and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
+            total_exit_cost_cash = 0.0
+            total_exit_cost_bps = 0.0
+            
+            for pos in open_positions:
+                pos.closed = True
+                pos.close_ts = dts
+                pos.exit_reason = "shock_exit"
+                
+                tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10)) if pos.mode == "overlay" else 0.0
+                tcost_cash = tcost_bp * pos.scale_dv01
+                
+                total_exit_cost_cash += tcost_cash
+                total_exit_cost_bps += tcost_bp
+                
+                closed_rows.append({
+                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "mode": pos.mode, "scale_dv01": pos.scale_dv01
+                })
+            
+            open_positions = [] # All liquidated
+            
+            # Retroactively update today's PnL record to reflect the cost of panic exit
+            # This ensures the shock metric history is accurate
+            if getattr(shock_cfg, "metric_type", "BPS") == "BPS":
+                daily_pnl_history[-1] -= total_exit_cost_bps
+            else:
+                daily_pnl_history[-1] -= total_exit_cost_cash
+
+        # Gate Entry
         if (not regime_ok) or is_shock_blocked:
-            # Gated: Skip entry logic
             continue
 
         # ----------------------------------------------------------
@@ -1003,13 +1039,11 @@ def run_month(
                 side_sign = 1.0 if str(h["side"]).upper() == "CRCV" else -1.0
                 z_entry_eff = _overlay_effective_z_entry(dv01_cash)
 
-                # Executed Tenor Z
                 exec_z = _get_z_at_tenor(snap_srt, trade_tenor)
                 if exec_z is None: continue
                 exec_row = snap_srt.iloc[(snap_srt["tenor_yrs"] - trade_tenor).abs().idxmin()]
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                # Find Best Alt
                 best_cand = None
                 best_zd = 0.0
                 
@@ -1023,11 +1057,9 @@ def run_month(
                     
                     if zdisp < z_entry_eff: continue
 
-                    # Short end extra
                     if (assign_bucket(alt_tenor)=="short" or assign_bucket(exec_tenor)=="short") and (zdisp < z_entry_eff + SHORT_END_EXTRA_Z):
                         continue
                     
-                    # Fly checks
                     c_t, r_t = (alt_tenor, exec_tenor) if z_alt > exec_z else (exec_tenor, alt_tenor)
                     if not (fly_alignment_ok(c_t, 1, snap_srt, zdisp_for_pair=zdisp) and fly_alignment_ok(r_t, -1, snap_srt, zdisp_for_pair=zdisp)):
                         continue
@@ -1039,7 +1071,6 @@ def run_month(
                 if best_cand:
                     alt_row, exec_row = best_cand
                     
-                    # Try getting trade rates
                     rate_i, rate_j = None, None
                     ti, tj = tenor_to_ticker(float(alt_row["tenor_yrs"])), tenor_to_ticker(float(exec_row["tenor_yrs"]))
                     if ti and f"{ti}_mid" in h: rate_i = _to_float(h[f"{ti}_mid"])
@@ -1050,7 +1081,6 @@ def run_month(
                     open_positions.append(pos)
                     ledger_rows.append({"decision_ts": dts, "event": "open", "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j, "mode": "overlay"})
 
-    # Output generation
     pos_df = pd.DataFrame(closed_rows)
     ledger = pd.DataFrame(ledger_rows)
     if not ledger.empty:
