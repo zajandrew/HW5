@@ -78,6 +78,15 @@ MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FRE
 ALT_LEG_TENOR_YEARS = 0.0
 EXEC_LEG_TENOR_YEARS = 0.084
 
+# ========= Backtest decision layer =========
+MIN_SIGNAL_HEALTH = -0.8
+MAX_TRENDINESS_ABS = 3.5
+MAX_Z_XS_MEAN_ABS_Z = 3.5
+SHOCK_PNL_WINDOW = 10
+RAW_PNL_Z_THRESH = -2.0
+RESID_Z_THRESH = -2.0
+SHOCK_BLOCK_LENGTH = 5
+
 # ========= Risk & selection =========
 BUCKETS = {
     "short": (0.0, 0.99),   # ~6M–<2Y
