@@ -80,14 +80,25 @@ MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FRE
 ALT_LEG_TENOR_YEARS = 0.0
 EXEC_LEG_TENOR_YEARS = 0.084
 
-# ========= Backtest decision layer =========
-MIN_SIGNAL_HEALTH = -0.8
-MAX_TRENDINESS_ABS = 3.5
-MAX_Z_XS_MEAN_ABS_Z = 3.5
-SHOCK_PNL_WINDOW = 10
-RAW_PNL_Z_THRESH = -2.0
-RESID_Z_THRESH = -2.0
-SHOCK_BLOCK_LENGTH = 5
+# ========= Regime Filter Settings (Curve Environment) =========
+# These control the "Regime Mask" (exogenous filter)
+MIN_SIGNAL_HEALTH_Z     = -0.5   # Require composite health >= this (higher is better)
+MAX_TRENDINESS_ABS      = 2.0    # Require absolute trendiness <= this
+MAX_Z_XS_MEAN_ABS_Z     = 2.0    # Require cross-sectional mean Z-score <= this
+
+# ========= Shock Filter Settings (PnL Feedback) =========
+# These control the "Shock Blocker" (endogenous filter)
+SHOCK_PNL_WINDOW        = 10     # Lookback window (in decision buckets) for PnL stats
+SHOCK_USE_RAW_PNL       = True   # Enable simple Z-score check on PnL?
+SHOCK_USE_RESIDUALS     = True   # Enable regression residual check?
+SHOCK_RAW_PNL_Z_THRESH  = -1.5   # Z-score below this triggers a block
+SHOCK_RESID_Z_THRESH    = -1.5   # Residual Z-score below this triggers a block
+SHOCK_BLOCK_LENGTH      = 10     # Number of buckets to block AFTER a shock
+SHOCK_REGRESSION_COLS   = [      # Columns from hybrid_signals to regress against
+    "signal_health_z", 
+    "trendiness_abs", 
+    "z_xs_mean_roll_z"
+]
 
 # ========= Risk & selection =========
 BUCKETS = {
