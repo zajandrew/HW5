@@ -684,16 +684,19 @@ def run_month(
     overlay_use_caps: Optional[bool] = None,
     
     # --- FILTER ARGUMENTS ---
-    regime_mask: Optional[pd.Series] = None,       # Exogenous Curve Filter
-    hybrid_signals: Optional[pd.DataFrame] = None, # Required for Endogenous Regression
-    shock_cfg: Optional[ShockConfig] = None,       # Config for Endogenous Filter
+    regime_mask: Optional[pd.Series] = None,       
+    hybrid_signals: Optional[pd.DataFrame] = None, 
+    shock_cfg: Optional[ShockConfig] = None,       
 ):
     """
-    Run a single month with integrated Regime and Endogenous PnL Shock filtering.
-    Includes robustness fixes for numerical stability in daily regression checks.
+    Run a single month. 
+    Includes: 
+      - Regime & Shock Filters (Robustness logic)
+      - Endogenous PnL Tracking (BPS or CASH)
+      - Full Column Logging (Restored)
+      - Trade-time Rate Lookup
     """
     import math
-    # Ensure numpy is available as np
     try:
         np
     except NameError:
@@ -715,7 +718,6 @@ def run_month(
     if missing:
         raise ValueError(f"{enh_path} missing columns: {missing}")
 
-    # Decision buckets
     df["ts"] = pd.to_datetime(df["ts"], utc=False, errors="coerce")
     if decision_freq == "D":
         df["decision_ts"] = df["ts"].dt.floor("d")
@@ -729,7 +731,6 @@ def run_month(
 
     base_max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
 
-    # --- Overlay/Strategy Config ---
     OVERLAY_MAX_HOLD_DV01_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_MED", 20_000.0))
     OVERLAY_MAX_HOLD_DV01_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_HI", 50_000.0))
     OVERLAY_MAX_HOLD_DAYS_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_MED", 5.0))
@@ -760,22 +761,18 @@ def run_month(
     def _per_trade_dv01_cap_for_bucket(bucket: str) -> float:
         return float(OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get("other", OVERLAY_DV01_CAP_PER_TRADE)))
 
-    # Fix for TypeError if BPS_PNL_STOP is None in config
     _bps_stop_val = getattr(cr, "BPS_PNL_STOP", None)
     BPS_PNL_STOP = float(_bps_stop_val) if _bps_stop_val is not None else 0.0
 
-    # --- Shock Filter Setup ---
     daily_pnl_history: list[float] = [] 
     daily_pnl_dates: list[pd.Timestamp] = []
     shock_block_remaining = 0
     
-    # Determine valid regression columns from hybrid_signals
     valid_reg_cols = []
     sig_lookup = pd.DataFrame()
     if shock_cfg is not None:
         if hybrid_signals is not None:
             if "decision_ts" in hybrid_signals.columns:
-                # Ensure unique index for safe lookup
                 sig_lookup = hybrid_signals.drop_duplicates("decision_ts").set_index("decision_ts").sort_index()
             else:
                 sig_lookup = hybrid_signals
@@ -783,13 +780,9 @@ def run_month(
             if shock_cfg.regression_cols:
                 valid_reg_cols = [c for c in shock_cfg.regression_cols if c in sig_lookup.columns]
 
-    # Pull Shock Mode Global
     SHOCK_MODE = str(getattr(cr, "SHOCK_MODE", "ROLL_OFF")).upper()
-
-    # Carry-in
     open_positions = (open_positions or []) if carry_in else []
 
-    # Filter hedges
     if mode == "overlay" and hedges is not None and not hedges.empty:
         valid_decisions = df["decision_ts"].dropna().unique()
         hedges = hedges[hedges["decision_ts"].isin(valid_decisions)].copy()
@@ -799,7 +792,6 @@ def run_month(
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
 
-    # Standard Strategy Params
     PER_BUCKET_DV01_CAP = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
     TOTAL_DV01_CAP = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
     FRONT_END_DV01_CAP = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
@@ -822,7 +814,7 @@ def run_month(
             continue
 
         # ----------------------------------------------------------
-        # 1) Mark positions & Calculate Period PnL
+        # 1) Mark positions
         # ----------------------------------------------------------
         period_pnl_cash = 0.0
         period_pnl_bps = 0.0
@@ -872,11 +864,16 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
+            # Ledger logging
             ledger_rows.append({
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
-                "z_spread": zsp, "closed": pos.closed, "mode": pos.mode
+                "z_spread": zsp, "closed": pos.closed, "mode": pos.mode,
+                # Extra ledger info
+                "rate_i": getattr(pos, "last_rate_i", np.nan),
+                "rate_j": getattr(pos, "last_rate_j", np.nan),
+                "w_i": pos.w_i, "w_j": pos.w_j,
             })
 
             if pos.closed:
@@ -889,11 +886,46 @@ def run_month(
                 period_pnl_cash -= tcost_cash
                 period_pnl_bps -= tcost_bp
 
+                # FULL OUTPUT COLUMNS RESTORED
                 closed_rows.append({
-                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
-                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    "mode": pos.mode, "scale_dv01": pos.scale_dv01
+                    "open_ts": pos.open_ts, 
+                    "close_ts": pos.close_ts, 
+                    "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, 
+                    "tenor_j": pos.tenor_j,
+                    "w_i": pos.w_i,
+                    "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)),
+                    "leg_dir_j": float(np.sign(pos.w_j)),
+                    
+                    "entry_rate_i": pos.entry_rate_i,
+                    "entry_rate_j": pos.entry_rate_j,
+                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
+                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
+                    
+                    "dv01_i_entry": pos.dv01_i_entry,
+                    "dv01_j_entry": pos.dv01_j_entry,
+                    "dv01_i_close": pos.dv01_i_curr,
+                    "dv01_j_close": pos.dv01_j_curr,
+                    "initial_dv01": pos.initial_dv01,
+                    "scale_dv01": pos.scale_dv01,
+                    
+                    "entry_zspread": pos.entry_zspread,
+                    "conv_proxy": pos.conv_pnl_proxy,
+                    
+                    "pnl_gross_bp": pos.pnl_bp, 
+                    "pnl_gross_cash": pos.pnl_cash,
+                    "tcost_bp": tcost_bp, 
+                    "tcost_cash": tcost_cash,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, 
+                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    
+                    "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
+                    "mode": pos.mode,
+                    
+                    # Meta
+                    "trade_id": pos.meta.get("trade_id"),
+                    "side": pos.meta.get("side"),
                 })
             else:
                 still_open.append(pos)
@@ -901,10 +933,8 @@ def run_month(
         open_positions = still_open
 
         # ----------------------------------------------------------
-        # 2) Update Endogenous Shock State (BPS vs CASH)
+        # 2) Update Shock State
         # ----------------------------------------------------------
-        
-        # Choose Metric
         if shock_cfg is not None and getattr(shock_cfg, "metric_type", "BPS") == "BPS":
             metric_val = period_pnl_bps
         else:
@@ -918,99 +948,62 @@ def run_month(
             is_shock_blocked = True
             shock_block_remaining -= 1
         
-        # Check for new shocks if config enabled
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
-            # Need enough data for window + buffer
             if len(daily_pnl_history) >= win + 2:
-                # Slice recent PnL (Y)
                 pnl_slice_raw = np.array(daily_pnl_history[-win:])
                 
-                # A) Raw Metric Z-Score
                 if shock_cfg.use_raw_pnl:
-                    # Filter NaNs/Infs for robust stats
                     mask_raw = np.isfinite(pnl_slice_raw)
                     if mask_raw.sum() >= 2:
                         pnl_clean = pnl_slice_raw[mask_raw]
                         mu = np.mean(pnl_clean)
                         sd = np.std(pnl_clean, ddof=1)
                         if sd > 1e-9:
-                            # Check latest point if it's finite
                             if np.isfinite(pnl_slice_raw[-1]):
                                 last_z = (pnl_slice_raw[-1] - mu) / sd
                                 if last_z <= shock_cfg.raw_pnl_z_thresh:
                                     shock_block_remaining = int(shock_cfg.block_length)
                                     is_shock_blocked = True
 
-                # B) Residual Z-Score (Endogenous Regression)
-                # Robust implementation matching hybrid_filter.py logic
                 if shock_cfg.use_residuals and not is_shock_blocked and valid_reg_cols:
                     rel_dates = daily_pnl_dates[-win:]
                     try:
-                        # 1. Get raw X slice
-                        # Use reindex to handle missing dates gracefully (fills with NaN)
                         sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
-                        
                         if len(sig_slice_raw) == len(pnl_slice_raw):
-                            # 2. Create mask for finite values in both Y and X rows
-                            # Check PnL is finite AND all signals in the row are finite
                             valid_mask = np.isfinite(pnl_slice_raw) & np.isfinite(sig_slice_raw).all(axis=1)
-                            
-                            # 3. Ensure enough degrees of freedom (rows > cols + intercept)
                             n_obs = valid_mask.sum()
                             n_cols = sig_slice_raw.shape[1] + 1
-                            
                             if n_obs >= n_cols + 1:
-                                # 4. Apply mask to get clean data
                                 Y_clean = pnl_slice_raw[valid_mask]
                                 X_clean = sig_slice_raw[valid_mask]
-                                
-                                # 5. Add Intercept
                                 X_final = np.column_stack([np.ones(len(X_clean)), X_clean])
-                                
-                                # 6. Run Regression with error catching
                                 try:
-                                    # rcond=None lets numpy determine cutoff for singular values
                                     beta, _, _, _ = np.linalg.lstsq(X_final, Y_clean, rcond=None)
-                                    
-                                    # Calculate Residuals
                                     y_hat = X_final @ beta
                                     resid = Y_clean - y_hat
-                                    
-                                    # Calculate Residual Z-Score
                                     r_mu = np.mean(resid)
                                     r_sd = np.std(resid, ddof=1)
-                                    
                                     if r_sd > 1e-9:
-                                        # We need the residual corresponding to the *latest* date.
-                                        # Since we masked data, the latest valid residual is the last one.
                                         last_r_z = (resid[-1] - r_mu) / r_sd
                                         if last_r_z <= shock_cfg.resid_z_thresh:
                                             shock_block_remaining = int(shock_cfg.block_length)
                                             is_shock_blocked = True
                                 except np.linalg.LinAlgError:
-                                    # SVD convergence failure or similar numerical issue. 
-                                    # Skip residual check this bucket.
                                     pass
-                    except KeyError:
-                         # Date alignment issue in lookup
-                         pass
                     except Exception:
-                         # Catch-all for other unexpected numerical issues during slicing
                          pass
 
         # ----------------------------------------------------------
-        # 3) Check Regime & Handle Shock Action (EXIT_ALL vs ROLL_OFF)
+        # 3) Check Regime & Handle Shock Action
         # ----------------------------------------------------------
         regime_ok = True
         if regime_mask is not None:
-            # Safe lookup for regime mask
             if dts in regime_mask.index:
                 regime_ok = bool(regime_mask.at[dts])
             else:
                 regime_ok = False 
 
-        # Handle EXIT_ALL logic if shock is active
         if is_shock_blocked and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
             total_exit_cost_cash = 0.0
             total_exit_cost_bps = 0.0
@@ -1027,26 +1020,57 @@ def run_month(
                 total_exit_cost_bps += tcost_bp
                 
                 closed_rows.append({
-                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
-                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    "mode": pos.mode, "scale_dv01": pos.scale_dv01
+                    "open_ts": pos.open_ts, 
+                    "close_ts": pos.close_ts, 
+                    "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, 
+                    "tenor_j": pos.tenor_j,
+                    "w_i": pos.w_i,
+                    "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)),
+                    "leg_dir_j": float(np.sign(pos.w_j)),
+                    
+                    "entry_rate_i": pos.entry_rate_i,
+                    "entry_rate_j": pos.entry_rate_j,
+                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
+                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
+                    
+                    "dv01_i_entry": pos.dv01_i_entry,
+                    "dv01_j_entry": pos.dv01_j_entry,
+                    "dv01_i_close": pos.dv01_i_curr,
+                    "dv01_j_close": pos.dv01_j_curr,
+                    "initial_dv01": pos.initial_dv01,
+                    "scale_dv01": pos.scale_dv01,
+                    
+                    "entry_zspread": pos.entry_zspread,
+                    "conv_proxy": pos.conv_pnl_proxy,
+                    
+                    "pnl_gross_bp": pos.pnl_bp, 
+                    "pnl_gross_cash": pos.pnl_cash,
+                    "tcost_bp": tcost_bp, 
+                    "tcost_cash": tcost_cash,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, 
+                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    
+                    "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
+                    "mode": pos.mode,
+                    
+                    "trade_id": pos.meta.get("trade_id"),
+                    "side": pos.meta.get("side"),
                 })
             
-            open_positions = [] # All liquidated
+            open_positions = [] 
             
-            # Retroactively update today's PnL record to reflect the cost of panic exit
             if getattr(shock_cfg, "metric_type", "BPS") == "BPS":
                 daily_pnl_history[-1] -= total_exit_cost_bps
             else:
                 daily_pnl_history[-1] -= total_exit_cost_cash
 
-        # Gate Entry
         if (not regime_ok) or is_shock_blocked:
             continue
 
         # ----------------------------------------------------------
-        # 4) Entry Logic (Strategy / Overlay)
+        # 4) Entry Logic
         # ----------------------------------------------------------
         remaining_slots = max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions))
         if remaining_slots <= 0:
@@ -1124,6 +1148,10 @@ def run_month(
                     if ti and f"{ti}_mid" in h: rate_i = _to_float(h[f"{ti}_mid"])
                     if tj and f"{tj}_mid" in h: rate_j = _to_float(h[f"{tj}_mid"])
                     
+                    # Fallback logic if hedge tape didn't have the rates
+                    if rate_i is None: rate_i = _to_float(alt_row["rate"])
+                    if rate_j is None: rate_j = _to_float(exec_row["rate"])
+
                     pos = PairPos(dts, alt_row, exec_row, side_sign*1.0, side_sign*-1.0, decisions_per_day, scale_dv01=dv01_cash, mode="overlay",
                                   meta={"trade_id": h.get("trade_id"), "side": h.get("side")}, entry_rate_i=rate_i, entry_rate_j=rate_j)
                     open_positions.append(pos)
