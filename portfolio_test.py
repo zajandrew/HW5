@@ -689,7 +689,10 @@ def run_month(
     shock_cfg: Optional[ShockConfig] = None,       
 ):
     """
-    Run a single month with granular tenor thresholds (EXEC vs ALT).
+    Run a single month.
+    NO LOOKAHEAD VERSION: 
+    - Entries are gated by the shock state as of Yesterday (Start of Bucket).
+    - Panic Exits are triggered by the shock state as of Today (End of Bucket).
     """
     import math
     try:
@@ -795,7 +798,6 @@ def run_month(
     Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
     Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
     
-    # --- NEW: Granular Tenor Thresholds ---
     EXEC_LEG_TENOR_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
     ALT_LEG_TENOR_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
     
@@ -812,11 +814,25 @@ def run_month(
         if snap_last.empty:
             continue
 
-        # ----------------------------------------------------------
-        # 1) Mark positions & Calculate Period PnL
-        # ----------------------------------------------------------
-        period_pnl_cash = 0.0
-        period_pnl_bps = 0.0
+        # ============================================================
+        # A) CAPTURE STATE AT OPEN (FOR ENTRIES)
+        # ============================================================
+        # CRITICAL: We must decide if we are blocked BEFORE we see today's PnL.
+        # If shock_block_remaining > 0 from YESTERDAY, we block entries TODAY.
+        was_shock_active_at_open = (shock_block_remaining > 0)
+        
+        # Decrement the counter for the *next* day logic, but 'was_shock_active_at_open'
+        # remains the truth source for gating entries in this bucket.
+        if shock_block_remaining > 0:
+            shock_block_remaining -= 1
+
+        # ============================================================
+        # 1) MARK POSITIONS & NATURAL EXITS
+        # ============================================================
+        period_pnl_cash = 0.0       
+        period_pnl_bps_mtm = 0.0    
+        period_pnl_bps_realized = 0.0 
+        
         still_open: list[PairPos] = []
         
         for pos in open_positions:
@@ -826,7 +842,7 @@ def run_month(
             zsp = pos.mark(snap_last, decision_ts=dts)
             
             period_pnl_cash += (pos.pnl_cash - prev_pnl_cash)
-            period_pnl_bps += (pos.pnl_bp - prev_pnl_bp)
+            period_pnl_bps_mtm += (pos.pnl_bp - prev_pnl_bp)
 
             entry_z = pos.entry_zspread
             exit_flag = None
@@ -881,7 +897,8 @@ def run_month(
                 pos.tcost_cash = tcost_cash
                 
                 period_pnl_cash -= tcost_cash
-                period_pnl_bps -= tcost_bp
+                period_pnl_bps_mtm -= tcost_bp
+                period_pnl_bps_realized += (pos.pnl_bp - tcost_bp)
 
                 closed_rows.append({
                     "open_ts": pos.open_ts, 
@@ -921,21 +938,29 @@ def run_month(
 
         open_positions = still_open
 
-        # ----------------------------------------------------------
-        # 2) Update Endogenous Shock State
-        # ----------------------------------------------------------
-        if shock_cfg is not None and getattr(shock_cfg, "metric_type", "BPS") == "BPS":
-            metric_val = period_pnl_bps
+        # ============================================================
+        # 2) UPDATE HISTORY & DETECT NEW SHOCK (AT CLOSE)
+        # ============================================================
+        metric_type = "MTM_BPS"
+        if shock_cfg is not None:
+            metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS")
+        
+        if metric_type == "REALIZED_BPS":
+            metric_val = period_pnl_bps_realized
+        elif metric_type == "MTM_BPS" or metric_type == "BPS":
+            metric_val = period_pnl_bps_mtm
         else:
             metric_val = period_pnl_cash
 
         daily_pnl_history.append(metric_val)
         daily_pnl_dates.append(dts)
 
-        is_shock_blocked = False
-        if shock_block_remaining > 0:
-            is_shock_blocked = True
-            shock_block_remaining -= 1
+        # We now check if TODAY'S results triggered a NEW shock.
+        # This new state will affect:
+        #   a) Panic Exits (Today) -> Because we can observe the close and exit MOC.
+        #   b) Entry Gating (Tomorrow) -> Because we can't travel back in time.
+        
+        is_new_shock_triggered = False
         
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
@@ -952,10 +977,9 @@ def run_month(
                             if np.isfinite(pnl_slice_raw[-1]):
                                 last_z = (pnl_slice_raw[-1] - mu) / sd
                                 if last_z <= shock_cfg.raw_pnl_z_thresh:
-                                    shock_block_remaining = int(shock_cfg.block_length)
-                                    is_shock_blocked = True
+                                    is_new_shock_triggered = True
 
-                if shock_cfg.use_residuals and not is_shock_blocked and valid_reg_cols:
+                if shock_cfg.use_residuals and not is_new_shock_triggered and valid_reg_cols:
                     rel_dates = daily_pnl_dates[-win:]
                     try:
                         sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
@@ -976,26 +1000,28 @@ def run_month(
                                     if r_sd > 1e-9:
                                         last_r_z = (resid[-1] - r_mu) / r_sd
                                         if last_r_z <= shock_cfg.resid_z_thresh:
-                                            shock_block_remaining = int(shock_cfg.block_length)
-                                            is_shock_blocked = True
+                                            is_new_shock_triggered = True
                                 except np.linalg.LinAlgError:
                                     pass
                     except Exception:
                          pass
 
-        # ----------------------------------------------------------
-        # 3) Check Regime & Handle Shock Action
-        # ----------------------------------------------------------
-        regime_ok = True
-        if regime_mask is not None:
-            if dts in regime_mask.index:
-                regime_ok = bool(regime_mask.at[dts])
-            else:
-                regime_ok = False 
+        # If new shock, set block for FUTURE
+        if is_new_shock_triggered:
+            shock_block_remaining = int(shock_cfg.block_length)
 
-        if is_shock_blocked and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
-            total_exit_cost_cash = 0.0
-            total_exit_cost_bps = 0.0
+        # ============================================================
+        # 3) CHECK REGIME & EXECUTE PANIC (IF SHOCK TRIGGERED TODAY)
+        # ============================================================
+        # Panic logic uses TODAY'S shock status (is_new_shock_triggered or existing block)
+        # If we are in a shock (old or new), and mode is EXIT_ALL, get out.
+        
+        is_in_shock_state = (shock_block_remaining > 0) or is_new_shock_triggered
+        
+        if is_in_shock_state and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
+            panic_pnl_realized_net = 0.0 
+            panic_tcost_bps = 0.0        
+            panic_tcost_cash = 0.0
             
             for pos in open_positions:
                 pos.closed = True
@@ -1005,9 +1031,13 @@ def run_month(
                 tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10)) if pos.mode == "overlay" else 0.0
                 tcost_cash = tcost_bp * pos.scale_dv01
                 
-                total_exit_cost_cash += tcost_cash
-                total_exit_cost_bps += tcost_bp
+                pos.tcost_bp = tcost_bp
+                pos.tcost_cash = tcost_cash
                 
+                panic_tcost_bps += tcost_bp
+                panic_tcost_cash += tcost_cash
+                panic_pnl_realized_net += (pos.pnl_bp - tcost_bp)
+
                 closed_rows.append({
                     "open_ts": pos.open_ts, 
                     "close_ts": pos.close_ts, 
@@ -1044,17 +1074,33 @@ def run_month(
             
             open_positions = [] 
             
-            if getattr(shock_cfg, "metric_type", "BPS") == "BPS":
-                daily_pnl_history[-1] -= total_exit_cost_bps
-            else:
-                daily_pnl_history[-1] -= total_exit_cost_cash
+            # RETROACTIVE HISTORY UPDATE
+            if metric_type == "REALIZED_BPS":
+                daily_pnl_history[-1] += panic_pnl_realized_net
+            elif metric_type == "MTM_BPS" or metric_type == "BPS":
+                daily_pnl_history[-1] -= panic_tcost_bps
+            else: 
+                daily_pnl_history[-1] -= panic_tcost_cash
 
-        if (not regime_ok) or is_shock_blocked:
+        # ============================================================
+        # 4) CHECK REGIME & GATE ENTRIES
+        # ============================================================
+        # CRITICAL: We use 'was_shock_active_at_open' (Yesterday's state) to gate entries.
+        # This prevents looking ahead at today's PnL to avoid today's trades.
+        
+        regime_ok = True
+        if regime_mask is not None:
+            if dts in regime_mask.index:
+                regime_ok = bool(regime_mask.at[dts])
+            else:
+                regime_ok = False 
+
+        if (not regime_ok) or was_shock_active_at_open:
             continue
 
-        # ----------------------------------------------------------
-        # 4) Entry Logic
-        # ----------------------------------------------------------
+        # ============================================================
+        # 5) NEW ENTRIES
+        # ============================================================
         remaining_slots = max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions))
         if remaining_slots <= 0:
             continue
@@ -1086,8 +1132,6 @@ def run_month(
                 if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS: break
                 
                 trade_tenor = float(h["tenor_yrs"])
-                
-                # --- Granular Check 1: Exec Leg ---
                 if trade_tenor < EXEC_LEG_TENOR_THRESHOLD: continue
                 
                 dv01_cash = float(h["dv01"])
@@ -1106,10 +1150,7 @@ def run_month(
                 
                 for _, alt_row in snap_srt.iterrows():
                     alt_tenor = float(alt_row["tenor_yrs"])
-                    
-                    # --- Granular Check 2: Alt Leg ---
                     if alt_tenor < ALT_LEG_TENOR_THRESHOLD: continue
-                    
                     if alt_tenor == exec_tenor: continue
                     if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
                     
@@ -1137,7 +1178,6 @@ def run_month(
                     if ti and f"{ti}_mid" in h: rate_i = _to_float(h[f"{ti}_mid"])
                     if tj and f"{tj}_mid" in h: rate_j = _to_float(h[f"{tj}_mid"])
                     
-                    # Fallback logic if hedge tape didn't have the rates
                     if rate_i is None: rate_i = _to_float(alt_row["rate"])
                     if rate_j is None: rate_j = _to_float(exec_row["rate"])
 
