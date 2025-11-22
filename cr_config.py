@@ -99,11 +99,12 @@ SHOCK_REGRESSION_COLS   = [      # Columns from hybrid_signals to regress agains
     "trendiness_abs", 
     "z_xs_mean_roll_z"
 ]
-SHOCK_METRIC_TYPE       = "REALIZED_BPS"  
+SHOCK_METRIC_TYPE = "REALIZED_CASH"  
 # Options:
-# "MTM_BPS"      = Daily mark-to-market variance (Smooth, catches volatility)
-# "MTM_CASH"     = Daily cash equity change (Smooth, catches risk-weighted volatility)
-# "REALIZED_BPS" = Closed trade outcomes (Lumpy, catches Strategy Failures) -> OLD BEHAVIOR
+# "REALIZED_CASH" = Sum of Cash PnL from CLOSED trades (Lumpy, Old Behavior) <- YOUR REQUEST
+# "REALIZED_BPS"  = Sum of Bps PnL from CLOSED trades (Lumpy, Size-Agnostic)
+# "MTM_CASH"      = Daily Equity Change (Smooth, Volatility-based)
+# "MTM_BPS"       = Daily Signal Change (Smooth, Signal-based)
 SHOCK_MODE              = "ROLL_OFF" #"ROLL_OFF" or "EXIT_ALL"
 
 # ========= Risk & selection =========
