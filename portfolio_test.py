@@ -686,11 +686,14 @@ def run_month(
     # --- FILTER ARGUMENTS ---
     regime_mask: Optional[pd.Series] = None,       
     hybrid_signals: Optional[pd.DataFrame] = None, 
-    shock_cfg: Optional[ShockConfig] = None,       
+    shock_cfg: Optional[ShockConfig] = None,
+    
+    # --- STATE PERSISTENCE (NEW) ---
+    # Passed from run_all to maintain history across months
+    shock_state: Optional[Dict] = None 
 ):
     """
-    Run a single month.
-    Updated to support 'REALIZED_CASH' (The "Old Way" - Lumpy & Size Weighted).
+    Run a single month with Global PnL History and aligned Shock Logic.
     """
     import math
     try:
@@ -760,11 +763,15 @@ def run_month(
     _bps_stop_val = getattr(cr, "BPS_PNL_STOP", None)
     BPS_PNL_STOP = float(_bps_stop_val) if _bps_stop_val is not None else 0.0
 
-    # --- Shock Filter State ---
-    daily_pnl_history: list[float] = [] 
-    daily_pnl_dates: list[pd.Timestamp] = []
-    shock_block_remaining = 0
+    # --- Initialize State if not provided (e.g. single month run) ---
+    if shock_state is None:
+        shock_state = {
+            "history": [],
+            "dates": [],
+            "remaining": 0
+        }
     
+    # Pre-calc valid regression columns
     valid_reg_cols = []
     sig_lookup = pd.DataFrame()
     if shock_cfg is not None:
@@ -799,7 +806,6 @@ def run_month(
     
     EXEC_LEG_TENOR_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
     ALT_LEG_TENOR_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
-    
     MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
     MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
 
@@ -814,19 +820,22 @@ def run_month(
             continue
 
         # ============================================================
-        # A) CAPTURE STATE AT OPEN (FOR ENTRIES)
+        # A) START-OF-DAY GATING (NO LOOKAHEAD)
         # ============================================================
-        was_shock_active_at_open = (shock_block_remaining > 0)
-        if shock_block_remaining > 0:
-            shock_block_remaining -= 1
+        # Corresponds to "Was I blocked based on data up to T-1?"
+        was_shock_active_at_open = (shock_state["remaining"] > 0)
+        
+        # Decrement counter for the future
+        if shock_state["remaining"] > 0:
+            shock_state["remaining"] -= 1
 
         # ============================================================
         # 1) MARK POSITIONS & NATURAL EXITS
         # ============================================================
-        period_pnl_cash = 0.0       # MTM
-        period_pnl_bps_mtm = 0.0    # MTM
-        period_pnl_bps_realized = 0.0 # Lumpy (Bps)
-        period_pnl_cash_realized = 0.0 # Lumpy (Cash) <--- NEW
+        period_pnl_cash = 0.0       
+        period_pnl_bps_mtm = 0.0    
+        period_pnl_bps_realized = 0.0 
+        period_pnl_cash_realized = 0.0
         
         still_open: list[PairPos] = []
         
@@ -891,46 +900,29 @@ def run_month(
                 pos.tcost_bp = tcost_bp
                 pos.tcost_cash = tcost_cash
                 
-                # MTM Flows
                 period_pnl_cash -= tcost_cash
                 period_pnl_bps_mtm -= tcost_bp
                 
-                # Realized Flows (Trade PnL - TCost)
                 period_pnl_bps_realized += (pos.pnl_bp - tcost_bp)
-                period_pnl_cash_realized += (pos.pnl_cash - tcost_cash) # <--- NEW
+                period_pnl_cash_realized += (pos.pnl_cash - tcost_cash)
 
                 closed_rows.append({
-                    "open_ts": pos.open_ts, 
-                    "close_ts": pos.close_ts, 
-                    "exit_reason": pos.exit_reason,
-                    "tenor_i": pos.tenor_i, 
-                    "tenor_j": pos.tenor_j,
-                    "w_i": pos.w_i,
-                    "w_j": pos.w_j,
-                    "leg_dir_i": float(np.sign(pos.w_i)),
-                    "leg_dir_j": float(np.sign(pos.w_j)),
-                    "entry_rate_i": pos.entry_rate_i,
-                    "entry_rate_j": pos.entry_rate_j,
-                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
-                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
-                    "dv01_i_entry": pos.dv01_i_entry,
-                    "dv01_j_entry": pos.dv01_j_entry,
-                    "dv01_i_close": pos.dv01_i_curr,
-                    "dv01_j_close": pos.dv01_j_curr,
-                    "initial_dv01": pos.initial_dv01,
-                    "scale_dv01": pos.scale_dv01,
-                    "entry_zspread": pos.entry_zspread,
-                    "conv_proxy": pos.conv_pnl_proxy,
-                    "pnl_gross_bp": pos.pnl_bp, 
-                    "pnl_gross_cash": pos.pnl_cash,
-                    "tcost_bp": tcost_bp, 
-                    "tcost_cash": tcost_cash,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp, 
-                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                    "w_i": pos.w_i, "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)), "leg_dir_j": float(np.sign(pos.w_j)),
+                    "entry_rate_i": pos.entry_rate_i, "entry_rate_j": pos.entry_rate_j,
+                    "close_rate_i": getattr(pos, "last_rate_i", np.nan), "close_rate_j": getattr(pos, "last_rate_j", np.nan),
+                    "dv01_i_entry": pos.dv01_i_entry, "dv01_j_entry": pos.dv01_j_entry,
+                    "dv01_i_close": pos.dv01_i_curr, "dv01_j_close": pos.dv01_j_curr,
+                    "initial_dv01": pos.initial_dv01, "scale_dv01": pos.scale_dv01,
+                    "entry_zspread": pos.entry_zspread, "conv_proxy": pos.conv_pnl_proxy,
+                    "pnl_gross_bp": pos.pnl_bp, "pnl_gross_cash": pos.pnl_cash,
+                    "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
-                    "trade_id": pos.meta.get("trade_id"),
-                    "side": pos.meta.get("side"),
+                    "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side"),
                 })
             else:
                 still_open.append(pos)
@@ -945,25 +937,25 @@ def run_month(
             metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS")
         
         if metric_type == "REALIZED_CASH":
-            metric_val = period_pnl_cash_realized # <--- Lumpy Cash
+            metric_val = period_pnl_cash_realized
         elif metric_type == "REALIZED_BPS":
-            metric_val = period_pnl_bps_realized  # <--- Lumpy Bps
+            metric_val = period_pnl_bps_realized
         elif metric_type == "MTM_BPS" or metric_type == "BPS":
-            metric_val = period_pnl_bps_mtm       # Smooth Bps
+            metric_val = period_pnl_bps_mtm
         else:
-            metric_val = period_pnl_cash          # Smooth Cash
+            metric_val = period_pnl_cash
 
-        daily_pnl_history.append(metric_val)
-        daily_pnl_dates.append(dts)
+        shock_state["history"].append(metric_val)
+        shock_state["dates"].append(dts)
 
-        # Detect Shock
         is_new_shock_triggered = False
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
-            if len(daily_pnl_history) >= win + 2:
-                pnl_slice_raw = np.array(daily_pnl_history[-win:])
+            hist_arr = np.array(shock_state["history"])
+            
+            if len(hist_arr) >= win + 2:
+                pnl_slice_raw = hist_arr[-win:]
                 
-                # A) Raw Metric Z-Score
                 if shock_cfg.use_raw_pnl:
                     mask_raw = np.isfinite(pnl_slice_raw)
                     if mask_raw.sum() >= 2:
@@ -976,9 +968,8 @@ def run_month(
                                 if last_z <= shock_cfg.raw_pnl_z_thresh:
                                     is_new_shock_triggered = True
 
-                # B) Residual Z-Score
                 if shock_cfg.use_residuals and not is_new_shock_triggered and valid_reg_cols:
-                    rel_dates = daily_pnl_dates[-win:]
+                    rel_dates = shock_state["dates"][-win:]
                     try:
                         sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
                         if len(sig_slice_raw) == len(pnl_slice_raw):
@@ -1004,13 +995,15 @@ def run_month(
                     except Exception:
                          pass
 
+        # State Update: If shock detected TODAY, set blocks for FUTURE
         if is_new_shock_triggered:
-            shock_block_remaining = int(shock_cfg.block_length)
+            shock_state["remaining"] = int(shock_cfg.block_length)
 
         # ============================================================
-        # 3) EXECUTE PANIC EXIT (IF SHOCK TODAY)
+        # 3) EXECUTE PANIC (IF SHOCK TODAY + MODE=EXIT_ALL)
         # ============================================================
-        is_in_shock_state = (shock_block_remaining > 0) or is_new_shock_triggered
+        # If we are in a shock state (either carried over or just detected), handle panic
+        is_in_shock_state = (shock_state["remaining"] > 0) or is_new_shock_triggered
         
         if is_in_shock_state and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
             panic_pnl_realized_bps = 0.0 
@@ -1032,59 +1025,47 @@ def run_month(
                 panic_tcost_bps += tcost_bp
                 panic_tcost_cash += tcost_cash
                 
-                # Capture Realized Outcome
                 panic_pnl_realized_bps += (pos.pnl_bp - tcost_bp)
                 panic_pnl_realized_cash += (pos.pnl_cash - tcost_cash)
 
                 closed_rows.append({
-                    "open_ts": pos.open_ts, 
-                    "close_ts": pos.close_ts, 
-                    "exit_reason": pos.exit_reason,
-                    "tenor_i": pos.tenor_i, 
-                    "tenor_j": pos.tenor_j,
-                    "w_i": pos.w_i,
-                    "w_j": pos.w_j,
-                    "leg_dir_i": float(np.sign(pos.w_i)),
-                    "leg_dir_j": float(np.sign(pos.w_j)),
-                    "entry_rate_i": pos.entry_rate_i,
-                    "entry_rate_j": pos.entry_rate_j,
-                    "close_rate_i": getattr(pos, "last_rate_i", np.nan),
-                    "close_rate_j": getattr(pos, "last_rate_j", np.nan),
-                    "dv01_i_entry": pos.dv01_i_entry,
-                    "dv01_j_entry": pos.dv01_j_entry,
-                    "dv01_i_close": pos.dv01_i_curr,
-                    "dv01_j_close": pos.dv01_j_curr,
-                    "initial_dv01": pos.initial_dv01,
-                    "scale_dv01": pos.scale_dv01,
-                    "entry_zspread": pos.entry_zspread,
-                    "conv_proxy": pos.conv_pnl_proxy,
-                    "pnl_gross_bp": pos.pnl_bp, 
-                    "pnl_gross_cash": pos.pnl_cash,
-                    "tcost_bp": tcost_bp, 
-                    "tcost_cash": tcost_cash,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp, 
-                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": pos.exit_reason,
+                    "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                    "w_i": pos.w_i, "w_j": pos.w_j,
+                    "leg_dir_i": float(np.sign(pos.w_i)), "leg_dir_j": float(np.sign(pos.w_j)),
+                    "entry_rate_i": pos.entry_rate_i, "entry_rate_j": pos.entry_rate_j,
+                    "close_rate_i": getattr(pos, "last_rate_i", np.nan), "close_rate_j": getattr(pos, "last_rate_j", np.nan),
+                    "dv01_i_entry": pos.dv01_i_entry, "dv01_j_entry": pos.dv01_j_entry,
+                    "dv01_i_close": pos.dv01_i_curr, "dv01_j_close": pos.dv01_j_curr,
+                    "initial_dv01": pos.initial_dv01, "scale_dv01": pos.scale_dv01,
+                    "entry_zspread": pos.entry_zspread, "conv_proxy": pos.conv_pnl_proxy,
+                    "pnl_gross_bp": pos.pnl_bp, "pnl_gross_cash": pos.pnl_cash,
+                    "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
-                    "trade_id": pos.meta.get("trade_id"),
-                    "side": pos.meta.get("side"),
+                    "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side"),
                 })
             
             open_positions = [] 
             
             # RETROACTIVE HISTORY UPDATE
             if metric_type == "REALIZED_CASH":
-                daily_pnl_history[-1] += panic_pnl_realized_cash
+                shock_state["history"][-1] += panic_pnl_realized_cash
             elif metric_type == "REALIZED_BPS":
-                daily_pnl_history[-1] += panic_pnl_realized_bps
+                shock_state["history"][-1] += panic_pnl_realized_bps
             elif metric_type == "MTM_BPS" or metric_type == "BPS":
-                daily_pnl_history[-1] -= panic_tcost_bps
-            else: # MTM_CASH
-                daily_pnl_history[-1] -= panic_tcost_cash
+                shock_state["history"][-1] -= panic_tcost_bps
+            else: 
+                shock_state["history"][-1] -= panic_tcost_cash
 
         # ============================================================
-        # 4) GATE ENTRIES (Based on YESTERDAY'S State)
+        # 4) GATE ENTRIES
         # ============================================================
+        # Standard Logic: Use Lagged State (was_shock_active_at_open)
+        # Override Logic: If we just Panic Exited today (is_in_shock_state and EXIT_ALL),
+        # it makes no sense to re-enter in the same bucket.
+        
         regime_ok = True
         if regime_mask is not None:
             if dts in regime_mask.index:
@@ -1092,11 +1073,16 @@ def run_month(
             else:
                 regime_ok = False 
 
-        if (not regime_ok) or was_shock_active_at_open:
+        gate_condition = (not regime_ok) or was_shock_active_at_open
+        
+        if SHOCK_MODE == "EXIT_ALL" and is_in_shock_state:
+            gate_condition = True # Force block if we just panicked
+
+        if gate_condition:
             continue
 
         # ============================================================
-        # 5) NEW ENTRIES
+        # 5) NEW ENTRIES (Overlay / Strategy)
         # ============================================================
         remaining_slots = max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions))
         if remaining_slots <= 0:
@@ -1212,7 +1198,7 @@ def run_all(
     shock_cfg: Optional[ShockConfig] = None,
 ):
     """
-    Run multiple months with support for Regime and Shock filters.
+    Run multiple months with GLOBAL State Persistence for PnL History and Shock Blocks.
     """
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     mode = mode.lower()
@@ -1225,6 +1211,14 @@ def run_all(
 
     all_pos, all_ledger, all_by = [], [], []
     open_positions: List[PairPos] = []
+
+    # --- INITIALIZE GLOBAL SHOCK STATE ---
+    # This dict persists across month boundaries
+    global_shock_state = {
+        "history": [],
+        "dates": [],
+        "remaining": 0
+    }
 
     filter_status = "ON" if (regime_mask is not None or shock_cfg is not None) else "OFF"
     print(f"[INFO] months: {len(yymms)} | mode={mode} | filter={filter_status}")
@@ -1250,7 +1244,10 @@ def run_all(
             # Pass Filter Args
             regime_mask=regime_mask,
             hybrid_signals=hybrid_signals,
-            shock_cfg=shock_cfg
+            shock_cfg=shock_cfg,
+            
+            # Pass Global State (Mutable Dict)
+            shock_state=global_shock_state
         )
         
         if not p.empty: all_pos.append(p.assign(yymm=yymm))
@@ -1281,7 +1278,6 @@ def run_all(
         pd.concat(all_ledger, ignore_index=True) if all_ledger else pd.DataFrame(),
         pd.concat(all_by, ignore_index=True) if all_by else pd.DataFrame()
     )
-
 # ------------------------
 # CLI
 # ------------------------
