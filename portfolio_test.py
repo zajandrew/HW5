@@ -690,9 +690,14 @@ def run_month(
 ):
     """
     Run a single month with integrated Regime and Endogenous PnL Shock filtering.
-    Includes support for SHOCK_MODE ("ROLL_OFF" vs "EXIT_ALL").
+    Includes robustness fixes for numerical stability in daily regression checks.
     """
     import math
+    # Ensure numpy is available as np
+    try:
+        np
+    except NameError:
+        import numpy as np
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     mode = mode.lower()
@@ -755,7 +760,9 @@ def run_month(
     def _per_trade_dv01_cap_for_bucket(bucket: str) -> float:
         return float(OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get(bucket, OVERLAY_DV01_CAP_PER_TRADE_BUCKET.get("other", OVERLAY_DV01_CAP_PER_TRADE)))
 
-    BPS_PNL_STOP = float(getattr(cr, "BPS_PNL_STOP", 0.0))
+    # Fix for TypeError if BPS_PNL_STOP is None in config
+    _bps_stop_val = getattr(cr, "BPS_PNL_STOP", None)
+    BPS_PNL_STOP = float(_bps_stop_val) if _bps_stop_val is not None else 0.0
 
     # --- Shock Filter Setup ---
     daily_pnl_history: list[float] = [] 
@@ -768,7 +775,8 @@ def run_month(
     if shock_cfg is not None:
         if hybrid_signals is not None:
             if "decision_ts" in hybrid_signals.columns:
-                sig_lookup = hybrid_signals.set_index("decision_ts").sort_index()
+                # Ensure unique index for safe lookup
+                sig_lookup = hybrid_signals.drop_duplicates("decision_ts").set_index("decision_ts").sort_index()
             else:
                 sig_lookup = hybrid_signals
             
@@ -821,14 +829,11 @@ def run_month(
         still_open: list[PairPos] = []
         
         for pos in open_positions:
-            # Capture PnL state before mark
             prev_pnl_cash = pos.pnl_cash
             prev_pnl_bp = pos.pnl_bp
             
-            # Mark (updates internal pnl_cash/bp)
             zsp = pos.mark(snap_last, decision_ts=dts)
             
-            # Add incremental PnL
             period_pnl_cash += (pos.pnl_cash - prev_pnl_cash)
             period_pnl_bps += (pos.pnl_bp - prev_pnl_bp)
 
@@ -867,7 +872,6 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
-            # Ledger logging
             ledger_rows.append({
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
@@ -897,7 +901,7 @@ def run_month(
         open_positions = still_open
 
         # ----------------------------------------------------------
-        # 2) Update Endogenous Shock State
+        # 2) Update Endogenous Shock State (BPS vs CASH)
         # ----------------------------------------------------------
         
         # Choose Metric
@@ -917,45 +921,90 @@ def run_month(
         # Check for new shocks if config enabled
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
+            # Need enough data for window + buffer
             if len(daily_pnl_history) >= win + 2:
-                pnl_slice = np.array(daily_pnl_history[-win:])
+                # Slice recent PnL (Y)
+                pnl_slice_raw = np.array(daily_pnl_history[-win:])
                 
                 # A) Raw Metric Z-Score
                 if shock_cfg.use_raw_pnl:
-                    mu = np.mean(pnl_slice)
-                    sd = np.std(pnl_slice, ddof=1)
-                    if sd > 1e-9:
-                        last_z = (pnl_slice[-1] - mu) / sd
-                        if last_z <= shock_cfg.raw_pnl_z_thresh:
-                            shock_block_remaining = int(shock_cfg.block_length)
-                            is_shock_blocked = True
+                    # Filter NaNs/Infs for robust stats
+                    mask_raw = np.isfinite(pnl_slice_raw)
+                    if mask_raw.sum() >= 2:
+                        pnl_clean = pnl_slice_raw[mask_raw]
+                        mu = np.mean(pnl_clean)
+                        sd = np.std(pnl_clean, ddof=1)
+                        if sd > 1e-9:
+                            # Check latest point if it's finite
+                            if np.isfinite(pnl_slice_raw[-1]):
+                                last_z = (pnl_slice_raw[-1] - mu) / sd
+                                if last_z <= shock_cfg.raw_pnl_z_thresh:
+                                    shock_block_remaining = int(shock_cfg.block_length)
+                                    is_shock_blocked = True
 
                 # B) Residual Z-Score (Endogenous Regression)
+                # Robust implementation matching hybrid_filter.py logic
                 if shock_cfg.use_residuals and not is_shock_blocked and valid_reg_cols:
                     rel_dates = daily_pnl_dates[-win:]
                     try:
-                        sig_slice = sig_lookup.loc[rel_dates, valid_reg_cols].values
-                        if len(sig_slice) == len(pnl_slice):
-                            X = np.column_stack([np.ones(len(sig_slice)), sig_slice])
-                            Y = pnl_slice
-                            beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-                            y_hat = X @ beta
-                            resid = Y - y_hat
-                            r_mu = np.mean(resid)
-                            r_sd = np.std(resid, ddof=1)
-                            if r_sd > 1e-9:
-                                last_r_z = (resid[-1] - r_mu) / r_sd
-                                if last_r_z <= shock_cfg.resid_z_thresh:
-                                    shock_block_remaining = int(shock_cfg.block_length)
-                                    is_shock_blocked = True
+                        # 1. Get raw X slice
+                        # Use reindex to handle missing dates gracefully (fills with NaN)
+                        sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
+                        
+                        if len(sig_slice_raw) == len(pnl_slice_raw):
+                            # 2. Create mask for finite values in both Y and X rows
+                            # Check PnL is finite AND all signals in the row are finite
+                            valid_mask = np.isfinite(pnl_slice_raw) & np.isfinite(sig_slice_raw).all(axis=1)
+                            
+                            # 3. Ensure enough degrees of freedom (rows > cols + intercept)
+                            n_obs = valid_mask.sum()
+                            n_cols = sig_slice_raw.shape[1] + 1
+                            
+                            if n_obs >= n_cols + 1:
+                                # 4. Apply mask to get clean data
+                                Y_clean = pnl_slice_raw[valid_mask]
+                                X_clean = sig_slice_raw[valid_mask]
+                                
+                                # 5. Add Intercept
+                                X_final = np.column_stack([np.ones(len(X_clean)), X_clean])
+                                
+                                # 6. Run Regression with error catching
+                                try:
+                                    # rcond=None lets numpy determine cutoff for singular values
+                                    beta, _, _, _ = np.linalg.lstsq(X_final, Y_clean, rcond=None)
+                                    
+                                    # Calculate Residuals
+                                    y_hat = X_final @ beta
+                                    resid = Y_clean - y_hat
+                                    
+                                    # Calculate Residual Z-Score
+                                    r_mu = np.mean(resid)
+                                    r_sd = np.std(resid, ddof=1)
+                                    
+                                    if r_sd > 1e-9:
+                                        # We need the residual corresponding to the *latest* date.
+                                        # Since we masked data, the latest valid residual is the last one.
+                                        last_r_z = (resid[-1] - r_mu) / r_sd
+                                        if last_r_z <= shock_cfg.resid_z_thresh:
+                                            shock_block_remaining = int(shock_cfg.block_length)
+                                            is_shock_blocked = True
+                                except np.linalg.LinAlgError:
+                                    # SVD convergence failure or similar numerical issue. 
+                                    # Skip residual check this bucket.
+                                    pass
                     except KeyError:
-                        pass 
+                         # Date alignment issue in lookup
+                         pass
+                    except Exception:
+                         # Catch-all for other unexpected numerical issues during slicing
+                         pass
 
         # ----------------------------------------------------------
         # 3) Check Regime & Handle Shock Action (EXIT_ALL vs ROLL_OFF)
         # ----------------------------------------------------------
         regime_ok = True
         if regime_mask is not None:
+            # Safe lookup for regime mask
             if dts in regime_mask.index:
                 regime_ok = bool(regime_mask.at[dts])
             else:
@@ -987,7 +1036,6 @@ def run_month(
             open_positions = [] # All liquidated
             
             # Retroactively update today's PnL record to reflect the cost of panic exit
-            # This ensures the shock metric history is accurate
             if getattr(shock_cfg, "metric_type", "BPS") == "BPS":
                 daily_pnl_history[-1] -= total_exit_cost_bps
             else:
