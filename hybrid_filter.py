@@ -11,11 +11,13 @@ Responsibilities
 2) Regime filter:
    - From hybrid_signals, build composite "signal health", "trendiness", etc.
    - Produce a boolean series indicating when we consider the environment tradable.
+   - Can pull defaults directly from cr_config.
 
 3) Shock-blocker:
-   - From closed-positions PnL (pnl_net_bp) and hybrid_signals,
-     detect local PnL shocks and block new risk for K buckets after each shock,
-     without lookahead bias.
+   - From closed-positions PnL and hybrid_signals, detect local PnL shocks 
+     and block new risk for K buckets after each shock.
+   - Can pull defaults directly from cr_config.
+   - Used primarily for OFF-LINE analysis. (On-line logic is in portfolio_test).
 
 All functions are written to avoid lookahead by design: any signal used to
 decide about bucket t is lagged to t-1.
@@ -68,8 +70,8 @@ class RegimeConfig:
 def _iter_enhanced_paths() -> List[Path]:
     """Return list of enhanced parquet paths respecting ENH_SUFFIX."""
     root = Path(cr.PATH_ENH)
-    # You can tighten this pattern if you prefer
-    return sorted(root.glob(f"*{cr.ENH_SUFFIX}.parquet"))
+    suffix = getattr(cr, "ENH_SUFFIX", "")
+    return sorted(root.glob(f"*{suffix}.parquet"))
 
 
 def _compute_z_slope(tenor: np.ndarray, z: np.ndarray) -> float:
@@ -126,14 +128,7 @@ def build_hybrid_signals(
 ) -> pd.DataFrame:
     """
     Build (or load) hybrid_signals from enhanced parquets.
-
-    Steps:
-      1) Iterate month-by-month through enhanced files to build cross-sectional
-         curve environment stats per decision_ts.
-      2) On the resulting time series, compute rolling / regime metrics.
-      3) Lag all regime metrics by 1 bucket to avoid lookahead.
-
-    Output is saved to HYBRID_SIGNALS_PATH and returned.
+    Lag all regime metrics by 1 bucket to avoid lookahead.
     """
     regime_cfg = regime_cfg or RegimeConfig()
     buckets = regime_cfg.buckets or cr.BUCKETS
@@ -217,8 +212,6 @@ def build_hybrid_signals(
 
     # ------------------------------------------------------------------
     # Composite "signal_health" and "trendiness"
-    #   health: high when mean z not extreme, std moderate, slope modest
-    #   trendiness: basically |slope z-score|
     # ------------------------------------------------------------------
     health_terms = []
     if "z_xs_mean_roll_z" in sig.columns:
@@ -229,7 +222,6 @@ def build_hybrid_signals(
         health_terms.append(regime_cfg.w_health_slope * sig["z_xs_slope_roll_z"].pow(2) * -1.0)
 
     if health_terms:
-        # more negative squared-z means worse; we flip sign to make higher=better
         sig["signal_health_raw"] = sum(health_terms)
         # normalize
         mu = sig["signal_health_raw"].rolling(win, min_periods=2).mean()
@@ -272,11 +264,15 @@ def regime_mask_from_signals(
 ) -> pd.Series:
     """
     Construct a boolean mask 'ok_to_trade' indexed by decision_ts from signals.
-
-    Any threshold attribute set to None is ignored. All non-None constraints
-    must be satisfied simultaneously for ok=True.
+    AUTO-LOADS defaults from cr_config if thresholds=None.
     """
-    thresholds = thresholds or RegimeThresholds()
+    # --- NEW: Load defaults from config if missing ---
+    if thresholds is None:
+        thresholds = RegimeThresholds(
+            min_signal_health_z=float(getattr(cr, "MIN_SIGNAL_HEALTH_Z", -0.5)),
+            max_trendiness_abs=float(getattr(cr, "MAX_TRENDINESS_ABS", 2.0)),
+            max_z_xs_mean_abs_z=float(getattr(cr, "MAX_Z_XS_MEAN_ABS_Z", 2.0)),
+        )
 
     sig = signals.copy()
     if "decision_ts" not in sig.columns:
@@ -321,6 +317,10 @@ class ShockConfig:
 
     # block length (K) after each detected shock, in buckets
     block_length: int = 10
+    
+    # --- NEW FIELDS ---
+    metric_type: str = "BPS"      # "BPS" or "CASH"
+    shock_mode: str = "ROLL_OFF"  # "ROLL_OFF" or "EXIT_ALL"
 
 
 def _make_pnl_ts_from_closed(
@@ -331,10 +331,6 @@ def _make_pnl_ts_from_closed(
 ) -> pd.DataFrame:
     """
     Convert closed-positions df into a time series of PnL by decision bucket.
-
-    pos_overlay is expected to have:
-      - 'close_ts'  (Timestamp)
-      - pnl_col (e.g. 'pnl_net_bp')
     """
     if pnl_col not in pos_overlay.columns:
         raise ValueError(f"pos_overlay missing column {pnl_col!r}")
@@ -368,31 +364,31 @@ def run_shock_blocker(
     decision_freq: Optional[str] = None,
 ) -> Dict[str, object]:
     """
-    Core shock-blocker logic.
-
-    Inputs
-    ------
-    pos_overlay : closed positions df from portfolio_test_new (overlay or combined),
-                  must contain 'close_ts' and 'pnl_net_bp'.
-    signals     : hybrid_signals df (from build_hybrid_signals).
-    shock_cfg   : tuning knobs (window, thresholds, block length, etc).
-
-    Returns dict with:
-      - "ts"                  : DatetimeIndex of decision buckets
-      - "pnl_raw"            : original pnl time series (per bucket)
-      - "pnl_blocked"        : pnl with shock-based blocks applied
-      - "shock_mask"         : boolean series: True where bucket is a "shock"
-      - "block_mask"         : boolean series: True where trading would be blocked
-      - "regression_cols"    : actual cols used in regression (if any)
+    Core shock-blocker logic (OFF-LINE ANALYSIS).
+    AUTO-LOADS defaults from cr_config if shock_cfg=None.
     """
-    shock_cfg = shock_cfg or ShockConfig()
+    # --- NEW: Load defaults from config if missing ---
+    if shock_cfg is None:
+        shock_cfg = ShockConfig(
+            pnl_window=int(getattr(cr, "SHOCK_PNL_WINDOW", 10)),
+            use_raw_pnl=bool(getattr(cr, "SHOCK_USE_RAW_PNL", True)),
+            use_residuals=bool(getattr(cr, "SHOCK_USE_RESIDUALS", True)),
+            raw_pnl_z_thresh=float(getattr(cr, "SHOCK_RAW_PNL_Z_THRESH", -1.5)),
+            resid_z_thresh=float(getattr(cr, "SHOCK_RESID_Z_THRESH", -1.5)),
+            regression_cols=list(getattr(cr, "SHOCK_REGRESSION_COLS", [])),
+            block_length=int(getattr(cr, "SHOCK_BLOCK_LENGTH", 10)),
+            metric_type=str(getattr(cr, "SHOCK_METRIC_TYPE", "BPS")),
+            shock_mode=str(getattr(cr, "SHOCK_MODE", "ROLL_OFF"))
+        )
+
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
-    # 1) Build pnl_ts per decision bucket
+    # 1) Build pnl_ts per decision bucket (BPS or CASH based on config)
+    target_col = "pnl_net_bp" if shock_cfg.metric_type == "BPS" else "pnl_net_cash"
     pnl_ts = _make_pnl_ts_from_closed(
         pos_overlay,
         decision_freq=decision_freq,
-        pnl_col="pnl_net_bp",
+        pnl_col=target_col,
     )
 
     # 2) Align with signals on union of decision_ts
@@ -431,11 +427,10 @@ def run_shock_blocker(
     pnl_z = (pnl - pnl_mu) / pnl_sd
 
     if X is not None:
-        # simple expanding regression up to t-1 for each t
-        # to keep it cheap we do a rolling window regression instead of full expanding.
+        # rolling window regression
         resid = pd.Series(np.nan, index=idx, dtype=float)
         for i in range(len(idx)):
-            end = i  # use data up to index i-1
+            end = i
             if end <= 0:
                 continue
             start = max(0, end - win)
@@ -462,7 +457,7 @@ def run_shock_blocker(
         resid = None
         resid_z = None
 
-    # 5) Detect shocks (no lookahead: everything is contemporaneous with bucket)
+    # 5) Detect shocks
     shock = pd.Series(False, index=idx, dtype=bool)
 
     if shock_cfg.use_raw_pnl:
@@ -473,7 +468,7 @@ def run_shock_blocker(
         shock_resid = resid_z <= shock_cfg.resid_z_thresh
         shock |= shock_resid.fillna(False)
 
-    # 6) Build block mask: for each shock bucket, block the subsequent K buckets
+    # 6) Build block mask
     block = pd.Series(False, index=idx, dtype=bool)
     K = int(shock_cfg.block_length)
 
@@ -486,7 +481,7 @@ def run_shock_blocker(
 
     block.name = "block"
 
-    # 7) Apply block to PnL (for evaluation only – we do not touch the strategy here)
+    # 7) Apply block to PnL (for evaluation only)
     pnl_blocked = pnl.copy()
     pnl_blocked[block] = 0.0
 
@@ -520,21 +515,14 @@ def attach_regime_and_shock_masks(
     force_rebuild_signals: bool = False,
 ) -> Dict[str, object]:
     """
-    High-level helper that:
-      1) Loads/builds hybrid_signals.
-      2) Builds regime mask (ok_regime).
-      3) Runs shock_blocker and returns all objects plus masks.
-
-    This does NOT alter your backtest; it just prepares objects you can
-    analyze and later wire into portfolio_test_new.
+    High-level helper (OFFLINE).
     """
     signals = get_or_build_hybrid_signals(force_rebuild=force_rebuild_signals)
 
     # Regime mask
     reg_mask = regime_mask_from_signals(signals, thresholds=regime_thresholds)
 
-    # Shock blocker (based on pnl_net_bp)
-    shock_cfg = shock_cfg or ShockConfig()
+    # Shock blocker
     shock_res = run_shock_blocker(pos_overlay, signals, shock_cfg=shock_cfg)
 
     out = {
