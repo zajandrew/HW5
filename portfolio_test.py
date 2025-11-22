@@ -690,9 +690,7 @@ def run_month(
 ):
     """
     Run a single month.
-    NO LOOKAHEAD VERSION: 
-    - Entries are gated by the shock state as of Yesterday (Start of Bucket).
-    - Panic Exits are triggered by the shock state as of Today (End of Bucket).
+    Updated to support 'REALIZED_CASH' (The "Old Way" - Lumpy & Size Weighted).
     """
     import math
     try:
@@ -762,6 +760,7 @@ def run_month(
     _bps_stop_val = getattr(cr, "BPS_PNL_STOP", None)
     BPS_PNL_STOP = float(_bps_stop_val) if _bps_stop_val is not None else 0.0
 
+    # --- Shock Filter State ---
     daily_pnl_history: list[float] = [] 
     daily_pnl_dates: list[pd.Timestamp] = []
     shock_block_remaining = 0
@@ -817,21 +816,17 @@ def run_month(
         # ============================================================
         # A) CAPTURE STATE AT OPEN (FOR ENTRIES)
         # ============================================================
-        # CRITICAL: We must decide if we are blocked BEFORE we see today's PnL.
-        # If shock_block_remaining > 0 from YESTERDAY, we block entries TODAY.
         was_shock_active_at_open = (shock_block_remaining > 0)
-        
-        # Decrement the counter for the *next* day logic, but 'was_shock_active_at_open'
-        # remains the truth source for gating entries in this bucket.
         if shock_block_remaining > 0:
             shock_block_remaining -= 1
 
         # ============================================================
         # 1) MARK POSITIONS & NATURAL EXITS
         # ============================================================
-        period_pnl_cash = 0.0       
-        period_pnl_bps_mtm = 0.0    
-        period_pnl_bps_realized = 0.0 
+        period_pnl_cash = 0.0       # MTM
+        period_pnl_bps_mtm = 0.0    # MTM
+        period_pnl_bps_realized = 0.0 # Lumpy (Bps)
+        period_pnl_cash_realized = 0.0 # Lumpy (Cash) <--- NEW
         
         still_open: list[PairPos] = []
         
@@ -896,9 +891,13 @@ def run_month(
                 pos.tcost_bp = tcost_bp
                 pos.tcost_cash = tcost_cash
                 
+                # MTM Flows
                 period_pnl_cash -= tcost_cash
                 period_pnl_bps_mtm -= tcost_bp
+                
+                # Realized Flows (Trade PnL - TCost)
                 period_pnl_bps_realized += (pos.pnl_bp - tcost_bp)
+                period_pnl_cash_realized += (pos.pnl_cash - tcost_cash) # <--- NEW
 
                 closed_rows.append({
                     "open_ts": pos.open_ts, 
@@ -939,34 +938,32 @@ def run_month(
         open_positions = still_open
 
         # ============================================================
-        # 2) UPDATE HISTORY & DETECT NEW SHOCK (AT CLOSE)
+        # 2) UPDATE HISTORY & DETECT NEW SHOCK
         # ============================================================
         metric_type = "MTM_BPS"
         if shock_cfg is not None:
             metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS")
         
-        if metric_type == "REALIZED_BPS":
-            metric_val = period_pnl_bps_realized
+        if metric_type == "REALIZED_CASH":
+            metric_val = period_pnl_cash_realized # <--- Lumpy Cash
+        elif metric_type == "REALIZED_BPS":
+            metric_val = period_pnl_bps_realized  # <--- Lumpy Bps
         elif metric_type == "MTM_BPS" or metric_type == "BPS":
-            metric_val = period_pnl_bps_mtm
+            metric_val = period_pnl_bps_mtm       # Smooth Bps
         else:
-            metric_val = period_pnl_cash
+            metric_val = period_pnl_cash          # Smooth Cash
 
         daily_pnl_history.append(metric_val)
         daily_pnl_dates.append(dts)
 
-        # We now check if TODAY'S results triggered a NEW shock.
-        # This new state will affect:
-        #   a) Panic Exits (Today) -> Because we can observe the close and exit MOC.
-        #   b) Entry Gating (Tomorrow) -> Because we can't travel back in time.
-        
+        # Detect Shock
         is_new_shock_triggered = False
-        
         if shock_cfg is not None:
             win = int(shock_cfg.pnl_window)
             if len(daily_pnl_history) >= win + 2:
                 pnl_slice_raw = np.array(daily_pnl_history[-win:])
                 
+                # A) Raw Metric Z-Score
                 if shock_cfg.use_raw_pnl:
                     mask_raw = np.isfinite(pnl_slice_raw)
                     if mask_raw.sum() >= 2:
@@ -979,6 +976,7 @@ def run_month(
                                 if last_z <= shock_cfg.raw_pnl_z_thresh:
                                     is_new_shock_triggered = True
 
+                # B) Residual Z-Score
                 if shock_cfg.use_residuals and not is_new_shock_triggered and valid_reg_cols:
                     rel_dates = daily_pnl_dates[-win:]
                     try:
@@ -1006,20 +1004,17 @@ def run_month(
                     except Exception:
                          pass
 
-        # If new shock, set block for FUTURE
         if is_new_shock_triggered:
             shock_block_remaining = int(shock_cfg.block_length)
 
         # ============================================================
-        # 3) CHECK REGIME & EXECUTE PANIC (IF SHOCK TRIGGERED TODAY)
+        # 3) EXECUTE PANIC EXIT (IF SHOCK TODAY)
         # ============================================================
-        # Panic logic uses TODAY'S shock status (is_new_shock_triggered or existing block)
-        # If we are in a shock (old or new), and mode is EXIT_ALL, get out.
-        
         is_in_shock_state = (shock_block_remaining > 0) or is_new_shock_triggered
         
         if is_in_shock_state and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
-            panic_pnl_realized_net = 0.0 
+            panic_pnl_realized_bps = 0.0 
+            panic_pnl_realized_cash = 0.0
             panic_tcost_bps = 0.0        
             panic_tcost_cash = 0.0
             
@@ -1036,7 +1031,10 @@ def run_month(
                 
                 panic_tcost_bps += tcost_bp
                 panic_tcost_cash += tcost_cash
-                panic_pnl_realized_net += (pos.pnl_bp - tcost_bp)
+                
+                # Capture Realized Outcome
+                panic_pnl_realized_bps += (pos.pnl_bp - tcost_bp)
+                panic_pnl_realized_cash += (pos.pnl_cash - tcost_cash)
 
                 closed_rows.append({
                     "open_ts": pos.open_ts, 
@@ -1075,19 +1073,18 @@ def run_month(
             open_positions = [] 
             
             # RETROACTIVE HISTORY UPDATE
-            if metric_type == "REALIZED_BPS":
-                daily_pnl_history[-1] += panic_pnl_realized_net
+            if metric_type == "REALIZED_CASH":
+                daily_pnl_history[-1] += panic_pnl_realized_cash
+            elif metric_type == "REALIZED_BPS":
+                daily_pnl_history[-1] += panic_pnl_realized_bps
             elif metric_type == "MTM_BPS" or metric_type == "BPS":
                 daily_pnl_history[-1] -= panic_tcost_bps
-            else: 
+            else: # MTM_CASH
                 daily_pnl_history[-1] -= panic_tcost_cash
 
         # ============================================================
-        # 4) CHECK REGIME & GATE ENTRIES
+        # 4) GATE ENTRIES (Based on YESTERDAY'S State)
         # ============================================================
-        # CRITICAL: We use 'was_shock_active_at_open' (Yesterday's state) to gate entries.
-        # This prevents looking ahead at today's PnL to avoid today's trades.
-        
         regime_ok = True
         if regime_mask is not None:
             if dts in regime_mask.index:
