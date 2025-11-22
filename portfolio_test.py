@@ -689,12 +689,7 @@ def run_month(
     shock_cfg: Optional[ShockConfig] = None,       
 ):
     """
-    Run a single month. 
-    Includes: 
-      - Regime & Shock Filters (Robustness logic)
-      - Endogenous PnL Tracking (BPS or CASH)
-      - Full Column Logging (Restored)
-      - Trade-time Rate Lookup
+    Run a single month with granular tenor thresholds (EXEC vs ALT).
     """
     import math
     try:
@@ -799,7 +794,11 @@ def run_month(
     SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
     Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
     Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
-    MIN_LEG_TENOR = float(getattr(cr, "MIN_LEG_TENOR_YEARS", 0.0))
+    
+    # --- NEW: Granular Tenor Thresholds ---
+    EXEC_LEG_TENOR_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
+    ALT_LEG_TENOR_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
+    
     MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
     MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
 
@@ -814,7 +813,7 @@ def run_month(
             continue
 
         # ----------------------------------------------------------
-        # 1) Mark positions
+        # 1) Mark positions & Calculate Period PnL
         # ----------------------------------------------------------
         period_pnl_cash = 0.0
         period_pnl_bps = 0.0
@@ -864,13 +863,11 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
-            # Ledger logging
             ledger_rows.append({
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
                 "z_spread": zsp, "closed": pos.closed, "mode": pos.mode,
-                # Extra ledger info
                 "rate_i": getattr(pos, "last_rate_i", np.nan),
                 "rate_j": getattr(pos, "last_rate_j", np.nan),
                 "w_i": pos.w_i, "w_j": pos.w_j,
@@ -886,7 +883,6 @@ def run_month(
                 period_pnl_cash -= tcost_cash
                 period_pnl_bps -= tcost_bp
 
-                # FULL OUTPUT COLUMNS RESTORED
                 closed_rows.append({
                     "open_ts": pos.open_ts, 
                     "close_ts": pos.close_ts, 
@@ -897,33 +893,26 @@ def run_month(
                     "w_j": pos.w_j,
                     "leg_dir_i": float(np.sign(pos.w_i)),
                     "leg_dir_j": float(np.sign(pos.w_j)),
-                    
                     "entry_rate_i": pos.entry_rate_i,
                     "entry_rate_j": pos.entry_rate_j,
                     "close_rate_i": getattr(pos, "last_rate_i", np.nan),
                     "close_rate_j": getattr(pos, "last_rate_j", np.nan),
-                    
                     "dv01_i_entry": pos.dv01_i_entry,
                     "dv01_j_entry": pos.dv01_j_entry,
                     "dv01_i_close": pos.dv01_i_curr,
                     "dv01_j_close": pos.dv01_j_curr,
                     "initial_dv01": pos.initial_dv01,
                     "scale_dv01": pos.scale_dv01,
-                    
                     "entry_zspread": pos.entry_zspread,
                     "conv_proxy": pos.conv_pnl_proxy,
-                    
                     "pnl_gross_bp": pos.pnl_bp, 
                     "pnl_gross_cash": pos.pnl_cash,
                     "tcost_bp": tcost_bp, 
                     "tcost_cash": tcost_cash,
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, 
                     "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
-                    
-                    # Meta
                     "trade_id": pos.meta.get("trade_id"),
                     "side": pos.meta.get("side"),
                 })
@@ -933,7 +922,7 @@ def run_month(
         open_positions = still_open
 
         # ----------------------------------------------------------
-        # 2) Update Shock State
+        # 2) Update Endogenous Shock State
         # ----------------------------------------------------------
         if shock_cfg is not None and getattr(shock_cfg, "metric_type", "BPS") == "BPS":
             metric_val = period_pnl_bps
@@ -1029,32 +1018,26 @@ def run_month(
                     "w_j": pos.w_j,
                     "leg_dir_i": float(np.sign(pos.w_i)),
                     "leg_dir_j": float(np.sign(pos.w_j)),
-                    
                     "entry_rate_i": pos.entry_rate_i,
                     "entry_rate_j": pos.entry_rate_j,
                     "close_rate_i": getattr(pos, "last_rate_i", np.nan),
                     "close_rate_j": getattr(pos, "last_rate_j", np.nan),
-                    
                     "dv01_i_entry": pos.dv01_i_entry,
                     "dv01_j_entry": pos.dv01_j_entry,
                     "dv01_i_close": pos.dv01_i_curr,
                     "dv01_j_close": pos.dv01_j_curr,
                     "initial_dv01": pos.initial_dv01,
                     "scale_dv01": pos.scale_dv01,
-                    
                     "entry_zspread": pos.entry_zspread,
                     "conv_proxy": pos.conv_pnl_proxy,
-                    
                     "pnl_gross_bp": pos.pnl_bp, 
                     "pnl_gross_cash": pos.pnl_cash,
                     "tcost_bp": tcost_bp, 
                     "tcost_cash": tcost_cash,
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, 
                     "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
-                    
                     "trade_id": pos.meta.get("trade_id"),
                     "side": pos.meta.get("side"),
                 })
@@ -1103,7 +1086,9 @@ def run_month(
                 if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS: break
                 
                 trade_tenor = float(h["tenor_yrs"])
-                if trade_tenor < MIN_LEG_TENOR: continue
+                
+                # --- Granular Check 1: Exec Leg ---
+                if trade_tenor < EXEC_LEG_TENOR_THRESHOLD: continue
                 
                 dv01_cash = float(h["dv01"])
                 if abs(dv01_cash) > _per_trade_dv01_cap_for_bucket(assign_bucket(trade_tenor)): continue
@@ -1121,7 +1106,11 @@ def run_month(
                 
                 for _, alt_row in snap_srt.iterrows():
                     alt_tenor = float(alt_row["tenor_yrs"])
-                    if alt_tenor == exec_tenor or alt_tenor < MIN_LEG_TENOR: continue
+                    
+                    # --- Granular Check 2: Alt Leg ---
+                    if alt_tenor < ALT_LEG_TENOR_THRESHOLD: continue
+                    
+                    if alt_tenor == exec_tenor: continue
                     if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
                     
                     z_alt = _to_float(alt_row["z_comb"])
