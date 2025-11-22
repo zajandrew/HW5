@@ -99,7 +99,11 @@ SHOCK_REGRESSION_COLS   = [      # Columns from hybrid_signals to regress agains
     "trendiness_abs", 
     "z_xs_mean_roll_z"
 ]
-SHOCK_METRIC_TYPE       = "BPS"  # "BPS" or "CASH"
+SHOCK_METRIC_TYPE       = "REALIZED_BPS"  
+# Options:
+# "MTM_BPS"      = Daily mark-to-market variance (Smooth, catches volatility)
+# "MTM_CASH"     = Daily cash equity change (Smooth, catches risk-weighted volatility)
+# "REALIZED_BPS" = Closed trade outcomes (Lumpy, catches Strategy Failures) -> OLD BEHAVIOR
 SHOCK_MODE              = "ROLL_OFF" #"ROLL_OFF" or "EXIT_ALL"
 
 # ========= Risk & selection =========
