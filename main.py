@@ -1,3 +1,101 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from pathlib import Path
+import numpy as np
+
+# Import your config to get paths automatically
+import cr_config as cr
+
+# ==============================================================================
+# 1. LOAD CLOSED POSITIONS
+# ==============================================================================
+out_dir = Path(cr.PATH_OUT)
+suffix = getattr(cr, "OUT_SUFFIX", "")
+pos_path = out_dir / f"positions_ledger{suffix}.parquet"
+
+if not pos_path.exists():
+    print(f"[ERROR] File not found: {pos_path}")
+else:
+    print(f"[LOAD] Reading {pos_path}...")
+    df = pd.read_parquet(pos_path)
+
+    # 1. Filter for Overlay Mode (if mixed)
+    if "mode" in df.columns:
+        df = df[df["mode"] == "overlay"].copy()
+
+    # 2. Sort by CLOSE TIME (Critical for realized equity curve)
+    df["close_ts"] = pd.to_datetime(df["close_ts"])
+    df = df.sort_values("close_ts").reset_index(drop=True)
+
+    # ==============================================================================
+    # 2. CALCULATE REALIZED EQUITY CURVE
+    # ==============================================================================
+    # Cumulative Sum of Net PnL (Bps and Cash)
+    df["equity_bp"] = df["pnl_net_bp"].cumsum()
+    df["equity_cash"] = df["pnl_net_cash"].cumsum()
+
+    # Calculate Drawdown (Distance from All-Time High Realized Equity)
+    running_max_bp = df["equity_bp"].cummax()
+    df["drawdown_bp"] = df["equity_bp"] - running_max_bp
+
+    # Stats
+    total_bp = df["pnl_net_bp"].sum()
+    total_cash = df["pnl_net_cash"].sum()
+    max_dd = df["drawdown_bp"].min()
+    win_rate = (df["pnl_net_bp"] > 0).mean()
+    avg_trade = df["pnl_net_bp"].mean()
+
+    print("-" * 40)
+    print(f"Total Realized PnL:   {total_bp:,.1f} bps")
+    print(f"Total Realized Cash:  ${total_cash:,.0f}")
+    print(f"Max Realized DD:      {max_dd:,.1f} bps")
+    print(f"Win Rate:             {win_rate:.1%}")
+    print(f"Avg Trade:            {avg_trade:.2f} bps")
+    print("-" * 40)
+
+    # ==============================================================================
+    # 3. PLOT
+    # ==============================================================================
+    # We use a STEP plot because realized PnL is discrete.
+    # It implies: "My banked money stayed X until trade T closed."
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, 
+                                   gridspec_kw={'height_ratios': [3, 1]})
+
+    # --- Top: Equity Curve ---
+    ax1.step(df["close_ts"], df["equity_bp"], where='post', color='#1f77b4', lw=2, label="Realized Net PnL")
+    
+    # Optional: Color background for "Winning Streaks" vs "Losing Streaks"?
+    # Keeping it simple for now.
+    
+    ax1.set_title("Closed Position Equity Curve (Net Bps)", fontsize=14, fontweight='bold')
+    ax1.set_ylabel("Cumulative Bps")
+    ax1.grid(True, alpha=0.4)
+    ax1.legend(loc="upper left")
+
+    # --- Bottom: Drawdown ---
+    ax2.fill_between(df["close_ts"], df["drawdown_bp"], 0, step='post', color='#d62728', alpha=0.3)
+    ax2.step(df["close_ts"], df["drawdown_bp"], where='post', color='#d62728', lw=1)
+    
+    ax2.set_title("Drawdown Profile (High Water Mark)", fontsize=12)
+    ax2.set_ylabel("Drawdown (Bps)")
+    ax2.set_xlabel("Trade Close Date")
+    ax2.grid(True, alpha=0.4)
+
+    # Format X-Axis Dates
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.xticks(rotation=0)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
