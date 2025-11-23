@@ -1,4 +1,4 @@
-# stitch_trades_with_curve.py  (or whatever file name you used before)
+# stitch_curve_trades.py
 
 from pathlib import Path
 from typing import Optional, List, Dict
