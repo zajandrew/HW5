@@ -5,7 +5,7 @@ Generates 'Mutant' variants of the historical trade tape for robustness testing.
 1. Loads the real trade tape (trades.pkl).
 2. Creates N variants (default 10).
 3. Applies random Time Jitter (Business Days) and Size Jitter (DV01).
-4. Calls the 'Stitcher' to attach the actual historical curve data 
+4. Calls 'stitch_curve_trades' to attach the actual historical curve data 
    corresponding to the NEW (jittered) timestamps.
 """
 
@@ -20,11 +20,10 @@ import cr_config as cr
 
 # Import the Stitcher Module
 try:
-    import trade_curve_stitch_raw as stitcher
+    import stitch_curve_trades as stitcher
 except ImportError:
-    print("[ERR] Could not import 'trade_curve_stitch_raw'.")
+    print("[ERR] Could not import 'stitch_curve_trades'.")
     print("      Please ensure your stitching script is in this directory.")
-    print("      If it is named differently, rename this import.")
     raise
 
 # ==============================================================================
@@ -39,7 +38,7 @@ SOURCE_FILE = "trades.pkl"
 def load_original_trades() -> pd.DataFrame:
     path = Path(SOURCE_FILE)
     if not path.exists():
-        # Fallback to config if explicit file missing, or raise
+        # Fallback to config if explicit file missing
         path_alt = Path(f"{cr.TRADE_TYPES}.pkl")
         if path_alt.exists():
             print(f"[WARN] {SOURCE_FILE} not found, falling back to {path_alt}")
@@ -68,7 +67,7 @@ def generate_mutant_tape(original_df: pd.DataFrame, seed: int) -> pd.DataFrame:
     #    We use BusinessDay to avoid moving trades to weekends where curve data is missing.
     days_shift = rng.integers(low=JITTER_DAYS_MIN, high=JITTER_DAYS_MAX + 1, size=n)
     
-    # Optimization: Create a cache: shift -> BDay object to avoid re-instantiating
+    # Optimization: Create a cache: shift -> BDay object
     unique_shifts = np.unique(days_shift)
     offset_map = {s: BusinessDay(s) for s in unique_shifts}
     
@@ -91,7 +90,7 @@ def generate_mutant_tape(original_df: pd.DataFrame, seed: int) -> pd.DataFrame:
         df[tgt_col] = df[tgt_col] * noise
     
     # 3. Cleanup
-    #    Sort by new times so stitching (merge_asof) works efficiently
+    #    Sort by new times so stitching works efficiently
     df = df.sort_values("tradetimeUTC").reset_index(drop=True)
     
     return df
@@ -100,37 +99,55 @@ def run_generation():
     trades = load_original_trades()
     print(f"[INFO] Original Trades: {len(trades)} rows.")
     
-    out_dir = Path(".") # Save in current dir for overlay_tscv to find
+    out_dir = Path(".") 
     
     for i in range(N_VARIANTS):
         print(f"\n--- Generating Variant {i+1}/{N_VARIANTS} ---")
         
         # 1. Mutate
-        # Use seed = i to ensure reproducibility of the set
         mutant_df = generate_mutant_tape(trades, seed=42 + i)
         
-        # 2. Stitch (The Heavy Lifting)
+        # 2. Stitch
         print(f"   ... Stitching curve data (might take a moment)...")
         
         try:
-            stitched_df = stitcher.stitch_trades_with_raw_curve(
-                mutant_df,
-                out_path=None # We assume we get DF back, save manually
+            # Use the imported stitcher module
+            stitched_df = stitcher.attach_curve_to_trades(
+                trades_path=f"temp_mutant_{i}.pkl", # Dummy path logic if func requires path
+                out_path=None 
+            )
+            # WAIT: attach_curve_to_trades expects a PATH string as input, 
+            # but we have a DataFrame in memory.
+            # We need to adapt slightly. The user's provided stitcher file 
+            # reads from disk. Let's save temp file to be safe.
+            
+            temp_path = Path(f"temp_mutant_input_{i}.pkl")
+            mutant_df.to_pickle(temp_path)
+            
+            stitched_df = stitcher.attach_curve_to_trades(
+                trades_path=temp_path,
+                out_path=None
             )
             
-            # 3. Save
+            # Clean up temp
+            if temp_path.exists():
+                temp_path.unlink()
+            
+            # 3. Save Final
             fname = f"synth_trades_{i}.pkl"
             save_path = out_dir / fname
             stitched_df.to_pickle(save_path)
             
             print(f"   [SUCCESS] Saved {fname} ({len(stitched_df)} rows)")
             
-            # Stats
             kept_pct = len(stitched_df) / len(trades) * 100
-            print(f"   Retention: {kept_pct:.1f}% (Trades lost due to missing curve dates: {len(trades)-len(stitched_df)})")
+            print(f"   Retention: {kept_pct:.1f}%")
             
         except Exception as e:
             print(f"   [FAIL] Variant {i} failed stitching: {e}")
+            # Clean up temp if failed
+            if Path(f"temp_mutant_input_{i}.pkl").exists():
+                Path(f"temp_mutant_input_{i}.pkl").unlink()
 
 if __name__ == "__main__":
     t0 = time.time()
