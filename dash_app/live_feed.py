@@ -4,14 +4,14 @@ import time
 import sys
 from datetime import datetime
 from pathlib import Path
+from data_manager import log_ticks
+import eod_process
 
 # Hook into parent directory for config
 current_dir = Path(__file__).resolve().parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 import cr_config as cr
-from .data_manager import log_ticks
-import eod_process  # Import the EOD processor
 
 class LiveFeed:
     def __init__(self):
