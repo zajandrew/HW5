@@ -91,52 +91,51 @@ def get_live_z_scores(live_rates_map):
 def get_valid_partners(active_ticker, direction, live_z_map):
     """
     Finds candidates based on Z-Spread improvement.
+    Respects Tenor Limits (ALT_LEG_TENOR_YEARS) and Separation Constraints.
     """
     active_tenor = cr.TENOR_YEARS.get(active_ticker)
     
-    # Safety check: if active ticker not in map (e.g. model missing), return empty
+    # Safety check: if active ticker not in map
     if active_ticker not in live_z_map:
         return []
 
     active_z = live_z_map[active_ticker]['z_live']
     candidates = []
     
+    # LOAD CONFIG LIMITS
+    # Ensure we don't pick an alternative that is too short (e.g. < 1Y)
+    min_alt_tenor = getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0)
+    min_sep = getattr(cr, "MIN_SEP_YEARS", 0.5)
+    max_span = getattr(cr, "MAX_SPAN_YEARS", 10.0)
+    
     for ticker, info in live_z_map.items():
         tenor = info['tenor']
         z_score = info['z_live']
         
-        # Skip self
+        # 1. Skip self
         if tenor == active_tenor: 
             continue
             
-        # Basic Constraints (from cr_config logic)
-        if abs(tenor - active_tenor) < cr.MIN_SEP_YEARS: continue
-        if abs(tenor - active_tenor) > cr.MAX_SPAN_YEARS: continue
+        # 2. Enforce Minimum Tenor Length for the Alternative
+        if tenor < min_alt_tenor:
+            continue
+            
+        # 3. Enforce Separation Constraints
+        dist = abs(tenor - active_tenor)
+        if dist < min_sep: continue
+        if dist > max_span: continue
         
         # Calculate Spread Improvement
-        # Direction = Intent of Original Request
-        
         if direction == 'PAY':
-            # Desk wants to PAY Original (Short).
-            # Hedge is REC Original.
-            # Strategy: PAY Alternative (Cheap) / REC Original (Rich).
+            # Desk wants to PAY Original (Short). Hedge is REC Original.
+            # Strategy: PAY Alt (Cheap) / REC Original (Rich).
             # We want Alt Z > Original Z.
             spread_imp = z_score - active_z
             
         else: # direction == 'REC'
-            # Desk wants to REC Original (Long).
-            # Hedge is PAY Original.
-            # Strategy: REC Alternative (Rich?) / PAY Original.
-            # Wait, usually we Rec Cheap / Pay Rich. 
-            # If we Rec Alt, we want Alt to be Cheap (High Z).
-            # If we Pay Original, we want Original to be Rich (Low Z).
-            # Spread = Alt Z - Original Z.
-            # Wait, let's check portfolio_test logic:
-            # Entry Z is always (Cheap - Rich).
-            
-            # If Intent is REC Original:
-            # We execute: REC Alt / PAY Original.
-            # We want Alt to be Cheaper (Higher Z) than Original.
+            # Desk wants to REC Original (Long). Hedge is PAY Original.
+            # Strategy: REC Alt (Cheap) / PAY Original (Rich).
+            # We want Alt Z > Original Z.
             spread_imp = z_score - active_z
 
         candidates.append({
