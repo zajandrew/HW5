@@ -35,8 +35,8 @@ def load_midnight_model(yymm_str):
         snapshot = df[df['ts'] == last_ts].copy()
         
         # Simplify for lookup: Index by Ticker (using Tenor Map reverse lookup if needed)
-        # Here we assume the parquet has 'tenor_yrs' and we map back to tickers via cr.TENOR_YEARS
-        # For simplicity in prototype: create a map of Tenor -> Row
+        # Here we assume the parquet has 'tenor_yrs' as a float.
+        # We index by tenor_yrs for fast O(1) lookup.
         MODEL_SNAPSHOT = snapshot.set_index('tenor_yrs').to_dict('index')
         print(f"[SYSTEM] Loaded Midnight Model: {last_ts} ({len(MODEL_SNAPSHOT)} tenors)")
         return True
@@ -45,6 +45,9 @@ def load_midnight_model(yymm_str):
         return False
 
 def get_live_z_scores(live_rates_map):
+    """
+    Projects Live Rates onto the Frozen Model.
+    """
     if not MODEL_SNAPSHOT:
         return {}
 
@@ -54,21 +57,27 @@ def get_live_z_scores(live_rates_map):
     # Inputs are percentages (e.g., 4.25).
     # 1 bp = 0.01 change in rate.
     # We estimate 1 Sigma daily vol is roughly 5 bps.
-    # Therefore VOL_PROXY = 0.05.
     VOL_PROXY = 0.05 
 
     for ticker, live_rate in live_rates_map.items():
-        # ... existing lookup code ...
+        # 1. Get Tenor
+        tenor = cr.TENOR_YEARS.get(ticker)
         
-        # The Projection
+        # 2. Check if Tenor exists in Model
+        if tenor is None or tenor not in MODEL_SNAPSHOT:
+            continue
+            
+        # 3. Extract Frozen Model Data
+        model_row = MODEL_SNAPSHOT[tenor]
+        model_rate = float(model_row.get('rate', live_rate)) # EOD Rate
+        model_z = float(model_row.get('z_comb', 0.0))        # EOD Z-Score
+        
+        # 4. The Projection
+        # Rate Diff: Live (4.25) - Model (4.20) = +0.05
         rate_diff = live_rate - model_rate
         
-        # If rate moves UP +1bp (0.01), and we are Paying Fixed (Short), we lose.
-        # But here we are just calculating the Z-score of the asset yield.
-        # Yield Up = Price Down = Cheap = High Z-Score? 
-        # Convention: High Z = Cheap (High Yield).
-        # So Rate Up -> Z Up.
-        
+        # Z Live: Model Z + (Diff / Vol)
+        # Yield Up = Price Down = Cheap = High Z-Score (Standard Convention)
         z_live = model_z + (rate_diff / VOL_PROXY)
         
         z_map[ticker] = {
@@ -81,23 +90,16 @@ def get_live_z_scores(live_rates_map):
 
 def get_valid_partners(active_ticker, direction, live_z_map):
     """
-    Finds candidates.
-    If Direction = 'PAY' (We are paying fixed on active_ticker), 
-    we want to REC fixed on a cheap partner.
-    Active Ticker is likely RICH (High Z) if we are Paying?
-    Actually, let's follow standard RV:
-    - If user clicks PAY 5Y -> They think 5Y is CHEAP (Low Z) or they have client flow.
-    - If flow is Pay 5Y, we need to Rec X (Hedge).
-    - We want to Rec the CHEAPEST possible tenor (Highest Z).
-    
-    Returns list of dicts: [{'ticker':..., 'tenor':..., 'z_score':..., 'rank':...}]
+    Finds candidates based on Z-Spread improvement.
     """
     active_tenor = cr.TENOR_YEARS.get(active_ticker)
-    candidates = []
     
-    # We want to HEDGE the input. 
-    # Input: Pay Fixed. Hedge: Rec Fixed.
-    # We look for High Z-scores to Rec.
+    # Safety check: if active ticker not in map (e.g. model missing), return empty
+    if active_ticker not in live_z_map:
+        return []
+
+    active_z = live_z_map[active_ticker]['z_live']
+    candidates = []
     
     for ticker, info in live_z_map.items():
         tenor = info['tenor']
@@ -112,15 +114,31 @@ def get_valid_partners(active_ticker, direction, live_z_map):
         if abs(tenor - active_tenor) > cr.MAX_SPAN_YEARS: continue
         
         # Calculate Spread Improvement
-        # If paying active (Z_a) and receiving candidate (Z_c)
-        # We capture (Z_c - Z_a). We want to maximize this.
-        spread_imp = z_score - live_z_map[active_ticker]['z_live']
+        # Direction = Intent of Original Request
         
-        # In Rec mode (User Recs Active), Hedge is Pay Candidate.
-        # We want to Pay the RICHEST possible tenor (Lowest Z).
-        if direction == 'REC':
-            spread_imp = live_z_map[active_ticker]['z_live'] - z_score
+        if direction == 'PAY':
+            # Desk wants to PAY Original (Short).
+            # Hedge is REC Original.
+            # Strategy: PAY Alternative (Cheap) / REC Original (Rich).
+            # We want Alt Z > Original Z.
+            spread_imp = z_score - active_z
             
+        else: # direction == 'REC'
+            # Desk wants to REC Original (Long).
+            # Hedge is PAY Original.
+            # Strategy: REC Alternative (Rich?) / PAY Original.
+            # Wait, usually we Rec Cheap / Pay Rich. 
+            # If we Rec Alt, we want Alt to be Cheap (High Z).
+            # If we Pay Original, we want Original to be Rich (Low Z).
+            # Spread = Alt Z - Original Z.
+            # Wait, let's check portfolio_test logic:
+            # Entry Z is always (Cheap - Rich).
+            
+            # If Intent is REC Original:
+            # We execute: REC Alt / PAY Original.
+            # We want Alt to be Cheaper (Higher Z) than Original.
+            spread_imp = z_score - active_z
+
         candidates.append({
             'ticker': ticker,
             'tenor': tenor,
