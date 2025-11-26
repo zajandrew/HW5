@@ -7,7 +7,9 @@ from pathlib import Path
 from dateutil.relativedelta import relativedelta
 
 # --- Hook into Research Libraries ---
-sys.path.append(str(Path(__file__).parent.parent))
+current_dir = Path(__file__).resolve().parent
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
 import cr_config as cr
 import feature_creation as fc
 import hybrid_filter as hf
