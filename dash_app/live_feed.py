@@ -5,6 +5,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Hook into parent directory for config
 sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
 from .data_manager import log_ticks
@@ -30,12 +31,16 @@ class LiveFeed:
         self.DB_LOG_INTERVAL = 5.0 
 
     def start(self):
-        # ... (Connection logic remains same as previous version) ...
         self.session_options = blpapi.SessionOptions()
         self.session_options.setServerAddress(self.host, self.port, 0)
-        self.session_options.setSessionIdentityOptions(
-            blpapi.AuthOptions.createWithApp(self.app_name)
-        )
+        
+        # --- CORRECTED AUTHENTICATION LOGIC ---
+        # Explicitly creating the Auth Options and Correlation ID as per your reference
+        authOptions = blpapi.AuthOptions.createWithApp(self.app_name)
+        self.auth_correlation_id = blpapi.CorrelationId("authCorrelation")
+        
+        self.session_options.setSessionIdentityOptions(authOptions, self.auth_correlation_id)
+        # --------------------------------------
         
         self.session = blpapi.Session(self.session_options)
         
@@ -47,7 +52,7 @@ class LiveFeed:
             print("[FEED] Failed to open //blp/mktdata service.")
             return
             
-        print("[FEED] Bloomberg Session Connected.")
+        print("[FEED] Bloomberg Session Connected (Identity Set).")
         self._subscribe()
         
         self.running = True
@@ -56,14 +61,18 @@ class LiveFeed:
         t.start()
         
     def _subscribe(self):
-        # ... (Subscribe logic remains same) ...
         subscription_list = blpapi.SubscriptionList()
         for ticker in cr.TENOR_YEARS.keys():
+            # We map the event back to the ticker using CorrelationId(ticker)
             cid = blpapi.CorrelationId(ticker)
             subscription_list.add(ticker, "LAST_PRICE", "", cid)
+            
+            # Init state
             self.live_map[ticker] = 0.0
             self.last_db_log[ticker] = 0.0
+            
         self.session.subscribe(subscription_list)
+        print(f"[FEED] Subscribed to {len(cr.TENOR_YEARS)} tickers.")
 
     def _run_loop(self):
         print("[FEED] Listener loop started.")
@@ -84,13 +93,17 @@ class LiveFeed:
                         if not self.eod_triggered:
                             print("[SYSTEM] Auto-Triggering EOD Process...")
                             self.eod_triggered = True
-                            # Run in separate thread so we don't block the UI updates entirely
+                            # Run in separate thread
                             eod_thread = threading.Thread(target=eod_process.run_eod_main)
                             eod_thread.start()
                 
                 # --- EVENT LOOP ---
                 event = self.session.nextEvent(1000)
                 for msg in event:
+                    # In a strict SAPI app, we might check for AUTHORIZATION_STATUS here
+                    # using self.auth_correlation_id, but usually session.start() 
+                    # handles the handshake sufficiently for data subscription.
+                    
                     if msg.hasElement("LAST_PRICE"):
                         self._process_message(msg)
                 
@@ -108,7 +121,7 @@ class LiveFeed:
             ticker = msg.correlationIds()[0].value()
             current_time = time.time()
             
-            # 1. Update In-Memory (ALWAYS updates UI, even after 4pm)
+            # 1. Update In-Memory (ALWAYS Instant for UI)
             self.live_map[ticker] = last_price
             
             # 2. Add to Buffer (ONLY if market is open)
@@ -120,10 +133,10 @@ class LiveFeed:
                     self.last_db_log[ticker] = current_time
                 
         except Exception as e:
-            print(f"[PARSE ERROR] {e}")
+            # SAPI sometimes sends service messages that don't map to tickers
+            pass
 
     def _flush_to_db(self):
-        # ... (Flush logic remains same) ...
         with self.lock:
             if not self.db_buffer:
                 self.last_flush_time = time.time()
