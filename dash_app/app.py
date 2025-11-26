@@ -336,57 +336,160 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
 
-# 4. Update Blotter
+# 4. Update Blotter (With Heatmap & Limits)
 @app.callback(
     Output('tbl-open-positions', 'data'),
     Output('tbl-open-positions', 'columns'),
+    Output('tbl-open-positions', 'style_data_conditional'), # <--- NEW OUTPUT
     Input('fast-interval', 'n_intervals'),
     Input('btn-refresh-blotter', 'n_clicks')
 )
 def update_blotter(n, click):
     df = get_open_positions()
-    if df.empty: return [], []
+    if df.empty:
+        return [], [], []
+        
     data = []
-    Z_EXIT, Z_STOP = cr.Z_EXIT, cr.Z_STOP
+    
+    # Config Limits
+    Z_EXIT = cr.Z_EXIT
+    Z_STOP = cr.Z_STOP
+    MAX_HOLD = cr.MAX_HOLD_DAYS
+    
+    # Style Logic Containers
+    styles = []
     
     for _, row in df.iterrows():
+        # 1. Rates & PnL
         curr_pay = feed.live_map.get(row['ticker_pay'], row['entry_rate_pay'])
         curr_rec = feed.live_map.get(row['ticker_rec'], row['entry_rate_rec'])
         pnl_pay = (curr_pay - row['entry_rate_pay']) * 100 * row['dv01']
         pnl_rec = (row['entry_rate_rec'] - curr_rec) * 100 * row['dv01']
         total_pnl = pnl_pay + pnl_rec
         
+        # 2. Z-Score Math
         z_map = le.get_live_z_scores(feed.live_map)
         zp = z_map.get(row['ticker_pay'], {}).get('z_live', 0)
         zr = z_map.get(row['ticker_rec'], {}).get('z_live', 0)
         curr_z = zp - zr
+        entry_z = row['entry_z_spread']
+        
+        # 3. Threshold Calcs
+        # Stop Z Level: The absolute Z value where we panic.
+        # If Entry is 2.0 (Cheap), we stop if it gets Richer (diverges)? 
+        # No, usually we stop if it keeps getting Cheaper (goes to 5.0).
+        # Divergence = abs(curr - entry).
+        # The "Level" is Entry + (Sign(Entry) * Stop_Distance)
+        stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
+        
+        # Days Held
+        open_dt = pd.to_datetime(row['open_ts'])
+        days_held = (pd.Timestamp.now() - open_dt).days
+        
+        # 4. Status Flags & Heatmap Logic
+        row_style = {} # Default style
         
         db_reason = row.get('close_reason')
         if db_reason and db_reason not in [None, 'None', '']:
-             if db_reason == 'max_hold': flag = "MAX HOLD"
-             elif db_reason == 'stop_loss': flag = "STOP LOSS (EOD)"
-             elif db_reason == 'reversion': flag = "TAKE PROFIT (EOD)"
-             else: flag = f"CHECK: {db_reason}"
+             # EOD FLAGS (Solid Colors)
+             if db_reason == 'max_hold': 
+                 flag = "MAX HOLD"
+                 bg_color = "#B8860B" # Dark Goldenrod
+             elif db_reason == 'stop_loss': 
+                 flag = "STOP LOSS (EOD)"
+                 bg_color = "#8B0000" # Dark Red
+             elif db_reason == 'reversion': 
+                 flag = "TAKE PROFIT (EOD)"
+                 bg_color = "#006400" # Dark Green
+             else: 
+                 flag = f"CHECK: {db_reason}"
+                 bg_color = "#444"
         else:
+             # LIVE FLAGS & GRADIENTS
              flag = "OPEN"
-             if abs(curr_z) < Z_EXIT: flag = "TAKE PROFIT"
-             if abs(curr_z - row['entry_z_spread']) > Z_STOP: flag = "STOP LOSS"
-        
+             
+             # Calc Distances
+             dist_to_stop = abs(curr_z - entry_z)
+             dist_to_target = abs(curr_z) # Assuming Mean Reversion to 0
+             
+             # A. Check Triggers
+             if dist_to_target < Z_EXIT: 
+                 flag = "TAKE PROFIT"
+                 bg_color = "#006400" # Solid Green
+             elif dist_to_stop > Z_STOP: 
+                 flag = "STOP LOSS"
+                 bg_color = "#8B0000" # Solid Red
+             else:
+                 # B. Gradients (Approaching)
+                 bg_color = "#222" # Default Dark Grey
+                 
+                 # Danger Zone: > 75% of the way to Stop
+                 if dist_to_stop > (Z_STOP * 0.75):
+                     bg_color = "#5c1e1e" # Tinted Red
+                     
+                 # Profit Zone: Approaching Target
+                 # If current Z is small relative to entry
+                 elif dist_to_target < (abs(entry_z) * 0.5):
+                     bg_color = "#1e3b1e" # Tinted Green
+
+        # 5. Formatting
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
         label_rec = format_tenor(row['ticker_rec'], row['tenor_rec'])
         
+        # Append Data
         data.append({
             'trade_id': row['trade_id'],
-            'open_ts': row['open_ts'],
+            'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
-            'dv01': row['dv01'],
-            'pnl_cash': round(total_pnl, 2),
-            'entry_z': round(row['entry_z_spread'], 2),
+            'dv01': f"{int(row['dv01']/1000)}k",
+            
+            # PnL & Z
+            'pnl_cash': round(total_pnl, 0),
             'curr_z': round(curr_z, 2),
-            'status': flag
+            'entry_z': round(entry_z, 2),
+            
+            # Thresholds
+            'target_z': f"0.0 ± {Z_EXIT}",
+            'stop_z_level': round(stop_z_level, 2),
+            
+            # Aging
+            'aging': f"{days_held} / {MAX_HOLD}",
+            
+            'status': flag,
+            
+            # Hidden column for styling mapping
+            '_row_color': bg_color 
         })
-    cols = [{"name": i, "id": i} for i in data[0].keys()]
-    return data, cols
+
+    # 6. Column Definitions
+    ordered_cols = [
+        'trade_id', 'status', 'aging', 'pair', 'dv01', 'pnl_cash', 
+        'curr_z', 'target_z', 'entry_z', 'stop_z_level', 'open_date'
+    ]
+    
+    cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in ordered_cols]
+    
+    # 7. Generate Conditional Styles dynamically
+    # This iterates through the data we just built and creates a style rule for every row
+    # based on its unique color calculation.
+    style_cond = []
+    
+    # Default dark theme text
+    style_cond.append({
+        'if': {'row_index': 'odd'},
+        'backgroundColor': 'rgba(255, 255, 255, 0.05)'
+    })
+    
+    for i, row in enumerate(data):
+        color = row['_row_color']
+        if color != "#222": # Only apply if not default
+            style_cond.append({
+                'if': {'filter_query': f'{{trade_id}} = {row["trade_id"]}'},
+                'backgroundColor': color,
+                'color': 'white'
+            })
+
+    return data, cols, style_cond
 
 # 5. Buttons Enable/Action (Unchanged)
 @app.callback(
