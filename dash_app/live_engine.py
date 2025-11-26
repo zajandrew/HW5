@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 
 # Hook into parent directory to import your research files
-sys.path.append(str(Path(__file__).parent.parent))
+current_dir = Path(__file__).resolve().parent
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
 import cr_config as cr
 import feature_creation as fc
 import portfolio_test as pt
