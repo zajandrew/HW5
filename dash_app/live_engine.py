@@ -1,150 +1,152 @@
-import pandas as pd
-import numpy as np
+import blpapi
+import threading
+import time
 import sys
-import os
+from datetime import datetime
 from pathlib import Path
 
-# Hook into parent directory to import your research files
+# Hook into parent directory for config
 sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
-import feature_creation as fc
-import portfolio_test as pt
+from .data_manager import log_ticks
+import eod_process  # Import the EOD processor
 
-# Global Cache for the "Frozen Model"
-MODEL_SNAPSHOT = None
-
-def load_midnight_model(yymm_str):
-    """
-    Loads the EOD parquet file. 
-    This is the 'Ruler' we measure live prices against.
-    """
-    global MODEL_SNAPSHOT
-    try:
-        # Construct path based on cr_config or hardcoded logic
-        # Assuming format {YYMM}_enh.parquet in PATH_ENH
-        path = Path(cr.PATH_ENH) / f"{yymm_str}_enh.parquet"
+class LiveFeed:
+    def __init__(self):
+        self.live_map = {}      
+        self.last_db_log = {}   
+        self.running = False
+        self.db_buffer = []     
+        self.last_flush_time = time.time()
+        self.lock = threading.Lock()
         
-        if not path.exists():
-            print(f"[WARN] Model file not found: {path}")
-            return False
-
-        df = pd.read_parquet(path)
+        # State Flags
+        self.eod_triggered = False
+        self.market_open = True
         
-        # Get the very last timestamp available in the file (EOD Yesterday)
-        last_ts = df['ts'].max()
-        snapshot = df[df['ts'] == last_ts].copy()
+        # Config
+        self.host = "x"
+        self.port = 8194
+        self.app_name = "x"
+        self.DB_LOG_INTERVAL = 5.0 
+
+    def start(self):
+        self.session_options = blpapi.SessionOptions()
+        self.session_options.setServerAddress(self.host, self.port, 0)
         
-        # Simplify for lookup: Index by Ticker (using Tenor Map reverse lookup if needed)
-        # Here we assume the parquet has 'tenor_yrs' as a float.
-        # We index by tenor_yrs for fast O(1) lookup.
-        MODEL_SNAPSHOT = snapshot.set_index('tenor_yrs').to_dict('index')
-        print(f"[SYSTEM] Loaded Midnight Model: {last_ts} ({len(MODEL_SNAPSHOT)} tenors)")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to load model: {e}")
-        return False
-
-def get_live_z_scores(live_rates_map):
-    """
-    Projects Live Rates onto the Frozen Model.
-    """
-    if not MODEL_SNAPSHOT:
-        return {}
-
-    z_map = {}
-    
-    # VOL PROXY ADJUSTMENT
-    # Inputs are percentages (e.g., 4.25).
-    # 1 bp = 0.01 change in rate.
-    # We estimate 1 Sigma daily vol is roughly 5 bps.
-    VOL_PROXY = 0.05 
-
-    for ticker, live_rate in live_rates_map.items():
-        # 1. Get Tenor
-        tenor = cr.TENOR_YEARS.get(ticker)
+        # --- CORRECTED AUTHENTICATION LOGIC ---
+        # Explicitly creating the Auth Options and Correlation ID as per your reference
+        authOptions = blpapi.AuthOptions.createWithApp(self.app_name)
+        self.auth_correlation_id = blpapi.CorrelationId("authCorrelation")
         
-        # 2. Check if Tenor exists in Model
-        if tenor is None or tenor not in MODEL_SNAPSHOT:
-            continue
+        self.session_options.setSessionIdentityOptions(authOptions, self.auth_correlation_id)
+        # --------------------------------------
+        
+        self.session = blpapi.Session(self.session_options)
+        
+        if not self.session.start():
+            print("[FEED] Failed to start Bloomberg Session.")
+            return
             
-        # 3. Extract Frozen Model Data
-        model_row = MODEL_SNAPSHOT[tenor]
-        model_rate = float(model_row.get('rate', live_rate)) # EOD Rate
-        model_z = float(model_row.get('z_comb', 0.0))        # EOD Z-Score
-        
-        # 4. The Projection
-        # Rate Diff: Live (4.25) - Model (4.20) = +0.05
-        rate_diff = live_rate - model_rate
-        
-        # Z Live: Model Z + (Diff / Vol)
-        # Yield Up = Price Down = Cheap = High Z-Score (Standard Convention)
-        z_live = model_z + (rate_diff / VOL_PROXY)
-        
-        z_map[ticker] = {
-            'z_live': z_live, 
-            'tenor': tenor, 
-            'model_z': model_z,
-            'model_rate': model_rate
-        }
-    return z_map
-
-def get_valid_partners(active_ticker, direction, live_z_map):
-    """
-    Finds candidates based on Z-Spread improvement.
-    Respects Tenor Limits (ALT_LEG_TENOR_YEARS) and Separation Constraints.
-    """
-    active_tenor = cr.TENOR_YEARS.get(active_ticker)
-    
-    # Safety check: if active ticker not in map
-    if active_ticker not in live_z_map:
-        return []
-
-    active_z = live_z_map[active_ticker]['z_live']
-    candidates = []
-    
-    # LOAD CONFIG LIMITS
-    # Ensure we don't pick an alternative that is too short (e.g. < 1Y)
-    min_alt_tenor = getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0)
-    min_sep = getattr(cr, "MIN_SEP_YEARS", 0.5)
-    max_span = getattr(cr, "MAX_SPAN_YEARS", 10.0)
-    
-    for ticker, info in live_z_map.items():
-        tenor = info['tenor']
-        z_score = info['z_live']
-        
-        # 1. Skip self
-        if tenor == active_tenor: 
-            continue
+        if not self.session.openService("//blp/mktdata"):
+            print("[FEED] Failed to open //blp/mktdata service.")
+            return
             
-        # 2. Enforce Minimum Tenor Length for the Alternative
-        if tenor < min_alt_tenor:
-            continue
-            
-        # 3. Enforce Separation Constraints
-        dist = abs(tenor - active_tenor)
-        if dist < min_sep: continue
-        if dist > max_span: continue
+        print("[FEED] Bloomberg Session Connected (Identity Set).")
+        self._subscribe()
         
-        # Calculate Spread Improvement
-        if direction == 'PAY':
-            # Desk wants to PAY Original (Short). Hedge is REC Original.
-            # Strategy: PAY Alt (Cheap) / REC Original (Rich).
-            # We want Alt Z > Original Z.
-            spread_imp = z_score - active_z
+        self.running = True
+        t = threading.Thread(target=self._run_loop)
+        t.daemon = True
+        t.start()
+        
+    def _subscribe(self):
+        subscription_list = blpapi.SubscriptionList()
+        for ticker in cr.TENOR_YEARS.keys():
+            # We map the event back to the ticker using CorrelationId(ticker)
+            cid = blpapi.CorrelationId(ticker)
+            subscription_list.add(ticker, "LAST_PRICE", "", cid)
             
-        else: # direction == 'REC'
-            # Desk wants to REC Original (Long). Hedge is PAY Original.
-            # Strategy: REC Alt (Cheap) / PAY Original (Rich).
-            # We want Alt Z > Original Z.
-            spread_imp = z_score - active_z
+            # Init state
+            self.live_map[ticker] = 0.0
+            self.last_db_log[ticker] = 0.0
+            
+        self.session.subscribe(subscription_list)
+        print(f"[FEED] Subscribed to {len(cr.TENOR_YEARS)} tickers.")
 
-        candidates.append({
-            'ticker': ticker,
-            'tenor': tenor,
-            'z_live': z_score,
-            'spread_imp': spread_imp
-        })
-        
-    # Sort by spread improvement (descending)
-    candidates.sort(key=lambda x: x['spread_imp'], reverse=True)
-    return candidates
+    def _run_loop(self):
+        print("[FEED] Listener loop started.")
+        while self.running:
+            try:
+                # --- TIME CHECK ---
+                now = datetime.now()
+                # Check if it is past 16:00 (4 PM)
+                if now.hour >= 16:
+                    if self.market_open:
+                        print("[SYSTEM] Market Closed (16:00). Stopping DB Writes.")
+                        self.market_open = False
+                        
+                        # Flush any remaining ticks
+                        self._flush_to_db()
+                        
+                        # TRIGGER AUTO-EOD
+                        if not self.eod_triggered:
+                            print("[SYSTEM] Auto-Triggering EOD Process...")
+                            self.eod_triggered = True
+                            # Run in separate thread
+                            eod_thread = threading.Thread(target=eod_process.run_eod_main)
+                            eod_thread.start()
+                
+                # --- EVENT LOOP ---
+                event = self.session.nextEvent(1000)
+                for msg in event:
+                    # In a strict SAPI app, we might check for AUTHORIZATION_STATUS here
+                    # using self.auth_correlation_id, but usually session.start() 
+                    # handles the handshake sufficiently for data subscription.
+                    
+                    if msg.hasElement("LAST_PRICE"):
+                        self._process_message(msg)
+                
+                # Only flush to DB if market is OPEN
+                if self.market_open:
+                    if time.time() - self.last_flush_time > 10:
+                        self._flush_to_db()
+                    
+            except Exception as e:
+                print(f"[FEED ERROR] {e}")
+
+    def _process_message(self, msg):
+        try:
+            last_price = msg.getElementAsFloat("LAST_PRICE")
+            ticker = msg.correlationIds()[0].value()
+            current_time = time.time()
+            
+            # 1. Update In-Memory (ALWAYS Instant for UI)
+            self.live_map[ticker] = last_price
+            
+            # 2. Add to Buffer (ONLY if market is open)
+            if self.market_open:
+                if (current_time - self.last_db_log.get(ticker, 0)) > self.DB_LOG_INTERVAL:
+                    ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    with self.lock:
+                        self.db_buffer.append({'ts': ts_str, 'ticker': ticker, 'rate': last_price})
+                    self.last_db_log[ticker] = current_time
+                
+        except Exception as e:
+            # SAPI sometimes sends service messages that don't map to tickers
+            pass
+
+    def _flush_to_db(self):
+        with self.lock:
+            if not self.db_buffer:
+                self.last_flush_time = time.time()
+                return
+            data_to_write = list(self.db_buffer)
+            self.db_buffer.clear()
+        try:
+            log_ticks(data_to_write)
+        except Exception as e:
+            print(f"[DB ERROR] {e}")
+        self.last_flush_time = time.time()
+
+feed = LiveFeed()
