@@ -42,22 +42,38 @@ def get_z_color(z):
 # --- HELPER: TENOR DISPLAY ---
 def format_tenor(ticker, float_years):
     """
-    Converts float years (e.g. 0.0833) to Labels (1M).
+    Converts float years to labels based on specific TENOR_YEARS dict.
+    Covers 1M-11M, 18M, and Integer Years.
     """
     if float_years is None: return "N/A"
     
-    # Simple rounding check for standard tenors
-    if abs(float_years - 1/12) < 0.01: return "1M"
-    if abs(float_years - 3/12) < 0.01: return "3M"
-    if abs(float_years - 6/12) < 0.01: return "6M"
-    if abs(float_years - 9/12) < 0.01: return "9M"
-    
-    # Whole years
-    if abs(float_years - round(float_years)) < 0.05:
-        return f"{int(round(float_years))}Y"
-        
-    return f"{float_years:.1f}Y"
+    y = float(float_years)
+    tol = 0.001  # Tolerance for float comparison
 
+    # --- Months (1/12 to 11/12) ---
+    if abs(y - 1/12) < tol: return "1M"
+    if abs(y - 2/12) < tol: return "2M"
+    if abs(y - 3/12) < tol: return "3M"
+    if abs(y - 4/12) < tol: return "4M"
+    if abs(y - 5/12) < tol: return "5M"
+    if abs(y - 6/12) < tol: return "6M"
+    if abs(y - 7/12) < tol: return "7M"
+    if abs(y - 8/12) < tol: return "8M"
+    if abs(y - 9/12) < tol: return "9M"
+    if abs(y - 10/12) < tol: return "10M"
+    if abs(y - 11/12) < tol: return "11M"
+
+    # --- Special Case: 18 Months (1.5 Years) ---
+    if abs(y - 1.5) < tol: return "18M"
+
+    # --- Integer Years (1Y, 2Y, ... 40Y) ---
+    # This dynamically handles 1, 2, 3... 10, 12, 15, 20, 25, 30, 40
+    if abs(y - round(y)) < tol:
+        return f"{int(round(y))}Y"
+
+    # --- Fallback ---
+    return f"{y:.1f}Y"
+  
 # --- LAYOUT ---
 app.layout = html.Div([
     dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates
