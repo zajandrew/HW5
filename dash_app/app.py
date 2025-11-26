@@ -14,10 +14,11 @@ from data_manager import (init_dbs, add_position, get_open_positions,
 import live_engine as le
 from live_feed import feed  # Real Feed
 import eod_process          # EOD Logic
-import hybrid_filter as hf  # For loading signals
 
-# Import Research Config
-sys.path.append(str(Path(__file__).parent.parent))
+current_dir = Path(__file__).resolve().parent
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
+import hybrid_filter as hf  # For loading signals
 import cr_config as cr
 
 # --- SETUP ---
