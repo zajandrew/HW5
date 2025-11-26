@@ -24,9 +24,9 @@ class LiveFeed:
         self.market_open = True
         
         # Config
-        self.host = "x"
+        self.host = "vpce-0c2e4f845a98f340e-t2ggznxv.vpce-svc-0a1ace7960b600239.us-east-2.vpce.amazonaws.com"
         self.port = 8194
-        self.app_name = "x"
+        self.app_name = "USBANK:Rates_Data_Viewer"
         self.DB_LOG_INTERVAL = 5.0 
 
     def start(self):
