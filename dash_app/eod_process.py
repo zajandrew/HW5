@@ -125,39 +125,84 @@ def step_2_build_model(yymm):
         return False
 
 def step_3_update_signals_and_state():
-    print(f"[EOD] Step 3: Updating System State...")
+    print(f"[EOD] Step 3: Updating System State (Regime & Shock)...")
     
-    # Force rebuild signals (will use the new _enh file)
+    # --- 1. REGIME CALCULATION ---
+    # Rebuild hybrid signals using the NEW _enh.parquet file we just made
     signals = hf.get_or_build_hybrid_signals(force_rebuild=True)
+    
     if signals.empty:
-        print("[WARN] Signals empty. Keeping state SAFE.")
-        return
+        print("[WARN] Signals generation failed. Defaulting to UNSTABLE.")
+        regime_str = "UNSTABLE"
+    else:
+        last_signal = signals.iloc[-1]
+        # Check Signal Health Z-Score against Config
+        health_z = last_signal.get('signal_health_z', -99)
+        if health_z >= cr.MIN_SIGNAL_HEALTH_Z:
+            regime_str = "SAFE"
+        else:
+            regime_str = "UNSTABLE"
+            print(f" -> Regime Deteriorated: Health Z {health_z:.2f}")
 
-    last_signal = signals.iloc[-1]
-    
-    # Regime Logic
-    is_regime_safe = True
-    if last_signal.get('signal_health_z', 0) < cr.MIN_SIGNAL_HEALTH_Z:
-        is_regime_safe = False
-        
-    # Shock Logic
+    # --- 2. SHOCK CALCULATION (PNL FEEDBACK) ---
     conn = get_db_connection(DB_POSITIONS)
+    
+    # A. Get current state to see if we are already blocked
     state_row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
-    shock_remaining = state_row[2] if state_row else 0
-    new_shock_remaining = max(0, shock_remaining - 1)
+    current_block = state_row[2] if state_row else 0
     
-    regime_str = "SAFE" if is_regime_safe else "UNSTABLE"
+    # B. Calculate Recent Daily PnL Stats
+    # We sum realized_pnl_cash by close_ts (bucketed by day)
+    # Note: In a real prod system, you might also include MTM PnL of open positions here
+    pnl_df = pd.read_sql("""
+        SELECT date(close_ts) as dts, sum(realized_pnl_cash) as daily_pnl 
+        FROM trades 
+        WHERE status='CLOSED' 
+        GROUP BY date(close_ts) 
+        ORDER BY dts
+    """, conn)
     
+    new_shock_detected = False
+    
+    if len(pnl_df) >= 5: # Need minimum history to calc stats
+        recent_pnl = pnl_df['daily_pnl'].values
+        # Lookback window from config
+        win = int(getattr(cr, "SHOCK_PNL_WINDOW", 10))
+        
+        if len(recent_pnl) > win:
+            slice_pnl = recent_pnl[-win:]
+            mu = np.mean(slice_pnl)
+            sd = np.std(slice_pnl, ddof=1)
+            
+            if sd > 1e-6: # Avoid div by zero
+                # Check the MOST RECENT day's Z-score
+                last_pnl = slice_pnl[-1]
+                z_score = (last_pnl - mu) / sd
+                
+                thresh = float(getattr(cr, "SHOCK_RAW_PNL_Z_THRESH", -1.5))
+                if z_score < thresh:
+                    new_shock_detected = True
+                    print(f" -> SHOCK DETECTED: Daily PnL Z-Score {z_score:.2f} < {thresh}")
+
+    # C. Update Block Counter
+    if new_shock_detected:
+        # Reset counter to full block length
+        new_block_remaining = int(getattr(cr, "SHOCK_BLOCK_LENGTH", 10))
+    else:
+        # Decrement existing block (if any)
+        new_block_remaining = max(0, current_block - 1)
+
+    # --- 3. SAVE TO DB ---
     ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("""
         UPDATE system_state 
         SET last_update_ts=?, shock_block_remaining=?, regime_status=?
         WHERE id=1
-    """, (ts_now, new_shock_remaining, regime_str))
+    """, (ts_now, new_block_remaining, regime_str))
     
     conn.commit()
     conn.close()
-    print(f"[EOD] State Updated: Regime={regime_str}, ShockRem={new_shock_remaining}")
+    print(f"[EOD] State Updated: Regime={regime_str}, ShockBlocks={new_block_remaining}")
 
 def step_4_mark_positions(yymm):
     print(f"[EOD] Step 4: Marking Positions against Official Close...")
