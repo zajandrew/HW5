@@ -45,30 +45,30 @@ def load_midnight_model(yymm_str):
         return False
 
 def get_live_z_scores(live_rates_map):
-    """
-    Project Live Rates onto Frozen Model.
-    Z_live = Z_model + (Rate_live - Rate_model) / Vol_Proxy
-    """
     if not MODEL_SNAPSHOT:
         return {}
 
     z_map = {}
     
-    # Vol Proxy: 10bps = 1 Sigma (Simplification if sigma not in parquet)
-    # Ideally, pull 'sigma' from feature_creation if saved.
-    VOL_PROXY = 0.0010 
+    # VOL PROXY ADJUSTMENT
+    # Inputs are percentages (e.g., 4.25).
+    # 1 bp = 0.01 change in rate.
+    # We estimate 1 Sigma daily vol is roughly 5 bps.
+    # Therefore VOL_PROXY = 0.05.
+    VOL_PROXY = 0.05 
 
     for ticker, live_rate in live_rates_map.items():
-        tenor = cr.TENOR_YEARS.get(ticker)
-        if tenor is None or tenor not in MODEL_SNAPSHOT:
-            continue
-            
-        model_row = MODEL_SNAPSHOT[tenor]
-        model_rate = model_row.get('rate', live_rate)
-        model_z = model_row.get('z_comb', 0.0)
+        # ... existing lookup code ...
         
         # The Projection
         rate_diff = live_rate - model_rate
+        
+        # If rate moves UP +1bp (0.01), and we are Paying Fixed (Short), we lose.
+        # But here we are just calculating the Z-score of the asset yield.
+        # Yield Up = Price Down = Cheap = High Z-Score? 
+        # Convention: High Z = Cheap (High Yield).
+        # So Rate Up -> Z Up.
+        
         z_live = model_z + (rate_diff / VOL_PROXY)
         
         z_map[ticker] = {
