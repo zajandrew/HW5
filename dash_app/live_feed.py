@@ -6,7 +6,9 @@ from datetime import datetime
 from pathlib import Path
 
 # Hook into parent directory for config
-sys.path.append(str(Path(__file__).parent.parent))
+current_dir = Path(__file__).resolve().parent
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
 import cr_config as cr
 from .data_manager import log_ticks
 import eod_process  # Import the EOD processor
