@@ -4,13 +4,13 @@ import sqlite3
 import sys
 import datetime
 from pathlib import Path
+from dateutil.relativedelta import relativedelta
 
 # --- Hook into Research Libraries ---
 sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
 import feature_creation as fc
 import hybrid_filter as hf
-import portfolio_test as pt # For rule constants like MAX_HOLD, Z_STOP
 
 # --- Constants ---
 DB_MARKET = "market_data.db"
@@ -19,55 +19,104 @@ DB_POSITIONS = "positions.db"
 def get_db_connection(db_name):
     return sqlite3.connect(db_name)
 
-def step_1_export_ticks_to_parquet(yymm):
+def get_lookback_files(current_yymm, months_back=6):
     """
-    Query market_data.db for the SPECIFIC MONTH (YYMM), 
-    pivot to Wide Format, save to cr.PATH_DATA.
+    Finds the previous N months of _features.parquet files.
+    Used to stitch history so PCA works correctly.
     """
-    print(f"[EOD] Step 1: Exporting ticks for {yymm}...")
-    conn = get_db_connection(DB_MARKET)
+    # Convert YYMM to datetime
+    curr_date = datetime.datetime.strptime(current_yymm, "%y%m")
     
-    # 1. Calculate Start/End dates for SQL filtering
-    # YYMM format (e.g., '2311') needs to become '2023-11' for SQL string matching
-    # assuming we are in 21st century
+    found_files = []
+    
+    # Loop backwards
+    for i in range(1, months_back + 1):
+        prev_date = curr_date - relativedelta(months=i)
+        prev_yymm = prev_date.strftime("%y%m")
+        
+        path = Path(cr.PATH_DATA) / f"{prev_yymm}_features.parquet"
+        if path.exists():
+            found_files.append(path)
+        else:
+            print(f"[WARN] Missing history file: {path}. PCA might be unstable.")
+            
+    # Return sorted (oldest first)
+    return sorted(found_files)
+
+def step_1_export_and_stitch(yymm):
+    """
+    1. Query SQLite for CURRENT month ticks.
+    2. Load PREVIOUS 6 months of parquet files.
+    3. Stitch together.
+    4. Save as {YYMM}_features.parquet.
+    """
+    print(f"[EOD] Step 1: Stitching History + Live Ticks for {yymm}...")
+    
+    # --- A. Get Live Ticks from SQLite ---
+    conn = get_db_connection(DB_MARKET)
     year = "20" + yymm[:2]
     month = yymm[2:]
-    date_filter = f"{year}-{month}" # e.g. "2023-11"
+    date_filter = f"{year}-{month}"
     
-    # 2. Query with Filter (SQLite strftime)
-    # This ensures we don't pull old months if the DB grows
     sql = f"""
         SELECT timestamp, ticker, rate 
         FROM ticks 
         WHERE strftime('%Y-%m', timestamp) = '{date_filter}'
     """
-    
-    df = pd.read_sql(sql, conn)
+    df_live = pd.read_sql(sql, conn)
     conn.close()
     
-    if df.empty:
-        print(f"[WARN] No ticks found for {date_filter}. Skipping export.")
-        return False
+    df_live_wide = pd.DataFrame()
+    if not df_live.empty:
+        df_live['ts'] = pd.to_datetime(df_live['timestamp'])
+        df_live_wide = df_live.pivot_table(index='ts', columns='ticker', values='rate', aggfunc='last')
+    else:
+        print(f"[WARN] No live ticks found for {date_filter}.")
 
-    # ... (Rest of the function: pivoting and saving remains exactly the same) ...
-    df['ts'] = pd.to_datetime(df['timestamp'])
-    df_wide = df.pivot_table(index='ts', columns='ticker', values='rate', aggfunc='last')
-    df_wide = df_wide.sort_index()
+    # --- B. Get Historical Data ---
+    hist_files = get_lookback_files(yymm, months_back=6)
     
+    dfs_to_concat = []
+    
+    # Load history
+    for p in hist_files:
+        try:
+            d = pd.read_parquet(p)
+            dfs_to_concat.append(d)
+        except Exception as e:
+            print(f"[ERROR] Failed to read {p}: {e}")
+            
+    # Add live data
+    if not df_live_wide.empty:
+        dfs_to_concat.append(df_live_wide)
+        
+    if not dfs_to_concat:
+        print("[ERROR] No data available (History or Live). Aborting.")
+        return False
+        
+    # --- C. Stitch and Save ---
+    # Combine
+    df_final = pd.concat(dfs_to_concat).sort_index()
+    
+    # Deduplicate: If we re-run EOD, don't duplicate overlapping timestamps
+    df_final = df_final[~df_final.index.duplicated(keep='last')]
+    
+    # Save
     out_path = Path(cr.PATH_DATA) / f"{yymm}_features.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_wide.to_parquet(out_path)
-    print(f"[EOD] Saved raw features to {out_path}")
+    
+    df_final.to_parquet(out_path)
+    print(f"[EOD] Stitched {len(df_final)} rows. Saved to {out_path}")
     return True
 
 def step_2_build_model(yymm):
     """
-    Run the heavy math: Splines and PCA.
-    Generates data/enh/{YYMM}_enh.parquet
+    Run Feature Creation. 
+    Because we stitched history in Step 1, PCA will see the full lookback window.
     """
     print(f"[EOD] Step 2: Running Feature Creation for {yymm}...")
     try:
-        # This calls your research library directly
+        # Calls research library directly
         fc.build_month(yymm)
         print("[EOD] Model Build Complete.")
         return True
@@ -76,40 +125,29 @@ def step_2_build_model(yymm):
         return False
 
 def step_3_update_signals_and_state():
-    """
-    Run Hybrid Filter to check if tomorrow is SAFE or SHOCK.
-    Updates 'system_state' table in positions.db.
-    """
-    print(f"[EOD] Step 3: Updating System State (Regime/Shock)...")
+    print(f"[EOD] Step 3: Updating System State...")
     
-    # 1. Generate Signals (Uses the _enh.parquet we just built)
-    # Force rebuild to ensure it sees the new EOD data
+    # Force rebuild signals (will use the new _enh file)
     signals = hf.get_or_build_hybrid_signals(force_rebuild=True)
-    
-    # 2. Get latest status
+    if signals.empty:
+        print("[WARN] Signals empty. Keeping state SAFE.")
+        return
+
     last_signal = signals.iloc[-1]
     
-    # Check Regime (Logic from hybrid_filter)
-    # Simple check: Is signal_health_z good?
+    # Regime Logic
     is_regime_safe = True
-    if last_signal['signal_health_z'] < cr.MIN_SIGNAL_HEALTH_Z:
+    if last_signal.get('signal_health_z', 0) < cr.MIN_SIGNAL_HEALTH_Z:
         is_regime_safe = False
         
-    # Check Shock (This usually requires pnl history, simplistic check here)
-    # We read the 'system_state' to decrement any existing block
+    # Shock Logic
     conn = get_db_connection(DB_POSITIONS)
     state_row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
-    # Schema: id, last_update, shock_remaining, regime_status, cum_pnl
-    
     shock_remaining = state_row[2] if state_row else 0
-    
-    # Decrement shock block if it exists (one day passed)
     new_shock_remaining = max(0, shock_remaining - 1)
     
-    # Determine Status String
     regime_str = "SAFE" if is_regime_safe else "UNSTABLE"
     
-    # Update DB
     ts_now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("""
         UPDATE system_state 
@@ -119,17 +157,11 @@ def step_3_update_signals_and_state():
     
     conn.commit()
     conn.close()
-    print(f"[EOD] System State Updated: Regime={regime_str}, ShockRem={new_shock_remaining}")
+    print(f"[EOD] State Updated: Regime={regime_str}, ShockRem={new_shock_remaining}")
 
 def step_4_mark_positions(yymm):
-    """
-    Load the OFFICIAL EOD Model.
-    Mark all OPEN positions.
-    If they violate rules (Stop/MaxHold), update status to 'PENDING_CLOSE'.
-    """
     print(f"[EOD] Step 4: Marking Positions against Official Close...")
     
-    # 1. Load Official EOD Data
     enh_path = Path(cr.PATH_ENH) / f"{yymm}_enh.parquet"
     if not enh_path.exists():
         print("[ERROR] EOD Model file missing.")
@@ -138,91 +170,58 @@ def step_4_mark_positions(yymm):
     df_enh = pd.read_parquet(enh_path)
     last_ts = df_enh['ts'].max()
     
-    # Get Snapshot of the last timestamp
     snapshot = df_enh[df_enh['ts'] == last_ts].set_index('tenor_yrs')
-    # Helper to get Z
+    
     def get_z(tenor):
-        # Find nearest tenor in snapshot
-        idx = snapshot.index.get_indexer([tenor], method='nearest')[0]
-        return snapshot.iloc[idx]['z_comb']
+        # Nearest neighbor lookup
+        if tenor not in snapshot.index:
+             # try finding nearest
+             idx = snapshot.index.get_indexer([tenor], method='nearest')[0]
+             return snapshot.iloc[idx]['z_comb']
+        return snapshot.loc[tenor]['z_comb']
 
-    # 2. Get Open Positions
     conn = get_db_connection(DB_POSITIONS)
     trades = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
     
     if trades.empty:
-        print("[EOD] No open positions to mark.")
+        print("[EOD] No open positions.")
         conn.close()
         return
 
-    # 3. Iterate and Check Rules
     for _, t in trades.iterrows():
         trade_id = t['trade_id']
-        t_pay = t['tenor_pay']
-        t_rec = t['tenor_rec']
-        entry_z = t['entry_z_spread']
+        curr_z = get_z(t['tenor_pay']) - get_z(t['tenor_rec'])
         
-        # Calculate Official EOD Z-Spread
-        z_pay = get_z(t_pay)
-        z_rec = get_z(t_rec)
-        curr_z = z_pay - z_rec
-        
-        # Calculate Days Held (Simple approx)
         open_dt = pd.to_datetime(t['open_ts'])
         days_held = (pd.Timestamp.now() - open_dt).days
         
-        # --- RULE CHECKING (Matches portfolio_test.py) ---
-        new_status = 'OPEN'
+        entry_z = t['entry_z_spread']
         reason = None
         
-        # 1. Reversion (Take Profit)
-        if abs(curr_z) < cr.Z_EXIT:
-            new_status = 'FLAGGED_CLOSE'
-            reason = 'reversion'
+        # Rule Logic
+        if abs(curr_z) < cr.Z_EXIT: reason = 'reversion'
+        elif abs(curr_z - entry_z) > cr.Z_STOP: reason = 'stop_loss'
+        elif days_held >= cr.MAX_HOLD_DAYS: reason = 'max_hold'
             
-        # 2. Stop Loss
-        elif abs(curr_z - entry_z) > cr.Z_STOP:
-            new_status = 'FLAGGED_CLOSE'
-            reason = 'stop_loss'
-            
-        # 3. Max Hold
-        elif days_held >= cr.MAX_HOLD_DAYS:
-            new_status = 'FLAGGED_CLOSE'
-            reason = 'max_hold'
-            
-        # Update DB if flag changed
-        if new_status == 'FLAGGED_CLOSE':
+        if reason:
             print(f" -> Flagging Trade {trade_id} for {reason} (Z: {curr_z:.2f})")
-            # We store the reason so the trader sees it tomorrow
-            conn.execute("""
-                UPDATE trades 
-                SET close_reason = ? 
-                WHERE trade_id = ?
-            """, (reason, trade_id))
-            # Note: We do NOT set status to CLOSED. We leave it OPEN (or FLAGGED)
-            # The UI Blotter will highlight it based on the close_reason.
+            conn.execute("UPDATE trades SET close_reason = ? WHERE trade_id = ?", (reason, trade_id))
             
     conn.commit()
     conn.close()
-    print("[EOD] Position Marking Complete.")
+    print("[EOD] Marking Complete.")
 
 def run_eod_main():
-    # Determine current YYMM based on today
     now = datetime.datetime.now()
     yymm = now.strftime("%y%m")
     
-    print("="*40)
     print(f"STARTING EOD BATCH FOR {yymm}")
-    print("="*40)
-    
-    if step_1_export_ticks_to_parquet(yymm):
+    # Step 1 now stitches history automatically
+    if step_1_export_and_stitch(yymm): 
         if step_2_build_model(yymm):
             step_3_update_signals_and_state()
             step_4_mark_positions(yymm)
-            
-    print("="*40)
     print("EOD BATCH COMPLETED")
-    print("="*40)
 
 if __name__ == "__main__":
     run_eod_main()
