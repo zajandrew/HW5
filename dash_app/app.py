@@ -12,18 +12,38 @@ from data_manager import (init_dbs, add_position, get_open_positions,
                           get_all_positions, update_position_status, 
                           get_system_state, delete_position)
 import live_engine as le
-from live_feed import feed
+from live_feed import feed  # Using the Real Feed
+import eod_process          # Using the EOD Logic
 
 # Import Research Config
 sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
-import feature_creation as fc 
 
 # --- SETUP ---
 init_dbs()
 feed.start()
-# Example hardcoded month - ensure this matches your parquet file
-CURRENT_YYMM = "2304" 
+
+def get_latest_model_yymm():
+    """
+    Scans PATH_ENH for the most recent parquet file.
+    Returns string "YYMM" (e.g., "2311").
+    If no file exists, returns current month.
+    """
+    enh_dir = Path(cr.PATH_ENH)
+    files = list(enh_dir.glob("*_enh.parquet"))
+    
+    if not files:
+        # Fallback: Current Month
+        return datetime.now().strftime("%y%m")
+    
+    # Files are named "YYMM_enh.parquet". Sorting works alphabetically for YYMM.
+    files.sort() 
+    latest_file = files[-1]
+    return latest_file.name.split('_')[0]
+
+# Dynamic Loading
+CURRENT_YYMM = get_latest_model_yymm()
+print(f"[SYSTEM] Initializing App with Model Month: {CURRENT_YYMM}")
 le.load_midnight_model(CURRENT_YYMM)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
@@ -67,13 +87,12 @@ def format_tenor(ticker, float_years):
     if abs(y - 1.5) < tol: return "18M"
 
     # --- Integer Years (1Y, 2Y, ... 40Y) ---
-    # This dynamically handles 1, 2, 3... 10, 12, 15, 20, 25, 30, 40
     if abs(y - round(y)) < tol:
         return f"{int(round(y))}Y"
 
     # --- Fallback ---
     return f"{y:.1f}Y"
-  
+
 # --- LAYOUT ---
 app.layout = html.Div([
     dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates
@@ -388,9 +407,20 @@ def update_blotter(n, click):
         zr = z_map.get(row['ticker_rec'], {}).get('z_live', 0)
         curr_z = zp - zr
         
-        flag = "OPEN"
-        if abs(curr_z) < Z_EXIT: flag = "TAKE PROFIT"
-        if abs(curr_z - row['entry_z_spread']) > Z_STOP: flag = "STOP LOSS"
+        # Determine Status
+        # Priority: Check if EOD flagged it (stored in close_reason)
+        db_reason = row.get('close_reason')
+        if db_reason and db_reason not in [None, 'None', '']:
+             # Use the DB flag if present
+             if db_reason == 'max_hold': flag = "MAX HOLD"
+             elif db_reason == 'stop_loss': flag = "STOP LOSS (EOD)"
+             elif db_reason == 'reversion': flag = "TAKE PROFIT (EOD)"
+             else: flag = f"CHECK: {db_reason}"
+        else:
+             # Realtime Calc
+             flag = "OPEN"
+             if abs(curr_z) < Z_EXIT: flag = "TAKE PROFIT"
+             if abs(curr_z - row['entry_z_spread']) > Z_STOP: flag = "STOP LOSS"
         
         # Pretty Tenors
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
@@ -447,14 +477,17 @@ def modify_trade(n_close, n_del, rows, data, reason):
                                
     return "Action Complete"
 
-# 6. EOD Trigger (Unchanged)
+# 6. EOD Trigger
 @app.callback(
     Output('btn-run-eod', 'children'),
     Input('btn-run-eod', 'n_clicks'),
     prevent_initial_call=True
 )
 def run_eod_batch(n):
-    return "Batch Started..."
+    # This runs synchronously in this thread
+    # In production, this should dispatch to a queue
+    eod_process.run_eod_main()
+    return "Batch Completed"
 
 if __name__ == '__main__':
     app.run_server(debug=True, port=8050)
