@@ -194,15 +194,50 @@ def _worker_task(task_tuple):
 # ==============================================================================
 
 def generate_random_params(n=100) -> List[Dict[str, Any]]:
-    """Monte Carlo Generator"""
-    combos = []
+    """
+    Generates exactly 'n' unique, valid random parameter sets.
+    Applies logic constraints upstream to ensure every candidate is viable.
+    """
     keys = list(PARAM_SPACE.keys())
-    for _ in range(n):
-        item = {}
-        for k in keys:
-            item[k] = random.choice(PARAM_SPACE[k])
-        combos.append(item)
-    return combos
+    seen_combos = set()
+    valid_dicts = []
+    
+    # Safety valve: calculate max possible combos to avoid infinite loop
+    # if requested n > max theoretical combos.
+    max_combos = 1
+    for k in keys:
+        max_combos *= len(PARAM_SPACE[k])
+    
+    target_n = min(n, max_combos) # Don't try to generate more than exist
+    
+    while len(valid_dicts) < target_n:
+        # 1. Random Selection
+        current_values = tuple(random.choice(PARAM_SPACE[k]) for k in keys)
+        
+        # 2. Duplicate Check
+        if current_values in seen_combos:
+            continue
+            
+        # 3. Convert to Dict for Logic Check
+        item = dict(zip(keys, current_values))
+        
+        # --- LOGIC CONSTRAINTS ---
+        
+        # Constraint A: Mean Reversion Width
+        # We need at least 0.5 sigma profit potential
+        if item["Z_ENTRY"] - item["Z_EXIT"] < 0.5:
+            continue
+            
+        # Constraint B: Stop Loss Distance
+        # Stop shouldn't be too tight relative to entry (noise trap)
+        if item["Z_STOP"] - item["Z_ENTRY"] < 0.5:
+            continue
+        
+        # --- ACCEPT ---
+        seen_combos.add(current_values)
+        valid_dicts.append(item)
+        
+    return valid_dicts
 
 def init_pool_globals(sigs, months):
     global _GLOBAL_SIGNALS, _GLOBAL_MONTHS
