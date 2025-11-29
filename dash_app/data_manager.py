@@ -12,7 +12,7 @@ def init_dbs():
     conn = sqlite3.connect(DB_POSITIONS)
     c = conn.cursor()
     
-    # Trade Blotter
+    # Updated Schema with PnL Breakdown
     c.execute('''CREATE TABLE IF NOT EXISTS trades (
         trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
         open_ts TEXT,
@@ -28,10 +28,12 @@ def init_dbs():
         model_z_score REAL,
         close_ts TEXT,
         close_reason TEXT,
-        realized_pnl_cash REAL DEFAULT 0.0
+        realized_pnl_cash REAL DEFAULT 0.0,
+        realized_pnl_price REAL DEFAULT 0.0,
+        realized_pnl_carry REAL DEFAULT 0.0,
+        realized_pnl_roll REAL DEFAULT 0.0
     )''')
     
-    # System State (Singleton)
     c.execute('''CREATE TABLE IF NOT EXISTS system_state (
         id INTEGER PRIMARY KEY,
         last_update_ts TEXT,
@@ -40,12 +42,11 @@ def init_dbs():
         cumulative_realized_pnl REAL DEFAULT 0.0
     )''')
     
-    # Init state row if not exists
     c.execute("INSERT OR IGNORE INTO system_state (id, regime_status) VALUES (1, 'SAFE')")
     conn.commit()
     conn.close()
 
-    # 2. Market Data DB (Rolling Buffer)
+    # 2. Market Data DB
     conn = sqlite3.connect(DB_MARKET)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS ticks (
@@ -57,7 +58,6 @@ def init_dbs():
     conn.close()
 
 def log_ticks(tick_list):
-    """Batch insert ticks for EOD processing."""
     if not tick_list: return
     conn = sqlite3.connect(DB_MARKET)
     c = conn.cursor()
@@ -76,19 +76,20 @@ def add_position(trade_dict):
     conn.commit()
     conn.close()
 
-def update_position_status(trade_id, status, close_reason=None, close_ts=None, pnl=0.0):
+def update_position_status(trade_id, status, close_reason=None, close_ts=None, 
+                           pnl_total=0.0, pnl_price=0.0, pnl_carry=0.0, pnl_roll=0.0):
     conn = sqlite3.connect(DB_POSITIONS)
     c = conn.cursor()
     c.execute("""
         UPDATE trades 
-        SET status=?, close_reason=?, close_ts=?, realized_pnl_cash=?
+        SET status=?, close_reason=?, close_ts=?, 
+            realized_pnl_cash=?, realized_pnl_price=?, realized_pnl_carry=?, realized_pnl_roll=?
         WHERE trade_id=?
-    """, (status, close_reason, close_ts, pnl, trade_id))
+    """, (status, close_reason, close_ts, pnl_total, pnl_price, pnl_carry, pnl_roll, trade_id))
     conn.commit()
     conn.close()
 
 def delete_position(trade_id):
-    """Hard delete for mistakes."""
     conn = sqlite3.connect(DB_POSITIONS)
     c = conn.cursor()
     c.execute("DELETE FROM trades WHERE trade_id=?", (trade_id,))
