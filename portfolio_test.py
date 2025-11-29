@@ -398,8 +398,7 @@ def run_month(
 ):
     """
     Run a single month.
-    Final Verified Version: Defines all local vars explicitly.
-    Includes Carry/Roll-Down + Numerical Stability fixes.
+    Final Fix: Corrected variable naming in Overlay inner loop (alt_tenor).
     """
     import math
     try:
@@ -434,11 +433,9 @@ def run_month(
     else:
         raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
-    # =========================================================
-    # 1. DEFINE LOCAL CONSTANTS & HELPERS
-    # =========================================================
     base_max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
 
+    # Overlay Config
     OVERLAY_MAX_HOLD_DV01_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_MED", 20_000.0))
     OVERLAY_MAX_HOLD_DV01_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_HI", 50_000.0))
     OVERLAY_MAX_HOLD_DAYS_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_MED", 5.0))
@@ -472,25 +469,7 @@ def run_month(
     _bps_stop_val = getattr(cr, "BPS_PNL_STOP", None)
     BPS_PNL_STOP = float(_bps_stop_val) if _bps_stop_val is not None else 0.0
 
-    PER_BUCKET_DV01_CAP = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
-    TOTAL_DV01_CAP = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
-    FRONT_END_DV01_CAP = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
-    Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
-    SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
-    Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
-    Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
-
-    EXEC_LEG_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
-    ALT_LEG_THRESHOLD = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
-    MIN_SEP = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-    MAX_SPAN = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
-    SHORT_EXTRA = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
-    
-    SHOCK_MODE = str(getattr(cr, "SHOCK_MODE", "ROLL_OFF")).upper()
-
-    # =========================================================
-    # 2. STATE INITIALIZATION
-    # =========================================================
+    # --- Shock Filter State ---
     if shock_state is None:
         shock_state = {"history": [], "dates": [], "remaining": 0}
     
@@ -506,6 +485,7 @@ def run_month(
             if shock_cfg.regression_cols:
                 valid_reg_cols = [c for c in shock_cfg.regression_cols if c in sig_lookup.columns]
 
+    SHOCK_MODE = str(getattr(cr, "SHOCK_MODE", "ROLL_OFF")).upper()
     open_positions = (open_positions or []) if carry_in else []
 
     if mode == "overlay" and hedges is not None and not hedges.empty:
@@ -517,9 +497,24 @@ def run_month(
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
 
-    # =========================================================
-    # 3. MAIN LOOP
-    # =========================================================
+    PER_BUCKET_DV01_CAP = float(getattr(cr, "PER_BUCKET_DV01_CAP", 1.0))
+    TOTAL_DV01_CAP = float(getattr(cr, "TOTAL_DV01_CAP", 3.0))
+    FRONT_END_DV01_CAP = float(getattr(cr, "FRONT_END_DV01_CAP", 1.0))
+    Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
+    SHORT_END_EXTRA_Z = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
+    Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
+    Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
+    
+    # Granular thresholds
+    EXEC_LEG_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
+    ALT_LEG_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
+    MIN_SEP = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
+    MAX_SPAN = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
+    
+    # Variables needed for inner loop checks
+    # SHORT_END_EXTRA_Z is aliased as SHORT_EXTRA
+    SHORT_EXTRA = SHORT_END_EXTRA_Z 
+
     for dts, snap in df.groupby("decision_ts", sort=True):
         snap_last = (
             snap.sort_values("ts")
@@ -530,12 +525,17 @@ def run_month(
         if snap_last.empty:
             continue
 
-        # A) START-OF-DAY GATING
+        # ============================================================
+        # A) START-OF-DAY GATING (NO LOOKAHEAD)
+        # ============================================================
         was_shock_active_at_open = (shock_state["remaining"] > 0)
+        
         if shock_state["remaining"] > 0:
             shock_state["remaining"] -= 1
 
-        # B) MARK POSITIONS & NATURAL EXITS
+        # ============================================================
+        # 1) MARK POSITIONS & NATURAL EXITS
+        # ============================================================
         period_pnl_cash = 0.0       
         period_pnl_bps_mtm = 0.0    
         period_pnl_bps_realized = 0.0 
@@ -546,8 +546,10 @@ def run_month(
         for pos in open_positions:
             prev_cash, prev_bp = pos.pnl_cash, pos.pnl_bp
             
+            # Mark
             zsp = pos.mark(snap_last, decision_ts=dts)
             
+            # Incremental MTM
             per_pnl_cash += (pos.pnl_cash - prev_cash)
             per_pnl_bps_mtm += (pos.pnl_bp - prev_bp)
 
@@ -593,9 +595,6 @@ def run_month(
                 "pnl_price_cash": pos.pnl_price_cash,
                 "pnl_carry_cash": pos.pnl_carry_cash,
                 "pnl_roll_cash": pos.pnl_roll_cash,
-                "pnl_price_bp": pos.pnl_price_bp,
-                "pnl_carry_bp": pos.pnl_carry_bp,
-                "pnl_roll_bp": pos.pnl_roll_bp,
                 "z_spread": zsp, "closed": pos.closed, "mode": pos.mode,
                 "rate_i": getattr(pos, "last_rate_i", np.nan),
                 "rate_j": getattr(pos, "last_rate_j", np.nan),
@@ -609,21 +608,21 @@ def run_month(
                 pos.tcost_bp = tcost_bp
                 pos.tcost_cash = tcost_cash
                 
-                per_pnl_cash -= tcost_cash
-                per_pnl_bps_mtm -= tcost_bp
+                period_pnl_cash -= tcost_cash
+                period_pnl_bps_mtm -= tcost_bp
                 
-                per_pnl_bps_realized += (pos.pnl_bp - tcost_bp)
-                per_pnl_cash_realized += (pos.pnl_cash - tcost_cash)
+                period_pnl_bps_realized += (pos.pnl_bp - tcost_bp)
+                period_pnl_cash_realized += (pos.pnl_cash - tcost_cash)
 
                 closed_rows.append({
                     "open_ts": pos.open_ts, "close_ts": dts, "exit_reason": pos.exit_reason,
                     "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                     "pnl_gross_bp": pos.pnl_bp, "pnl_gross_cash": pos.pnl_cash,
-                    "pnl_carry_cash": pos.pnl_carry_cash, "pnl_carry_bp": pos.pnl_carry_bp,
-                    "pnl_roll_cash": pos.pnl_roll_cash, "pnl_roll_bp": pos.pnl_roll_bp,  
-                    "pnl_price_cash": pos.pnl_price_cash, "pnl_price_bp": pos.pnl_price_bp,
+                    "pnl_carry_cash": pos.pnl_carry_cash, 
+                    "pnl_roll_cash": pos.pnl_roll_cash,   
                     "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
-                    "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "pnl_net_bp": pos.pnl_bp - tcost_bp, 
+                    "pnl_net_cash": pos.pnl_cash - tcost_cash,
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
                     "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side"),
@@ -633,12 +632,14 @@ def run_month(
         
         open_positions = still_open
         
-        # C) UPDATE SHOCK STATE
+        # ============================================================
+        # 2) UPDATE HISTORY & DETECT NEW SHOCK
+        # ============================================================
         metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS") if shock_cfg else "MTM_BPS"
-        if metric_type == "REALIZED_CASH": metric_val = per_pnl_cash_realized
-        elif metric_type == "REALIZED_BPS": metric_val = per_pnl_bps_realized
-        elif metric_type == "MTM_BPS" or metric_type == "BPS": metric_val = per_pnl_bps_mtm
-        else: metric_val = per_pnl_cash
+        if metric_type == "REALIZED_CASH": metric_val = period_pnl_cash_realized
+        elif metric_type == "REALIZED_BPS": metric_val = period_pnl_bps_realized
+        elif metric_type == "MTM_BPS" or metric_type == "BPS": metric_val = period_pnl_bps_mtm
+        else: metric_val = period_pnl_cash
 
         shock_state["history"].append(metric_val)
         shock_state["dates"].append(dts)
@@ -681,9 +682,11 @@ def run_month(
         
         if is_new_shock: shock_state["remaining"] = int(shock_cfg.block_length)
 
-        # D) PANIC EXIT
-        is_shock_active = (shock_state["remaining"] > 0) or is_new_shock
-        if is_shock_active and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
+        # ============================================================
+        # 3) EXECUTE PANIC EXIT
+        # ============================================================
+        is_in_shock_state = (shock_state["remaining"] > 0) or is_new_shock
+        if is_in_shock_state and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
             panic_bp_real, panic_cash_real = 0.0, 0.0
             panic_t_bp, panic_t_cash = 0.0, 0.0
             
@@ -701,28 +704,31 @@ def run_month(
                 closed_rows.append({
                     "open_ts": pos.open_ts, "close_ts": dts, "exit_reason": "shock_exit",
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
-                    "pnl_carry_cash": pos.pnl_carry_cash, "pnl_carry_bp": pos.pnl_carry_bp,
-                    "pnl_roll_cash": pos.pnl_roll_cash, "pnl_roll_bp": pos.pnl_roll_bp,
-                    "pnl_price_cash": pos.pnl_price_cash, "pnl_price_bp": pos.pnl_price_bp,
-                    "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
+                    "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
                     "mode": pos.mode, "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side")
                 })
             open_positions = []
             
+            # Retroactive History Update
             if metric_type == "REALIZED_CASH": shock_state["history"][-1] += panic_cash_real
             elif metric_type == "REALIZED_BPS": shock_state["history"][-1] += panic_bp_real
             elif metric_type == "MTM_BPS" or metric_type == "BPS": shock_state["history"][-1] -= panic_t_bp
             else: shock_state["history"][-1] -= panic_t_cash
 
-        # E) GATE ENTRIES
+        # ============================================================
+        # 4) GATE ENTRIES
+        # ============================================================
         regime_ok = True
         if regime_mask is not None:
             regime_ok = bool(regime_mask.at[dts]) if dts in regime_mask.index else False
-            
+        
         gate = (not regime_ok) or was_shock_active_at_open
-        if SHOCK_MODE == "EXIT_ALL" and is_shock_active: gate = True
+        if SHOCK_MODE == "EXIT_ALL" and is_in_shock_state: gate = True
         if gate: continue
         
+        # ============================================================
+        # 5) NEW ENTRIES
+        # ============================================================
         rem_slots = max(0, cr.MAX_CONCURRENT_PAIRS - len(open_positions))
         if rem_slots <= 0: continue
 
@@ -744,6 +750,8 @@ def run_month(
             for _, h in h_here.iterrows():
                 if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS: break
                 t_trade = float(h["tenor_yrs"])
+                
+                # --- Granular Checks ---
                 if t_trade < EXEC_LEG_THRESHOLD: continue
                 if abs(float(h["dv01"])) > _per_trade_dv01_cap_for_bucket(assign_bucket(t_trade)): continue
 
@@ -755,18 +763,21 @@ def run_month(
                 
                 best_c, best_z = None, 0.0
                 for _, alt in snap_srt.iterrows():
-                    t_alt = float(alt["tenor_yrs"])
-                    if t_alt < ALT_LEG_THRESHOLD or t_alt == float(exec_row["tenor_yrs"]): continue
-                    if not (MIN_SEP <= abs(t_alt - float(exec_row["tenor_yrs"])) <= MAX_SPAN): continue
+                    alt_tenor = float(alt["tenor_yrs"])
+                    
+                    # --- Alt Checks ---
+                    if alt_tenor < ALT_LEG_THRESHOLD: continue
+                    if alt_tenor == float(exec_row["tenor_yrs"]): continue
+                    if not (MIN_SEP <= abs(alt_tenor - float(exec_row["tenor_yrs"])) <= MAX_SPAN): continue
                     
                     z_alt = _to_float(alt["z_comb"])
                     disp = (z_alt - exec_z) if side_s > 0 else (exec_z - z_alt)
                     if disp < z_ent_eff: continue
                     
-                    if (assign_bucket(alt_tenor)=="short" or assign_bucket(exec_tenor)=="short") and (disp < z_ent_eff + SHORT_EXTRA):
+                    if (assign_bucket(alt_tenor)=="short" or assign_bucket(float(exec_row["tenor_yrs"]))=="short") and (disp < z_ent_eff + SHORT_EXTRA):
                         continue
                     
-                    c_t, r_t = (t_alt, float(exec_row["tenor_yrs"])) if z_alt > exec_z else (float(exec_row["tenor_yrs"]), t_alt)
+                    c_t, r_t = (alt_tenor, float(exec_row["tenor_yrs"])) if z_alt > exec_z else (float(exec_row["tenor_yrs"]), alt_tenor)
                     if not (fly_alignment_ok(c_t, 1, snap_srt, zdisp_for_pair=disp) and fly_alignment_ok(r_t, -1, snap_srt, zdisp_for_pair=disp)): continue
                     
                     if disp > best_z: best_z, best_c = disp, alt
