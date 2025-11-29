@@ -18,6 +18,7 @@ Path(getattr(cr, "PATH_OUT", ".")).mkdir(parents=True, exist_ok=True)
 
 
 def _to_float(x, default=np.nan):
+    """Safe scalar float extraction."""
     try:
         if isinstance(x, (pd.Series, pd.Index)):
             if len(x) == 0: return default
@@ -27,6 +28,7 @@ def _to_float(x, default=np.nan):
         return default
 
 def pv01_proxy(tenor_yrs, rate_pct):
+    """Simple PV01 proxy so pair is roughly DV01-neutral."""
     return tenor_yrs / max(1e-6, 1.0 + 0.01 * rate_pct)
 
 def assign_bucket(tenor):
@@ -132,6 +134,7 @@ def tenor_to_ticker(tenor_yrs, tol=1e-6):
     return best_k if best_d <= tol else None
 
 def _get_funding_rate(snap_last: pd.DataFrame) -> float:
+    """Finds proxy for funding rate (shortest available tenor)."""
     try:
         if snap_last.empty: return 0.0
         sorted_snap = snap_last.sort_values("tenor_yrs")
@@ -140,7 +143,7 @@ def _get_funding_rate(snap_last: pd.DataFrame) -> float:
         return 0.0
 
 # ------------------------
-# Pair object (Fixed Carry Logic)
+# Pair object (With Carry/Roll Logic)
 # ------------------------
 class PairPos:
     def __init__(self, open_ts, cheap_row, rich_row, w_i, w_j, decisions_per_day, *, 
@@ -178,15 +181,15 @@ class PairPos:
         self.dv01_i_curr, self.dv01_j_curr = self.dv01_i_entry, self.dv01_j_entry
         self.rem_tenor_i, self.rem_tenor_j = self.tenor_i_orig, self.tenor_j_orig
         
-        # State for Incremental Calc
-        self.last_mark_ts = open_ts # Needed for incremental carry
-
         # PnL Components (Cumulative)
         self.pnl_price_cash = 0.0
         self.pnl_carry_cash = 0.0
         self.pnl_roll_cash = 0.0
         self.pnl_cash = 0.0
         self.pnl_bp = 0.0
+        
+        # State for Incremental Carry
+        self.last_mark_ts = open_ts 
         
         self.tcost_bp, self.tcost_cash = 0.0, 0.0
         self.decisions_per_day = decisions_per_day
@@ -207,7 +210,7 @@ class PairPos:
         self.dv01_j_curr = self.dv01_j_entry * fj
 
     def mark(self, snap_last: pd.DataFrame, decision_ts: Optional[pd.Timestamp] = None):
-        # 0. Update DV01 State
+        # 0. Update Decay
         if self.mode == "overlay" and decision_ts:
             self._update_overlay_dv01(decision_ts)
 
@@ -215,35 +218,30 @@ class PairPos:
         ri = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "rate"])
         rj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "rate"])
         r_float = _get_funding_rate(snap_last)
+        
         self.last_rate_i, self.last_rate_j = ri, rj
 
-        # 2. Price PnL (Delta) - Uses Current DV01
-        # (Entry - Current) * DV01. Reflects "remaining" MTM value.
+        # 2. Price PnL (Delta)
         pnl_price_i = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
         pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
         self.pnl_price_cash = pnl_price_i + pnl_price_j
 
-        # 3. Carry PnL (Coupon) - INCREMENTAL ACCUMULATION
-        # We must accrue carry for the time passed since LAST mark, using CURRENT risk.
+        # 3. Carry PnL (Coupon) - Incremental Accumulation
         if decision_ts and self.last_mark_ts:
-            # Days since last mark (incremental)
             dt_days = max(0.0, (decision_ts.normalize() - self.last_mark_ts.normalize()).days)
             if dt_days > 0:
-                # Accrue based on current DV01 (approximation of risk over this interval)
                 inc_carry_i = (self.entry_rate_i - r_float) * 100.0 * self.dv01_i_curr * (dt_days / 360.0)
                 inc_carry_j = (self.entry_rate_j - r_float) * 100.0 * self.dv01_j_curr * (dt_days / 360.0)
                 self.pnl_carry_cash += (inc_carry_i + inc_carry_j)
-                
-            self.last_mark_ts = decision_ts # Update last seen
+            self.last_mark_ts = decision_ts
 
         # 4. Roll-Down PnL
-        # Effectively corrects Price PnL to use the Interpolated Yield instead of Constant Maturity Yield.
-        # Uses cumulative days from open to find the point on the curve.
         days_total = 0.0
         if decision_ts:
             days_total = max(0.0, (decision_ts.normalize() - self.open_ts.normalize()).days)
         
-        xp, fp = snap_last["tenor_yrs"].values, snap_last["rate"].values
+        xp = snap_last["tenor_yrs"].values
+        fp = snap_last["rate"].values
         
         t_roll_i = max(0.0, self.tenor_i_orig - (days_total/360.0))
         y_roll_i = np.interp(t_roll_i, xp, fp)
@@ -263,7 +261,7 @@ class PairPos:
         else:
             self.pnl_bp = 0.0
 
-        # Z-Score State
+        # Z-Score Logic
         zi = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "z_comb"])
         zj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "z_comb"])
         zsp = zi - zj
@@ -296,6 +294,7 @@ def choose_pairs_under_caps(snap_last, max_pairs, per_bucket_cap, total_cap, fro
     MAX_SPAN = float(getattr(cr, "MAX_SPAN_YEARS", 10))
     Z_ENT = float(getattr(cr, "Z_ENTRY", 0.75))
     SHORT_EXTRA = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
+    # Use ALT_LEG_TENOR_YEARS as floor for Mode A
     MIN_TEN = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.5))
 
     for k_low in range(low_take):
@@ -349,6 +348,29 @@ def _enhanced_in_path(yymm: str) -> Path:
     name = cr.enh_fname(yymm) if hasattr(cr, "enh_fname") else f"{yymm}_enh{suffix}.parquet" if suffix else f"{yymm}_enh.parquet"
     return Path(getattr(cr, "PATH_ENH", ".")) / name
 
+def _positions_out_path() -> Path:
+    if hasattr(cr, "positions_fname") and callable(cr.positions_fname): name = cr.positions_fname()
+    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"positions_ledger{suffix}.parquet" if suffix else "positions_ledger.parquet"
+    return Path(getattr(cr, "PATH_OUT", ".")) / name
+
+def _marks_out_path() -> Path:
+    if hasattr(cr, "marks_fname") and callable(cr.marks_fname): name = cr.marks_fname()
+    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"marks_ledger{suffix}.parquet" if suffix else "marks_ledger.parquet"
+    return Path(getattr(cr, "PATH_OUT", ".")) / name
+
+def _pnl_out_path() -> Path:
+    if hasattr(cr, "pnl_fname") and callable(cr.pnl_fname): name = cr.pnl_fname()
+    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"pnl_by_bucket{suffix}.parquet" if suffix else "pnl_by_bucket.parquet"
+    return Path(getattr(cr, "PATH_OUT", ".")) / name
+
+def _pnl_curve_png(yymm: str) -> Path:
+    if hasattr(cr, "pnl_curve_png") and callable(cr.pnl_curve_png): name = cr.pnl_curve_png(yymm)
+    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"pnl_curve_{yymm}{suffix}.png" if suffix else f"pnl_curve_{yymm}.png"
+    return Path(getattr(cr, "PATH_OUT", ".")) / name
+
+# ------------------------
+# RUN MONTH (Corrected Logic)
+# ------------------------
 def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, mode="strategy", hedges=None, overlay_use_caps=None, regime_mask=None, hybrid_signals=None, shock_cfg=None, shock_state=None):
     try: np
     except NameError: import numpy as np
@@ -394,7 +416,6 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
         was_shock_active = (shock_state["remaining"] > 0)
         if shock_state["remaining"] > 0: shock_state["remaining"] -= 1
         
-        # B) Mark & Natural Exits
         per_pnl_cash, per_pnl_bps_mtm = 0.0, 0.0
         per_pnl_bps_real, per_pnl_cash_real = 0.0, 0.0
         
@@ -402,7 +423,6 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
         for pos in open_positions:
             prev_cash, prev_bp = pos.pnl_cash, pos.pnl_bp
             
-            # Mark (Calculates Price+Carry+Roll internally)
             zsp = pos.mark(snap_last, decision_ts=dts)
             
             per_pnl_cash += (pos.pnl_cash - prev_cash)
@@ -423,17 +443,13 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
             if exit_flag: 
                 pos.closed, pos.close_ts, pos.exit_reason = True, dts, exit_flag
 
-            # LOGGING (Full Breakdown)
             ledger_rows.append({
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
-                "pnl_price_cash": pos.pnl_price_cash,
-                "pnl_carry_cash": pos.pnl_carry_cash,
-                "pnl_roll_cash": pos.pnl_roll_cash,
+                "pnl_price_cash": pos.pnl_price_cash, "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
                 "z_spread": zsp, "closed": pos.closed, "mode": pos.mode,
-                "rate_i": getattr(pos, "last_rate_i", np.nan),
-                "rate_j": getattr(pos, "last_rate_j", np.nan),
+                "rate_i": getattr(pos, "last_rate_i", np.nan), "rate_j": getattr(pos, "last_rate_j", np.nan),
                 "w_i": pos.w_i, "w_j": pos.w_j,
             })
 
@@ -444,7 +460,6 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
                 
                 per_pnl_cash -= t_cash
                 per_pnl_bps_mtm -= t_bp
-                
                 per_pnl_bps_real += (pos.pnl_bp - t_bp)
                 per_pnl_cash_real += (pos.pnl_cash - t_cash)
                 
@@ -452,11 +467,9 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
                     "open_ts": pos.open_ts, "close_ts": dts, "exit_reason": pos.exit_reason,
                     "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                     "pnl_gross_bp": pos.pnl_bp, "pnl_gross_cash": pos.pnl_cash,
-                    "pnl_carry_cash": pos.pnl_carry_cash, 
-                    "pnl_roll_cash": pos.pnl_roll_cash,   
+                    "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,   
                     "tcost_bp": t_bp, "tcost_cash": t_cash,
                     "pnl_net_bp": pos.pnl_bp - t_bp, "pnl_net_cash": pos.pnl_cash - t_cash,
-                    "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "mode": pos.mode,
                     "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side"),
                 })
@@ -465,7 +478,7 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
         
         open_positions = still_open
         
-        # C) Update Shock State
+        # C) Shock Logic
         metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS") if shock_cfg else "MTM_BPS"
         if metric_type == "REALIZED_CASH": metric_val = per_pnl_cash_real
         elif metric_type == "REALIZED_BPS": metric_val = per_pnl_bps_real
@@ -510,7 +523,7 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
         
         if is_new_shock: shock_state["remaining"] = int(shock_cfg.block_length)
 
-        # D) Panic Exit
+        # D) Panic
         is_shock_active = (shock_state["remaining"] > 0) or is_new_shock
         if is_shock_active and SHOCK_MODE == "EXIT_ALL" and len(open_positions) > 0:
             panic_bp_real, panic_cash_real = 0.0, 0.0
@@ -530,7 +543,7 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
                     "open_ts": pos.open_ts, "close_ts": dts, "exit_reason": "shock_exit",
                     "pnl_net_bp": pos.pnl_bp - t_bp, "pnl_net_cash": pos.pnl_cash - t_cash,
                     "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
-                    "mode": pos.mode
+                    "mode": pos.mode, "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side")
                 })
             open_positions = []
             
@@ -539,7 +552,7 @@ def run_month(yymm, *, decision_freq=None, open_positions=None, carry_in=True, m
             elif metric_type == "MTM_BPS" or metric_type == "BPS": shock_state["history"][-1] -= panic_t_bp
             else: shock_state["history"][-1] -= panic_t_cash
 
-        # E) Gate & Entries
+        # E) Gate
         regime_ok = True
         if regime_mask is not None:
             regime_ok = bool(regime_mask.at[dts]) if dts in regime_mask.index else False
@@ -640,7 +653,7 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, mod
         if not b.empty: all_by.append(b.assign(yymm=yymm))
         
     if force_close_end and open_pos:
-        # EOC Close
+        # EOC Close Logic
         pass
 
     return (pd.concat(all_pos, ignore_index=True) if all_pos else pd.DataFrame(),
