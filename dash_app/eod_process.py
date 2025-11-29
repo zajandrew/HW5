@@ -6,10 +6,11 @@ import datetime
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
 
-# --- Hook into Research Libraries ---
+# --- Hook into Parent Directory to import Research Libraries ---
 current_dir = Path(__file__).resolve().parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
+
 import cr_config as cr
 import feature_creation as fc
 import hybrid_filter as hf
@@ -26,12 +27,10 @@ def get_lookback_files(current_yymm, months_back=6):
     Finds the previous N months of _features.parquet files.
     Used to stitch history so PCA works correctly.
     """
-    # Convert YYMM to datetime
     curr_date = datetime.datetime.strptime(current_yymm, "%y%m")
-    
     found_files = []
     
-    # Loop backwards
+    # Loop backwards to gather history
     for i in range(1, months_back + 1):
         prev_date = curr_date - relativedelta(months=i)
         prev_yymm = prev_date.strftime("%y%m")
@@ -60,6 +59,7 @@ def step_1_export_and_stitch(yymm):
     month = yymm[2:]
     date_filter = f"{year}-{month}"
     
+    # Filter strictly for the current month to avoid pollution
     sql = f"""
         SELECT timestamp, ticker, rate 
         FROM ticks 
@@ -73,14 +73,12 @@ def step_1_export_and_stitch(yymm):
         df_live['ts'] = pd.to_datetime(df_live['timestamp'])
         df_live_wide = df_live.pivot_table(index='ts', columns='ticker', values='rate', aggfunc='last')
     else:
-        print(f"[WARN] No live ticks found for {date_filter}.")
+        print(f"[WARN] No live ticks found for {date_filter} in SQLite.")
 
     # --- B. Get Historical Data ---
     hist_files = get_lookback_files(yymm, months_back=6)
-    
     dfs_to_concat = []
     
-    # Load history
     for p in hist_files:
         try:
             d = pd.read_parquet(p)
@@ -88,7 +86,6 @@ def step_1_export_and_stitch(yymm):
         except Exception as e:
             print(f"[ERROR] Failed to read {p}: {e}")
             
-    # Add live data
     if not df_live_wide.empty:
         dfs_to_concat.append(df_live_wide)
         
@@ -97,13 +94,10 @@ def step_1_export_and_stitch(yymm):
         return False
         
     # --- C. Stitch and Save ---
-    # Combine
     df_final = pd.concat(dfs_to_concat).sort_index()
-    
-    # Deduplicate: If we re-run EOD, don't duplicate overlapping timestamps
+    # Deduplicate overlapping timestamps if EOD is run multiple times
     df_final = df_final[~df_final.index.duplicated(keep='last')]
     
-    # Save
     out_path = Path(cr.PATH_DATA) / f"{yymm}_features.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -113,8 +107,8 @@ def step_1_export_and_stitch(yymm):
 
 def step_2_build_model(yymm):
     """
-    Run Feature Creation. 
-    Because we stitched history in Step 1, PCA will see the full lookback window.
+    Run Feature Creation (Spline/PCA).
+    Generates {YYMM}_enh.parquet based on the stitched features.
     """
     print(f"[EOD] Step 2: Running Feature Creation for {yymm}...")
     try:
@@ -127,10 +121,14 @@ def step_2_build_model(yymm):
         return False
 
 def step_3_update_signals_and_state():
+    """
+    Run Filters (Regime/Shock) based on new data and PnL history.
+    Updates 'system_state' table in positions.db.
+    """
     print(f"[EOD] Step 3: Updating System State (Regime & Shock)...")
     
     # --- 1. REGIME CALCULATION ---
-    # Rebuild hybrid signals using the NEW _enh.parquet file we just made
+    # Force rebuild signals using the NEW _enh.parquet file
     signals = hf.get_or_build_hybrid_signals(force_rebuild=True)
     
     if signals.empty:
@@ -138,8 +136,9 @@ def step_3_update_signals_and_state():
         regime_str = "UNSTABLE"
     else:
         last_signal = signals.iloc[-1]
-        # Check Signal Health Z-Score against Config
         health_z = last_signal.get('signal_health_z', -99)
+        
+        # Logic: If signal health is too low, curve is noisy/untradeable
         if health_z >= cr.MIN_SIGNAL_HEALTH_Z:
             regime_str = "SAFE"
         else:
@@ -149,26 +148,37 @@ def step_3_update_signals_and_state():
     # --- 2. SHOCK CALCULATION (PNL FEEDBACK) ---
     conn = get_db_connection(DB_POSITIONS)
     
-    # A. Get current state to see if we are already blocked
+    # Get current block status
     state_row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
     current_block = state_row[2] if state_row else 0
     
-    # B. Calculate Recent Daily PnL Stats
-    # We sum realized_pnl_cash by close_ts (bucketed by day)
-    # Note: In a real prod system, you might also include MTM PnL of open positions here
-    pnl_df = pd.read_sql("""
-        SELECT date(close_ts) as dts, sum(realized_pnl_cash) as daily_pnl 
+    # Check Metric Type from Config (Default Cash)
+    metric_type = str(getattr(cr, "SHOCK_METRIC_TYPE", "REALIZED_CASH"))
+    
+    # Select column based on metric preference
+    # We now have explicit columns for BP and CASH in the DB
+    if metric_type == "REALIZED_BPS":
+        # Sum realized_pnl_bp
+        target_col = "realized_pnl_bp"
+    else:
+        # Sum realized_pnl_cash
+        target_col = "realized_pnl_cash"
+
+    sql_query = f"""
+        SELECT date(close_ts) as dts, sum({target_col}) as daily_pnl 
         FROM trades 
         WHERE status='CLOSED' 
         GROUP BY date(close_ts) 
         ORDER BY dts
-    """, conn)
+    """
+
+    pnl_df = pd.read_sql(sql_query, conn)
     
     new_shock_detected = False
     
-    if len(pnl_df) >= 5: # Need minimum history to calc stats
+    # Rolling Z-Score Check on PnL
+    if len(pnl_df) >= 5: 
         recent_pnl = pnl_df['daily_pnl'].values
-        # Lookback window from config
         win = int(getattr(cr, "SHOCK_PNL_WINDOW", 10))
         
         if len(recent_pnl) > win:
@@ -176,19 +186,19 @@ def step_3_update_signals_and_state():
             mu = np.mean(slice_pnl)
             sd = np.std(slice_pnl, ddof=1)
             
-            if sd > 1e-6: # Avoid div by zero
-                # Check the MOST RECENT day's Z-score
+            if sd > 1e-6:
                 last_pnl = slice_pnl[-1]
                 z_score = (last_pnl - mu) / sd
                 
                 thresh = float(getattr(cr, "SHOCK_RAW_PNL_Z_THRESH", -1.5))
+                
                 if z_score < thresh:
                     new_shock_detected = True
-                    print(f" -> SHOCK DETECTED: Daily PnL Z-Score {z_score:.2f} < {thresh}")
+                    print(f" -> SHOCK DETECTED: Daily PnL ({metric_type}) Z-Score {z_score:.2f} < {thresh}")
 
     # C. Update Block Counter
     if new_shock_detected:
-        # Reset counter to full block length
+        # Reset counter to full block length (e.g. 10 days)
         new_block_remaining = int(getattr(cr, "SHOCK_BLOCK_LENGTH", 10))
     else:
         # Decrement existing block (if any)
@@ -207,6 +217,10 @@ def step_3_update_signals_and_state():
     print(f"[EOD] State Updated: Regime={regime_str}, ShockBlocks={new_block_remaining}")
 
 def step_4_mark_positions(yymm):
+    """
+    Mark OPEN positions against the new Official EOD Model.
+    Sets 'close_reason' flag if Max Hold or Stops are hit.
+    """
     print(f"[EOD] Step 4: Marking Positions against Official Close...")
     
     enh_path = Path(cr.PATH_ENH) / f"{yymm}_enh.parquet"
@@ -216,11 +230,9 @@ def step_4_mark_positions(yymm):
 
     df_enh = pd.read_parquet(enh_path)
     last_ts = df_enh['ts'].max()
-    
     snapshot = df_enh[df_enh['ts'] == last_ts].set_index('tenor_yrs')
     
     def get_z(tenor):
-        # Nearest neighbor lookup
         if tenor not in snapshot.index:
              # try finding nearest
              idx = snapshot.index.get_indexer([tenor], method='nearest')[0]
@@ -237,6 +249,8 @@ def step_4_mark_positions(yymm):
 
     for _, t in trades.iterrows():
         trade_id = t['trade_id']
+        
+        # Calculate Official Z-Spread
         curr_z = get_z(t['tenor_pay']) - get_z(t['tenor_rec'])
         
         open_dt = pd.to_datetime(t['open_ts'])
@@ -245,13 +259,17 @@ def step_4_mark_positions(yymm):
         entry_z = t['entry_z_spread']
         reason = None
         
-        # Rule Logic
-        if abs(curr_z) < cr.Z_EXIT: reason = 'reversion'
-        elif abs(curr_z - entry_z) > cr.Z_STOP: reason = 'stop_loss'
-        elif days_held >= cr.MAX_HOLD_DAYS: reason = 'max_hold'
+        # Rule Logic (Matches App & Backtest)
+        if abs(curr_z) < cr.Z_EXIT: 
+            reason = 'reversion' # Take Profit
+        elif abs(curr_z - entry_z) > cr.Z_STOP: 
+            reason = 'stop_loss'
+        elif days_held >= cr.MAX_HOLD_DAYS: 
+            reason = 'max_hold'
             
         if reason:
             print(f" -> Flagging Trade {trade_id} for {reason} (Z: {curr_z:.2f})")
+            # We flag it in the DB. The Blotter will see this tomorrow and highlight it.
             conn.execute("UPDATE trades SET close_reason = ? WHERE trade_id = ?", (reason, trade_id))
             
     conn.commit()
@@ -262,13 +280,18 @@ def run_eod_main():
     now = datetime.datetime.now()
     yymm = now.strftime("%y%m")
     
+    print("="*40)
     print(f"STARTING EOD BATCH FOR {yymm}")
-    # Step 1 now stitches history automatically
+    print("="*40)
+    
     if step_1_export_and_stitch(yymm): 
         if step_2_build_model(yymm):
             step_3_update_signals_and_state()
             step_4_mark_positions(yymm)
+            
+    print("="*40)
     print("EOD BATCH COMPLETED")
+    print("="*40)
 
 if __name__ == "__main__":
     run_eod_main()
