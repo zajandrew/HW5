@@ -7,7 +7,12 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# Import Local Modules
+# --- Hook into Parent Directory ---
+current_dir = Path(__file__).resolve().parent
+root_dir = current_dir.parent
+sys.path.append(str(root_dir))
+
+# --- Local Imports ---
 from data_manager import (init_dbs, add_position, get_open_positions, 
                           get_all_positions, update_position_status, 
                           get_system_state, delete_position)
@@ -15,9 +20,6 @@ import live_engine as le
 from live_feed import feed
 import eod_process
 import hybrid_filter as hf
-
-# Import Research Config
-sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
 
 # --- SETUP ---
@@ -25,6 +27,7 @@ init_dbs()
 feed.start()
 
 def get_latest_model_yymm():
+    """Finds most recent _enh.parquet file to load as Midnight Model."""
     enh_dir = Path(cr.PATH_ENH)
     files = list(enh_dir.glob("*_enh.parquet"))
     if not files: return datetime.now().strftime("%y%m")
@@ -32,6 +35,7 @@ def get_latest_model_yymm():
     return files[-1].name.split('_')[0]
 
 CURRENT_YYMM = get_latest_model_yymm()
+print(f"[SYSTEM] Initializing App with Model Month: {CURRENT_YYMM}")
 le.load_midnight_model(CURRENT_YYMM)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
@@ -40,11 +44,11 @@ app.title = "RV Overlay DSS"
 # --- HELPERS ---
 def get_z_color(z):
     if z is None: return "grey"
-    if z > 2.0: return "#00FF00" 
-    if z > 0.5: return "#90EE90" 
-    if z < -2.0: return "#FF0000" 
-    if z < -0.5: return "#CD5C5C" 
-    return "#FFD700" 
+    if z > 2.0: return "#00FF00" # Bright Green
+    if z > 0.5: return "#90EE90" # Light Green
+    if z < -2.0: return "#FF0000" # Bright Red
+    if z < -0.5: return "#CD5C5C" # Indian Red
+    return "#FFD700" # Neutral
 
 def format_tenor(ticker, float_years):
     if float_years is None: return "N/A"
@@ -71,7 +75,7 @@ def assign_bucket(tenor):
     return "Long (>7Y)"
 
 def aggregate_pnl_columns(df):
-    """Sums cash, price, carry, roll."""
+    """Sums cash columns for summary."""
     if df.empty: return 0,0,0,0
     return (
         df['realized_pnl_cash'].sum(),
@@ -167,14 +171,13 @@ app.layout = html.Div([
             dbc.Container([
                 html.H4("Performance Dashboard", className="mt-4"),
                 html.Div(id="summary-cards", className="d-flex gap-3 mb-4 flex-wrap"),
-                
                 dbc.Row([
                     dbc.Col([
-                        html.H5("Time Horizon Stats"),
+                        html.H5("Time Horizon Stats"), 
                         html.Div(id="time-stats-container")
                     ], width=6),
                     dbc.Col([
-                        html.H5("Risk Profile (Net DV01)"),
+                        html.H5("Risk Profile (Net DV01)"), 
                         html.Div(id="risk-profile-container")
                     ], width=6)
                 ])
@@ -188,9 +191,9 @@ app.layout = html.Div([
                 html.Div(id="health-cards", className="d-flex gap-3 mb-4"),
                 html.H5("Filter Inputs (Last 10 Days)"),
                 dash_table.DataTable(
-                    id='tbl-signal-history',
-                    style_table={'overflowX': 'auto'},
-                    style_cell={'backgroundColor': '#222', 'color': 'white'},
+                    id='tbl-signal-history', 
+                    style_table={'overflowX': 'auto'}, 
+                    style_cell={'backgroundColor': '#222', 'color': 'white'}
                 )
             ], fluid=True)
         ])
@@ -227,9 +230,11 @@ def update_grid(n):
         tenor_label = format_tenor(t, data['tenor'])
         color = get_z_color(z_val)
         
+        # Smart Disable Logic
         if global_disable:
             can_pay, can_rec = False, False
         else:
+            # Check availability of partners
             partners_pay = le.get_valid_partners(t, 'PAY', z_map)
             partners_rec = le.get_valid_partners(t, 'REC', z_map)
             can_pay = len(partners_pay) > 0
@@ -238,6 +243,7 @@ def update_grid(n):
         pay_style = {'opacity': 0.5 if not can_pay else 1.0}
         rec_style = {'opacity': 0.5 if not can_rec else 1.0}
         
+        # Visual cue if feed is dead (0.0)
         if z_val == 0.0 and data['model_z'] != 0.0: color = "#444"
 
         card = dbc.Card([
@@ -263,7 +269,7 @@ def update_grid(n):
     
     return cards, regime_text, regime_color, shock_text, shock_color
 
-# 2. Modal Logic (Unchanged)
+# 2. Modal Logic
 @app.callback(
     Output("modal-trade", "is_open"),
     Output("modal-body-content", "children"),
@@ -304,6 +310,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         best_ticker = candidates[0]['ticker']
         best_rate = feed.live_map.get(best_ticker, 0.0)
         
+        # Switch Logic Text
         if intent == "PAY":
             leg1_label = "LEG 1: PAY (Alternative)"
             leg2_label = f"LEG 2: REC (Original {label_orig})"
@@ -332,7 +339,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         return True, content
     return is_open, dash.no_update
 
-# 3. Submit Trade Logic (Unchanged)
+# 3. Submit Trade
 @app.callback(
     Output("scanner-msg", "children"),
     Input("btn-submit-trade", "n_clicks"),
@@ -376,7 +383,7 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
 
-# 4. Update Blotter (BOTH TABLES with BREAKDOWN)
+# 4. Update Blotter (Both Tables + Breakdown)
 @app.callback(
     Output('tbl-open-positions', 'data'),
     Output('tbl-open-positions', 'columns'),
@@ -393,13 +400,13 @@ def update_blotter(n, click):
     Z_EXIT, Z_STOP, MAX_HOLD = cr.Z_EXIT, cr.Z_STOP, cr.MAX_HOLD_DAYS
     now_dt = datetime.now()
     
-    # --- OPEN TRADES ---
+    # --- PROCESS OPEN TRADES ---
     open_df = all_trades[all_trades['status'] == 'OPEN']
-    open_data, open_styles = [], []
+    open_data = []
     
     for _, row in open_df.iterrows():
-        # CALL LIVE ENGINE PNL DECOMP
-        tot, prc, cry, rol = le.calculate_live_pnl(row, feed.live_map, now_dt)
+        # Live Engine Returns: (Cash_Tuple, BP_Tuple)
+        (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(row, feed.live_map, now_dt)
         
         z_map = le.get_live_z_scores(feed.live_map)
         zp = z_map.get(row['ticker_pay'], {}).get('z_live', 0)
@@ -431,11 +438,19 @@ def update_blotter(n, click):
             'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            # PnL Breakdown
-            'total_pnl': round(tot, 0),
-            'price_pnl': round(prc, 0),
-            'carry_pnl': round(cry, 0),
-            'roll_pnl': round(rol, 0),
+            
+            # PnL Cash (Displayed)
+            'total_pnl': round(c_tot, 0),
+            'price_pnl': round(c_prc, 0),
+            'carry_pnl': round(c_cry, 0),
+            'roll_pnl': round(c_rol, 0),
+            
+            # PnL BP (Hidden for DB pass-through)
+            'total_bp': b_tot,
+            'price_bp': b_prc,
+            'carry_bp': b_cry,
+            'roll_bp': b_rol,
+            
             'curr_z': round(curr_z, 2),
             'target_z': f"0.0 ± {Z_EXIT}",
             'stop_z': round(stop_z_level, 2),
@@ -444,7 +459,7 @@ def update_blotter(n, click):
             '_row_color': bg_color 
         })
 
-    # --- HISTORY TRADES ---
+    # --- PROCESS CLOSED HISTORY ---
     hist_df = all_trades[all_trades['status'] == 'CLOSED'].sort_values('close_ts', ascending=False)
     hist_data = []
     
@@ -462,6 +477,7 @@ def update_blotter(n, click):
             'reason': row['close_reason']
         })
 
+    # Column Definitions
     open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'curr_z', 'target_z', 'stop_z']
     open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
@@ -475,7 +491,7 @@ def update_blotter(n, click):
 
     return open_data, open_cols, style_cond, hist_data, hist_cols
 
-# 5. Modify Trade (Actions)
+# 5. Modify Trade (Save BPs to DB)
 @app.callback(
     Output('summary-content', 'children'), 
     Input('btn-close-trade', 'n_clicks'),
@@ -495,17 +511,19 @@ def modify_trade(n_close, n_del, rows, data, reason):
     if button_id == "btn-delete-trade": delete_position(trade_id)
     elif button_id == "btn-close-trade":
         row = data[row_idx]
+        
+        # Pass breakdown to DataManager
+        c_dict = {'total': row['total_pnl'], 'price': row['price_pnl'], 'carry': row['carry_pnl'], 'roll': row['roll_pnl']}
+        b_dict = {'total': row['total_bp'], 'price': row['price_bp'], 'carry': row['carry_bp'], 'roll': row['roll_bp']}
+        
         update_position_status(
             trade_id, "CLOSED", reason or "manual", 
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-            pnl_total=row['total_pnl'],
-            pnl_price=row['price_pnl'],
-            pnl_carry=row['carry_pnl'],
-            pnl_roll=row['roll_pnl']
+            pnl_cash=c_dict, pnl_bp=b_dict
         )
     return "Action Complete"
 
-# 6. EOD
+# 6. EOD Trigger
 @app.callback(
     Output('btn-run-eod', 'children'),
     Input('btn-run-eod', 'n_clicks'),
@@ -515,7 +533,7 @@ def run_eod_batch(n):
     eod_process.run_eod_main()
     return "Batch Completed"
 
-# --- NEW: SUMMARY (UPDATED) ---
+# --- SUMMARY & HEALTH ---
 @app.callback(
     Output('summary-cards', 'children'),
     Output('time-stats-container', 'children'),
@@ -532,11 +550,12 @@ def update_summary(n, close_trigger):
     
     c_tot, c_prc, c_cry, c_rol = aggregate_pnl_columns(closed)
     
+    # Calculate approx live PnL for Open Trades
     o_tot = 0
     now_dt = datetime.now()
     for _, row in open_trades.iterrows():
-        t, _, _, _ = le.calculate_live_pnl(row, feed.live_map, now_dt)
-        o_tot += t
+        (ct,_,_,_),_ = le.calculate_live_pnl(row, feed.live_map, now_dt)
+        o_tot += ct
         
     grand_total = c_tot + o_tot
     
@@ -550,6 +569,7 @@ def update_summary(n, close_trigger):
         make_card("Realized Roll", f"${c_rol:,.0f}", "warning"),
     ]
     
+    # Time Horizon Stats
     now = datetime.now()
     all_trades['dt'] = pd.to_datetime(all_trades['open_ts'])
     mask_mtd = (all_trades['dt'].dt.month == now.month) & (all_trades['dt'].dt.year == now.year)
@@ -565,6 +585,7 @@ def update_summary(n, close_trigger):
         "Trades": [len(all_trades[mask_mtd]), len(all_trades[mask_ytd]), len(all_trades)]
     }), striped=True, bordered=True, dark=True)
     
+    # Risk Profile
     bucket_risk = {"Short (<2Y)": 0, "Belly (2-7Y)": 0, "Long (>7Y)": 0}
     for _, row in open_trades.iterrows():
         b_pay = assign_bucket(row['tenor_pay'])
