@@ -12,13 +12,12 @@ from data_manager import (init_dbs, add_position, get_open_positions,
                           get_all_positions, update_position_status, 
                           get_system_state, delete_position)
 import live_engine as le
-from live_feed import feed  # Real Feed
-import eod_process          # EOD Logic
+from live_feed import feed
+import eod_process
+import hybrid_filter as hf
 
-current_dir = Path(__file__).resolve().parent
-root_dir = current_dir.parent
-sys.path.append(str(root_dir))
-import hybrid_filter as hf  # For loading signals
+# Import Research Config
+sys.path.append(str(Path(__file__).parent.parent))
 import cr_config as cr
 
 # --- SETUP ---
@@ -26,7 +25,6 @@ init_dbs()
 feed.start()
 
 def get_latest_model_yymm():
-    """Scans PATH_ENH for the most recent parquet file."""
     enh_dir = Path(cr.PATH_ENH)
     files = list(enh_dir.glob("*_enh.parquet"))
     if not files: return datetime.now().strftime("%y%m")
@@ -34,7 +32,6 @@ def get_latest_model_yymm():
     return files[-1].name.split('_')[0]
 
 CURRENT_YYMM = get_latest_model_yymm()
-print(f"[SYSTEM] Initializing App with Model Month: {CURRENT_YYMM}")
 le.load_midnight_model(CURRENT_YYMM)
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
@@ -68,10 +65,25 @@ def format_tenor(ticker, float_years):
     if abs(y - round(y)) < tol: return f"{int(round(y))}Y"
     return f"{y:.1f}Y"
 
+def assign_bucket(tenor):
+    if tenor < 2.0: return "Short (<2Y)"
+    if tenor <= 7.0: return "Belly (2-7Y)"
+    return "Long (>7Y)"
+
+def aggregate_pnl_columns(df):
+    """Sums cash, price, carry, roll."""
+    if df.empty: return 0,0,0,0
+    return (
+        df['realized_pnl_cash'].sum(),
+        df['realized_pnl_price'].sum(),
+        df['realized_pnl_carry'].sum(),
+        df['realized_pnl_roll'].sum()
+    )
+
 # --- LAYOUT ---
 app.layout = html.Div([
     dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates
-    dcc.Interval(id='slow-interval', interval=10000, n_intervals=0), # 10s updates (Health/Summary)
+    dcc.Interval(id='slow-interval', interval=10000, n_intervals=0), # 10s updates
     
     # Header
     dbc.NavbarSimple(
@@ -110,8 +122,9 @@ app.layout = html.Div([
         # TAB 2: BLOTTER
         dbc.Tab(label="Blotter", children=[
             dbc.Container([
+                # Open Positions
                 dbc.Row([
-                    dbc.Col(html.H5("Open Positions"), width=10),
+                    dbc.Col(html.H5("Active Positions (Live PnL Breakdown)"), width=10),
                     dbc.Col(dbc.Button("Refresh", id="btn-refresh-blotter", size="sm"), width=2)
                 ], className="mt-3"),
                 dash_table.DataTable(
@@ -133,32 +146,47 @@ app.layout = html.Div([
                     ), width=3),
                     dbc.Col(dbc.Button("Close Selected Trade", id="btn-close-trade", color="warning", disabled=True), width=3),
                     dbc.Col(dbc.Button("DELETE Trade (Mistake)", id="btn-delete-trade", color="danger", disabled=True), width=3)
-                ], className="mt-2")
-            ], fluid=True)
-        ]),
-
-        # TAB 3: SUMMARY (POPULATED)
-        dbc.Tab(label="Summary", children=[
-            dbc.Container([
-                html.H4("Performance Summary", className="mt-4"),
-                html.Div(id="summary-cards", className="d-flex gap-3 mb-4"),
+                ], className="mt-2 mb-4"),
+                
                 html.Hr(),
-                html.H5("Closed Trades Ledger"),
+                
+                # Closed Positions
+                html.H5("Trade History (Closed)", className="mt-3"),
                 dash_table.DataTable(
-                    id='tbl-closed-positions',
-                    style_table={'overflowX': 'auto', 'maxHeight': '400px', 'overflowY': 'scroll'},
-                    style_cell={'backgroundColor': '#222', 'color': 'white'},
-                    page_size=10
+                    id='tbl-history-positions',
+                    style_table={'overflowX': 'auto', 'maxHeight': '300px', 'overflowY': 'scroll'},
+                    style_cell={'backgroundColor': '#333', 'color': '#ddd'},
+                    page_size=20,
+                    sort_action='native'
                 )
             ], fluid=True)
         ]),
+
+        # TAB 3: SUMMARY
+        dbc.Tab(label="Summary", children=[
+            dbc.Container([
+                html.H4("Performance Dashboard", className="mt-4"),
+                html.Div(id="summary-cards", className="d-flex gap-3 mb-4 flex-wrap"),
+                
+                dbc.Row([
+                    dbc.Col([
+                        html.H5("Time Horizon Stats"),
+                        html.Div(id="time-stats-container")
+                    ], width=6),
+                    dbc.Col([
+                        html.H5("Risk Profile (Net DV01)"),
+                        html.Div(id="risk-profile-container")
+                    ], width=6)
+                ])
+            ], fluid=True)
+        ]),
         
-        # TAB 4: HEALTH (POPULATED)
+        # TAB 4: HEALTH
         dbc.Tab(label="System Health", children=[
             dbc.Container([
                 html.H4("Regime & Signal Diagnostics", className="mt-4"),
                 html.Div(id="health-cards", className="d-flex gap-3 mb-4"),
-                html.H5("Last 10 Days Signal History"),
+                html.H5("Filter Inputs (Last 10 Days)"),
                 dash_table.DataTable(
                     id='tbl-signal-history',
                     style_table={'overflowX': 'auto'},
@@ -171,7 +199,7 @@ app.layout = html.Div([
 
 # --- CALLBACKS ---
 
-# 1. Update Ticker Grid & Badges
+# 1. Update Ticker Grid (SMART DISABLE)
 @app.callback(
     Output('ticker-grid', 'children'),
     Output('badge-regime', 'children'),
@@ -187,7 +215,7 @@ def update_grid(n):
     
     is_shocked = (shock_days > 0)
     is_unstable = (regime != 'SAFE')
-    trading_disabled = is_shocked or is_unstable
+    global_disable = is_shocked or is_unstable
     
     z_map = le.get_live_z_scores(feed.live_map)
     sorted_tickers = sorted(z_map.keys(), key=lambda t: cr.TENOR_YEARS.get(t, 99))
@@ -198,19 +226,31 @@ def update_grid(n):
         z_val = data['z_live']
         tenor_label = format_tenor(t, data['tenor'])
         color = get_z_color(z_val)
-        btn_style = {'opacity': 0.5} if trading_disabled else {}
         
+        if global_disable:
+            can_pay, can_rec = False, False
+        else:
+            partners_pay = le.get_valid_partners(t, 'PAY', z_map)
+            partners_rec = le.get_valid_partners(t, 'REC', z_map)
+            can_pay = len(partners_pay) > 0
+            can_rec = len(partners_rec) > 0
+        
+        pay_style = {'opacity': 0.5 if not can_pay else 1.0}
+        rec_style = {'opacity': 0.5 if not can_rec else 1.0}
+        
+        if z_val == 0.0 and data['model_z'] != 0.0: color = "#444"
+
         card = dbc.Card([
             dbc.CardBody([
                 html.H6(f"{tenor_label}", className="card-title text-center"),
                 html.P(f"Z: {z_val:.2f}", className="text-center small mb-1"),
                 html.Div([
                     dbc.Button("PAY", id={'type': 'btn-pay', 'index': t}, 
-                               color="success" if not trading_disabled else "secondary", 
-                               size="sm", className="me-1", disabled=trading_disabled, style=btn_style), 
+                               color="success" if can_pay else "secondary", 
+                               size="sm", className="me-1", disabled=not can_pay, style=pay_style), 
                     dbc.Button("REC", id={'type': 'btn-rec', 'index': t}, 
-                               color="danger" if not trading_disabled else "secondary", 
-                               size="sm", disabled=trading_disabled, style=btn_style)
+                               color="danger" if can_rec else "secondary", 
+                               size="sm", disabled=not can_rec, style=rec_style)
                 ], className="d-flex justify-content-center")
             ])
         ], style={"width": "120px", "border": f"2px solid {color}"})
@@ -336,172 +376,108 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
 
-# 4. Update Blotter (With Heatmap & Limits)
+# 4. Update Blotter (BOTH TABLES with BREAKDOWN)
 @app.callback(
     Output('tbl-open-positions', 'data'),
     Output('tbl-open-positions', 'columns'),
-    Output('tbl-open-positions', 'style_data_conditional'), # <--- NEW OUTPUT
+    Output('tbl-open-positions', 'style_data_conditional'),
+    Output('tbl-history-positions', 'data'),
+    Output('tbl-history-positions', 'columns'),
     Input('fast-interval', 'n_intervals'),
     Input('btn-refresh-blotter', 'n_clicks')
 )
 def update_blotter(n, click):
-    df = get_open_positions()
-    if df.empty:
-        return [], [], []
+    all_trades = get_all_positions()
+    if all_trades.empty: return [], [], [], [], []
+    
+    Z_EXIT, Z_STOP, MAX_HOLD = cr.Z_EXIT, cr.Z_STOP, cr.MAX_HOLD_DAYS
+    now_dt = datetime.now()
+    
+    # --- OPEN TRADES ---
+    open_df = all_trades[all_trades['status'] == 'OPEN']
+    open_data, open_styles = [], []
+    
+    for _, row in open_df.iterrows():
+        # CALL LIVE ENGINE PNL DECOMP
+        tot, prc, cry, rol = le.calculate_live_pnl(row, feed.live_map, now_dt)
         
-    data = []
-    
-    # Config Limits
-    Z_EXIT = cr.Z_EXIT
-    Z_STOP = cr.Z_STOP
-    MAX_HOLD = cr.MAX_HOLD_DAYS
-    
-    # Style Logic Containers
-    styles = []
-    
-    for _, row in df.iterrows():
-        # 1. Rates & PnL
-        curr_pay = feed.live_map.get(row['ticker_pay'], row['entry_rate_pay'])
-        curr_rec = feed.live_map.get(row['ticker_rec'], row['entry_rate_rec'])
-        pnl_pay = (curr_pay - row['entry_rate_pay']) * 100 * row['dv01']
-        pnl_rec = (row['entry_rate_rec'] - curr_rec) * 100 * row['dv01']
-        total_pnl = pnl_pay + pnl_rec
-        
-        # 2. Z-Score Math
         z_map = le.get_live_z_scores(feed.live_map)
         zp = z_map.get(row['ticker_pay'], {}).get('z_live', 0)
         zr = z_map.get(row['ticker_rec'], {}).get('z_live', 0)
         curr_z = zp - zr
         entry_z = row['entry_z_spread']
         
-        # 3. Threshold Calcs
-        # Stop Z Level: The absolute Z value where we panic.
-        # If Entry is 2.0 (Cheap), we stop if it gets Richer (diverges)? 
-        # No, usually we stop if it keeps getting Cheaper (goes to 5.0).
-        # Divergence = abs(curr - entry).
-        # The "Level" is Entry + (Sign(Entry) * Stop_Distance)
-        stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
-        
-        # Days Held
         open_dt = pd.to_datetime(row['open_ts'])
-        days_held = (pd.Timestamp.now() - open_dt).days
-        
-        # 4. Status Flags & Heatmap Logic
-        row_style = {} # Default style
-        
+        days_held = (now_dt - open_dt).days
+        stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
+
+        bg_color = "#222"
         db_reason = row.get('close_reason')
         if db_reason and db_reason not in [None, 'None', '']:
-             # EOD FLAGS (Solid Colors)
-             if db_reason == 'max_hold': 
-                 flag = "MAX HOLD"
-                 bg_color = "#B8860B" # Dark Goldenrod
-             elif db_reason == 'stop_loss': 
-                 flag = "STOP LOSS (EOD)"
-                 bg_color = "#8B0000" # Dark Red
-             elif db_reason == 'reversion': 
-                 flag = "TAKE PROFIT (EOD)"
-                 bg_color = "#006400" # Dark Green
-             else: 
-                 flag = f"CHECK: {db_reason}"
-                 bg_color = "#444"
+             if db_reason == 'max_hold': flag, bg_color = "MAX HOLD", "#B8860B"
+             elif db_reason == 'stop_loss': flag, bg_color = "STOP LOSS (EOD)", "#8B0000"
+             elif db_reason == 'reversion': flag, bg_color = "TAKE PROFIT (EOD)", "#006400"
+             else: flag = f"CHECK: {db_reason}"
         else:
-             # LIVE FLAGS & GRADIENTS
              flag = "OPEN"
-             
-             # Calc Distances
-             dist_to_stop = abs(curr_z - entry_z)
-             dist_to_target = abs(curr_z) # Assuming Mean Reversion to 0
-             
-             # A. Check Triggers
-             if dist_to_target < Z_EXIT: 
-                 flag = "TAKE PROFIT"
-                 bg_color = "#006400" # Solid Green
-             elif dist_to_stop > Z_STOP: 
-                 flag = "STOP LOSS"
-                 bg_color = "#8B0000" # Solid Red
-             else:
-                 # B. Gradients (Approaching)
-                 bg_color = "#222" # Default Dark Grey
-                 
-                 # Danger Zone: > 75% of the way to Stop
-                 if dist_to_stop > (Z_STOP * 0.75):
-                     bg_color = "#5c1e1e" # Tinted Red
-                     
-                 # Profit Zone: Approaching Target
-                 # If current Z is small relative to entry
-                 elif dist_to_target < (abs(entry_z) * 0.5):
-                     bg_color = "#1e3b1e" # Tinted Green
+             if abs(curr_z) < Z_EXIT: flag, bg_color = "TAKE PROFIT", "#006400"
+             elif abs(curr_z - entry_z) > Z_STOP: flag, bg_color = "STOP LOSS", "#8B0000"
 
-        # 5. Formatting
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
         label_rec = format_tenor(row['ticker_rec'], row['tenor_rec'])
         
-        # Append Data
-        data.append({
+        open_data.append({
             'trade_id': row['trade_id'],
             'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            
-            # PnL & Z
-            'pnl_cash': round(total_pnl, 0),
+            # PnL Breakdown
+            'total_pnl': round(tot, 0),
+            'price_pnl': round(prc, 0),
+            'carry_pnl': round(cry, 0),
+            'roll_pnl': round(rol, 0),
             'curr_z': round(curr_z, 2),
-            'entry_z': round(entry_z, 2),
-            
-            # Thresholds
             'target_z': f"0.0 ± {Z_EXIT}",
-            'stop_z_level': round(stop_z_level, 2),
-            
-            # Aging
+            'stop_z': round(stop_z_level, 2),
             'aging': f"{days_held} / {MAX_HOLD}",
-            
             'status': flag,
-            
-            # Hidden column for styling mapping
             '_row_color': bg_color 
         })
 
-    # 6. Column Definitions
-    ordered_cols = [
-        'trade_id', 'status', 'aging', 'pair', 'dv01', 'pnl_cash', 
-        'curr_z', 'target_z', 'entry_z', 'stop_z_level', 'open_date'
-    ]
+    # --- HISTORY TRADES ---
+    hist_df = all_trades[all_trades['status'] == 'CLOSED'].sort_values('close_ts', ascending=False)
+    hist_data = []
     
-    cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in ordered_cols]
+    for _, row in hist_df.iterrows():
+        label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
+        label_rec = format_tenor(row['ticker_rec'], row['tenor_rec'])
+        hist_data.append({
+            'close_ts': row['close_ts'],
+            'pair': f"Pay {label_pay} / Rec {label_rec}",
+            'dv01': f"{int(row['dv01']/1000)}k",
+            'total_pnl': f"${row['realized_pnl_cash']:,.0f}",
+            'price_pnl': f"${row.get('realized_pnl_price', 0):,.0f}",
+            'carry_pnl': f"${row.get('realized_pnl_carry', 0):,.0f}",
+            'roll_pnl': f"${row.get('realized_pnl_roll', 0):,.0f}",
+            'reason': row['close_reason']
+        })
+
+    open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'curr_z', 'target_z', 'stop_z']
+    open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
-    # 7. Generate Conditional Styles dynamically
-    # This iterates through the data we just built and creates a style rule for every row
-    # based on its unique color calculation.
+    hist_cols_list = ['close_ts', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'reason']
+    hist_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in hist_cols_list]
+
     style_cond = []
-    
-    # Default dark theme text
-    style_cond.append({
-        'if': {'row_index': 'odd'},
-        'backgroundColor': 'rgba(255, 255, 255, 0.05)'
-    })
-    
-    for i, row in enumerate(data):
-        color = row['_row_color']
-        if color != "#222": # Only apply if not default
-            style_cond.append({
-                'if': {'filter_query': f'{{trade_id}} = {row["trade_id"]}'},
-                'backgroundColor': color,
-                'color': 'white'
-            })
+    for i, row in enumerate(open_data):
+        if row['_row_color'] != "#222":
+            style_cond.append({'if': {'filter_query': f'{{trade_id}} = {row["trade_id"]}'}, 'backgroundColor': row['_row_color'], 'color': 'white'})
 
-    return data, cols, style_cond
+    return open_data, open_cols, style_cond, hist_data, hist_cols
 
-# 5. Buttons Enable/Action (Unchanged)
+# 5. Modify Trade (Actions)
 @app.callback(
-    Output('btn-close-trade', 'disabled'),
-    Output('btn-delete-trade', 'disabled'),
-    Input('tbl-open-positions', 'selected_rows'),
-    prevent_initial_call=True
-)
-def enable_buttons(rows): return not rows, not rows
-
-@app.callback(
-    Output('summary-content', 'children'), # Dummy output
+    Output('summary-content', 'children'), 
     Input('btn-close-trade', 'n_clicks'),
     Input('btn-delete-trade', 'n_clicks'),
     State('tbl-open-positions', 'selected_rows'),
@@ -518,11 +494,18 @@ def modify_trade(n_close, n_del, rows, data, reason):
     
     if button_id == "btn-delete-trade": delete_position(trade_id)
     elif button_id == "btn-close-trade":
-        pnl = data[row_idx]['pnl_cash']
-        update_position_status(trade_id, "CLOSED", reason or "manual", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl)
+        row = data[row_idx]
+        update_position_status(
+            trade_id, "CLOSED", reason or "manual", 
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            pnl_total=row['total_pnl'],
+            pnl_price=row['price_pnl'],
+            pnl_carry=row['carry_pnl'],
+            pnl_roll=row['roll_pnl']
+        )
     return "Action Complete"
 
-# 6. EOD Trigger
+# 6. EOD
 @app.callback(
     Output('btn-run-eod', 'children'),
     Input('btn-run-eod', 'n_clicks'),
@@ -532,57 +515,67 @@ def run_eod_batch(n):
     eod_process.run_eod_main()
     return "Batch Completed"
 
-# --- NEW: SUMMARY & HEALTH TABS ---
-
+# --- NEW: SUMMARY (UPDATED) ---
 @app.callback(
     Output('summary-cards', 'children'),
-    Output('tbl-closed-positions', 'data'),
-    Output('tbl-closed-positions', 'columns'),
+    Output('time-stats-container', 'children'),
+    Output('risk-profile-container', 'children'),
     Input('slow-interval', 'n_intervals'),
-    Input('btn-close-trade', 'n_clicks') # Update when we close a trade
+    Input('btn-close-trade', 'n_clicks')
 )
 def update_summary(n, close_trigger):
-    # 1. Get Closed Trades
     all_trades = get_all_positions()
-    if all_trades.empty: return [], [], []
+    if all_trades.empty: return [], "No Data", "No Data"
     
     closed = all_trades[all_trades['status'] == 'CLOSED']
     open_trades = all_trades[all_trades['status'] == 'OPEN']
     
-    realized_pnl = closed['realized_pnl_cash'].sum()
+    c_tot, c_prc, c_cry, c_rol = aggregate_pnl_columns(closed)
     
-    # Approx Unrealized PnL (Recalculating briefly here)
-    unrealized_pnl = 0.0
+    o_tot = 0
+    now_dt = datetime.now()
     for _, row in open_trades.iterrows():
-        curr_pay = feed.live_map.get(row['ticker_pay'], row['entry_rate_pay'])
-        curr_rec = feed.live_map.get(row['ticker_rec'], row['entry_rate_rec'])
-        pnl_pay = (curr_pay - row['entry_rate_pay']) * 100 * row['dv01']
-        pnl_rec = (row['entry_rate_rec'] - curr_rec) * 100 * row['dv01']
-        unrealized_pnl += (pnl_pay + pnl_rec)
+        t, _, _, _ = le.calculate_live_pnl(row, feed.live_map, now_dt)
+        o_tot += t
         
-    total_pnl = realized_pnl + unrealized_pnl
-    win_rate = (len(closed[closed['realized_pnl_cash'] > 0]) / len(closed) * 100) if not closed.empty else 0.0
+    grand_total = c_tot + o_tot
     
     def make_card(title, value, color="primary"):
-        return dbc.Card([
-            dbc.CardBody([
-                html.H6(title, className="card-title"),
-                html.H4(value, className=f"text-{color}")
-            ])
-        ], style={"width": "180px"})
+        return dbc.Card([dbc.CardBody([html.H6(title, className="card-title"), html.H4(value, className=f"text-{color}")])], style={"width": "180px"})
 
     cards = [
-        make_card("Total PnL", f"${total_pnl:,.0f}", "success" if total_pnl >=0 else "danger"),
-        make_card("Realized PnL", f"${realized_pnl:,.0f}", "success" if realized_pnl >=0 else "danger"),
-        make_card("Unrealized PnL", f"${unrealized_pnl:,.0f}", "info"),
-        make_card("Win Rate", f"{win_rate:.1f}%", "warning"),
-        make_card("Total Trades", f"{len(all_trades)}", "secondary")
+        make_card("Total PnL", f"${grand_total:,.0f}", "success" if grand_total >=0 else "danger"),
+        make_card("Realized Price", f"${c_prc:,.0f}", "info"),
+        make_card("Realized Carry", f"${c_cry:,.0f}", "warning"),
+        make_card("Realized Roll", f"${c_rol:,.0f}", "warning"),
     ]
     
-    closed_data = closed.to_dict('records')
-    closed_cols = [{"name": i, "id": i} for i in closed.columns]
+    now = datetime.now()
+    all_trades['dt'] = pd.to_datetime(all_trades['open_ts'])
+    mask_mtd = (all_trades['dt'].dt.month == now.month) & (all_trades['dt'].dt.year == now.year)
+    mask_ytd = (all_trades['dt'].dt.year == now.year)
     
-    return cards, closed_data, closed_cols
+    def calc_stat_pnl(mask):
+        sub = all_trades[mask & (all_trades['status']=='CLOSED')]
+        return sub['realized_pnl_cash'].sum()
+
+    time_table = dbc.Table.from_dataframe(pd.DataFrame({
+        "Period": ["Month to Date", "Year to Date", "All Time"],
+        "Realized PnL": [f"${calc_stat_pnl(mask_mtd):,.0f}", f"${calc_stat_pnl(mask_ytd):,.0f}", f"${c_tot:,.0f}"],
+        "Trades": [len(all_trades[mask_mtd]), len(all_trades[mask_ytd]), len(all_trades)]
+    }), striped=True, bordered=True, dark=True)
+    
+    bucket_risk = {"Short (<2Y)": 0, "Belly (2-7Y)": 0, "Long (>7Y)": 0}
+    for _, row in open_trades.iterrows():
+        b_pay = assign_bucket(row['tenor_pay'])
+        b_rec = assign_bucket(row['tenor_rec'])
+        bucket_risk[b_pay] += row['dv01']
+        bucket_risk[b_rec] += row['dv01']
+        
+    risk_df = pd.DataFrame(list(bucket_risk.items()), columns=["Bucket", "Gross DV01"])
+    risk_table = dbc.Table.from_dataframe(risk_df, striped=True, bordered=True, dark=True)
+    
+    return cards, time_table, risk_table
 
 @app.callback(
     Output('health-cards', 'children'),
@@ -591,46 +584,32 @@ def update_summary(n, close_trigger):
     Input('slow-interval', 'n_intervals')
 )
 def update_health(n):
-    # Load Signals Parquet
     signals = hf.get_or_build_hybrid_signals()
     if signals.empty: return [], [], []
-    
     last = signals.iloc[-1]
     
-    # Metrics
-    health_z = last.get('signal_health_z', -99)
-    trendiness = last.get('trendiness_abs', 0)
-    xs_mean_z = last.get('z_xs_mean_roll_z', 0)
+    metrics = {
+        "Signal Health (Z)": (last.get('signal_health_z', -99), cr.MIN_SIGNAL_HEALTH_Z, "gt"),
+        "Trendiness (Abs)": (last.get('trendiness_abs', 0), cr.MAX_TRENDINESS_ABS, "lt"),
+        "Curve Mean (Z)": (last.get('z_xs_mean_roll_z', 0), cr.MAX_Z_XS_MEAN_ABS_Z, "lt"),
+        "Curve Vol (Z)": (last.get('z_xs_std_roll_z', 0), 2.0, "lt")
+    }
     
-    def make_card(title, value, threshold_desc, status_color):
-        return dbc.Card([
-            dbc.CardBody([
-                html.H6(title, className="card-title"),
-                html.H4(f"{value:.2f}", className=f"text-{status_color}"),
-                html.Small(threshold_desc, className="text-muted")
-            ])
-        ], style={"width": "220px"})
-
-    # Logic colors
-    health_col = "success" if health_z > cr.MIN_SIGNAL_HEALTH_Z else "danger"
-    trend_col = "success" if trendiness < cr.MAX_TRENDINESS_ABS else "danger"
-    
-    cards = [
-        make_card("Signal Health (Z)", health_z, f"Threshold > {cr.MIN_SIGNAL_HEALTH_Z}", health_col),
-        make_card("Trendiness (Abs)", trendiness, f"Threshold < {cr.MAX_TRENDINESS_ABS}", trend_col),
-        make_card("Curve Mean (Z)", xs_mean_z, f"Threshold < {cr.MAX_Z_XS_MEAN_ABS_Z}", "info")
-    ]
-    
-    # Recent History Table
+    cards = []
+    for name, (val, thresh, op) in metrics.items():
+        is_good = (val > thresh) if op == "gt" else (abs(val) < thresh)
+        col = "success" if is_good else "danger"
+        cards.append(dbc.Card([dbc.CardBody([
+            html.H6(name, className="card-title"),
+            html.H4(f"{val:.2f}", className=f"text-{col}"),
+            html.Small(f"Limit: {thresh}", className="text-muted")
+        ])], style={"width": "180px"}))
+        
     recent = signals.tail(10).sort_values('decision_ts', ascending=False)
-    recent['decision_ts'] = recent['decision_ts'].astype(str) # Serialize date
+    recent['decision_ts'] = recent['decision_ts'].astype(str)
+    cols = [{"name": i, "id": i} for i in recent.columns if "z_" in i or "health" in i or "trend" in i or "ts" in i]
     
-    # Filter columns for display
-    disp_cols = ['decision_ts', 'signal_health_z', 'trendiness_abs', 'z_xs_mean_roll_z']
-    data = recent[disp_cols].to_dict('records')
-    cols = [{"name": i, "id": i} for i in disp_cols]
-    
-    return cards, data, cols
+    return cards, recent.to_dict('records'), cols
 
 if __name__ == '__main__':
     app.run_server(debug=True, port=8050)
