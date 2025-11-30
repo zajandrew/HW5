@@ -77,8 +77,18 @@ Z_EXIT        = 0.75     # take profit when |z-spread| <= Z_EXIT
 Z_STOP        = 1.00     # stop if divergence since entry >= Z_STOP
 BPS_PNL_STOP = 0.00
 MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
-ALT_LEG_TENOR_YEARS = 0.0
-EXEC_LEG_TENOR_YEARS = 0.084
+
+# ========= Safety: The "20% Rule" =========
+# We enforce that Tenor >= 5x Holding Period to ensure linear decay assumptions hold.
+# 73.0 comes from 365 / 5.
+MIN_TENOR_SAFETY_FACTOR = 73.0 
+
+# Calculated Defaults (Production Safety)
+_safe_min_tenor = MAX_HOLD_DAYS / MIN_TENOR_SAFETY_FACTOR
+
+# Apply this to the execution thresholds
+EXEC_LEG_TENOR_YEARS = max(0.085, _safe_min_tenor)
+ALT_LEG_TENOR_YEARS  = max(0.083, _safe_min_tenor)
 
 # ========= Regime Filter Settings (Curve Environment) =========
 # These control the "Regime Mask" (exogenous filter)
