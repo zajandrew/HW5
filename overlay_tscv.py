@@ -92,7 +92,8 @@ def load_global_data():
 
 def _apply_config(params: Dict[str, Any]):
     """Apply params to config with DYNAMIC CONSTRAINTS."""
-    # 1. Apply Variable Params
+    
+    # 1. Apply Variable Params (Z_ENTRY, etc.)
     for k, v in params.items():
         setattr(cr, k, v)
         
@@ -101,10 +102,18 @@ def _apply_config(params: Dict[str, Any]):
         setattr(cr, k, v)
         
     # 3. Dynamic Tenor Limits (The 20% Rule)
+    # CRITICAL: We must recalculate this because changing cr.MAX_HOLD_DAYS 
+    # via setattr above DOES NOT automatically re-run the math in cr_config.py
     if "MAX_HOLD_DAYS" in params:
         hold_days = params["MAX_HOLD_DAYS"]
-        dynamic_min = hold_days / 73.0
+        
+        # Pull the factor from config so it's defined in one place
+        safety_factor = getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0)
+        
+        dynamic_min = hold_days / safety_factor
         limit = max(0.084, dynamic_min)
+        
+        # Enforce the calculated limit
         setattr(cr, "EXEC_LEG_TENOR_YEARS", limit)
         setattr(cr, "ALT_LEG_TENOR_YEARS", limit)
 
