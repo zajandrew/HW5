@@ -88,7 +88,7 @@ _safe_min_tenor = MAX_HOLD_DAYS / MIN_TENOR_SAFETY_FACTOR
 
 # Apply this to the execution thresholds
 EXEC_LEG_TENOR_YEARS = max(0.085, _safe_min_tenor)
-ALT_LEG_TENOR_YEARS  = max(0.085, _safe_min_tenor)
+ALT_LEG_TENOR_YEARS  = max(0.083, _safe_min_tenor)
 
 # ========= Regime Filter Settings (Curve Environment) =========
 # These control the "Regime Mask" (exogenous filter)
