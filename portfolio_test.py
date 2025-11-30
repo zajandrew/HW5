@@ -1,21 +1,21 @@
 import os, sys
+import math
 from pathlib import Path
 from typing import Optional, List, Dict
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pandas.tseries.offsets import MonthEnd
 
 # All config access via module namespace
 import cr_config as cr
-from hybrid_filter import ShockConfig
+from hybrid_filter import ShockConfig, RegimeThresholds
+import hybrid_filter as hf
 
 # ------------------------
 # Utilities / conventions
 # ------------------------
 Path(getattr(cr, "PATH_OUT", ".")).mkdir(parents=True, exist_ok=True)
-
 
 def _to_float(x, default=np.nan):
     """Safe scalar float extraction."""
@@ -29,6 +29,7 @@ def _to_float(x, default=np.nan):
 
 def pv01_proxy(tenor_yrs, rate_pct):
     """Simple PV01 proxy so pair is roughly DV01-neutral."""
+    # PV01 approx = Tenor / Discount.
     return tenor_yrs / max(1e-6, 1.0 + 0.01 * rate_pct)
 
 def assign_bucket(tenor):
@@ -51,6 +52,7 @@ def _map_instrument_to_tenor(instr: str) -> Optional[float]:
 def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
     if raw_df is None or raw_df.empty: return pd.DataFrame()
     df = raw_df.copy()
+    # Ensure UTC conversion is robust
     df["trade_ts"] = pd.to_datetime(df["tradetimeUTC"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
     
     decision_freq = str(decision_freq).upper()
@@ -137,6 +139,7 @@ def _get_funding_rate(snap_last: pd.DataFrame) -> float:
     """Finds proxy for funding rate (shortest available tenor)."""
     try:
         if snap_last.empty: return 0.0
+        # Sort by tenor to find the shortest (e.g., 1M or 0.083y)
         sorted_snap = snap_last.sort_values("tenor_yrs")
         return float(sorted_snap.iloc[0]["rate"])
     except:
@@ -203,34 +206,38 @@ class PairPos:
         self.last_zspread, self.last_z_dir, self.conv_pnl_proxy = self.entry_zspread, self.entry_z_dir, 0.0
 
     def _update_overlay_dv01(self, decision_ts):
+        """Linearly decay DV01 based on Act/360 time passed."""
         if not isinstance(decision_ts, pd.Timestamp): return
         days = max(0, (decision_ts.normalize() - self.open_ts.normalize()).days)
         yr_pass = days / 360.0
         self.rem_tenor_i = max(self.tenor_i_orig - yr_pass, 0.0)
         self.rem_tenor_j = max(self.tenor_j_orig - yr_pass, 0.0)
         
+        # Avoid div by zero
         fi = self.rem_tenor_i / max(self.tenor_i_orig, 1e-6)
         fj = self.rem_tenor_j / max(self.tenor_j_orig, 1e-6)
         self.dv01_i_curr = self.dv01_i_entry * fi
         self.dv01_j_curr = self.dv01_j_entry * fj
 
     def mark(self, snap_last: pd.DataFrame, decision_ts: Optional[pd.Timestamp] = None):
-        # 0. Update Decay
+        # 0. Update Decay (Overlay Only)
         if self.mode == "overlay" and decision_ts:
             self._update_overlay_dv01(decision_ts)
 
-        # 1. Get Market Data
+        # 1. Get Market Data (Rates & Funding)
         ri = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_i, "rate"])
         rj = _to_float(snap_last.loc[snap_last["tenor_yrs"] == self.tenor_j, "rate"])
         r_float = _get_funding_rate(snap_last)
         self.last_rate_i, self.last_rate_j = ri, rj
 
-        # 2. Price PnL (Delta)
+        # 2. Price PnL (Capital Gains due to Rate Change)
+        # Formula: (Entry - Current) * 100 * DV01
         pnl_price_i = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
         pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
         self.pnl_price_cash = pnl_price_i + pnl_price_j
 
-        # 3. Carry PnL (Coupon) - Incremental Accumulation
+        # 3. Carry PnL (Net Interest Income) - Incremental Accumulation
+        # Formula: (FixedEntry - FundingFloat) * 100 * DV01 * Time
         if decision_ts and self.last_mark_ts:
             dt_days = max(0.0, (decision_ts.normalize() - self.last_mark_ts.normalize()).days)
             if dt_days > 0:
@@ -239,7 +246,8 @@ class PairPos:
                 self.pnl_carry_cash += (inc_carry_i + inc_carry_j)
             self.last_mark_ts = decision_ts
 
-        # 4. Roll-Down PnL
+        # 4. Roll-Down PnL (Price gain due to sliding down yield curve)
+        # Logic: Interpolate rate at (OriginalTenor - TimePassed). Diff from CurrentRate at OriginalTenor.
         days_total = 0.0
         if decision_ts:
             days_total = max(0.0, (decision_ts.normalize() - self.open_ts.normalize()).days)
@@ -260,7 +268,7 @@ class PairPos:
         # 5. Total Cash
         self.pnl_cash = self.pnl_price_cash + self.pnl_carry_cash + self.pnl_roll_cash
         
-        # 6. Total Bps
+        # 6. Total Bps and Breakdown
         if self.scale_dv01 != 0.0 and np.isfinite(self.scale_dv01):
             self.pnl_bp = self.pnl_cash / self.scale_dv01
             self.pnl_price_bp = self.pnl_price_cash / self.scale_dv01
@@ -359,28 +367,8 @@ def _enhanced_in_path(yymm: str) -> Path:
     name = cr.enh_fname(yymm) if hasattr(cr, "enh_fname") else f"{yymm}_enh{suffix}.parquet" if suffix else f"{yymm}_enh.parquet"
     return Path(getattr(cr, "PATH_ENH", ".")) / name
 
-def _positions_out_path() -> Path:
-    if hasattr(cr, "positions_fname") and callable(cr.positions_fname): name = cr.positions_fname()
-    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"positions_ledger{suffix}.parquet" if suffix else "positions_ledger.parquet"
-    return Path(getattr(cr, "PATH_OUT", ".")) / name
-
-def _marks_out_path() -> Path:
-    if hasattr(cr, "marks_fname") and callable(cr.marks_fname): name = cr.marks_fname()
-    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"marks_ledger{suffix}.parquet" if suffix else "marks_ledger.parquet"
-    return Path(getattr(cr, "PATH_OUT", ".")) / name
-
-def _pnl_out_path() -> Path:
-    if hasattr(cr, "pnl_fname") and callable(cr.pnl_fname): name = cr.pnl_fname()
-    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"pnl_by_bucket{suffix}.parquet" if suffix else "pnl_by_bucket.parquet"
-    return Path(getattr(cr, "PATH_OUT", ".")) / name
-
-def _pnl_curve_png(yymm: str) -> Path:
-    if hasattr(cr, "pnl_curve_png") and callable(cr.pnl_curve_png): name = cr.pnl_curve_png(yymm)
-    else: suffix = getattr(cr, "OUT_SUFFIX", ""); name = f"pnl_curve_{yymm}{suffix}.png" if suffix else f"pnl_curve_{yymm}.png"
-    return Path(getattr(cr, "PATH_OUT", ".")) / name
-
 # ------------------------
-# RUN MONTH (Verified Correct)
+# RUN MONTH
 # ------------------------
 def run_month(
     yymm: str,
@@ -391,26 +379,14 @@ def run_month(
     mode: str = "strategy",
     hedges: Optional[pd.DataFrame] = None,
     overlay_use_caps: Optional[bool] = None,
-    
-    # --- FILTER ARGUMENTS ---
-    regime_mask: Optional[pd.Series] = None,       
+    regime_mask: Optional[pd.Series] = None,        
     hybrid_signals: Optional[pd.DataFrame] = None, 
     shock_cfg: Optional[ShockConfig] = None,
-    
-    # --- STATE PERSISTENCE ---
     shock_state: Optional[Dict] = None 
 ):
-    """
-    Run a single month.
-    Corrected variable names:
-      - Uses 'is_in_shock_state' for Panic Exit check.
-      - Uses 'alt_tenor' / 'exec_tenor' consistently in Overlay loop.
-    """
     import math
-    try:
-        np
-    except NameError:
-        import numpy as np
+    try: np
+    except NameError: import numpy as np
 
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     mode = mode.lower()
@@ -440,7 +416,6 @@ def run_month(
         raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
     base_max_hold_decisions = cr.MAX_HOLD_DAYS * decisions_per_day
-
     OVERLAY_MAX_HOLD_DV01_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_MED", 20_000.0))
     OVERLAY_MAX_HOLD_DV01_HI = float(getattr(cr, "OVERLAY_MAX_HOLD_DV01_HI", 50_000.0))
     OVERLAY_MAX_HOLD_DAYS_MED = float(getattr(cr, "OVERLAY_MAX_HOLD_DAYS_MED", 5.0))
@@ -510,13 +485,11 @@ def run_month(
     Z_EXIT = float(getattr(cr, "Z_EXIT", 0.40))
     Z_STOP = float(getattr(cr, "Z_STOP", 3.00))
     
-    # Granular thresholds
     EXEC_LEG_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
     ALT_LEG_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
     MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
     MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
     
-    # Alias for inner loop
     SHORT_EXTRA = SHORT_END_EXTRA_Z 
 
     for dts, snap in df.groupby("decision_ts", sort=True):
@@ -540,8 +513,8 @@ def run_month(
         # ============================================================
         # 1) MARK POSITIONS & NATURAL EXITS
         # ============================================================
-        period_pnl_cash = 0.0       
-        period_pnl_bps_mtm = 0.0    
+        period_pnl_cash = 0.0        
+        period_pnl_bps_mtm = 0.0     
         period_pnl_bps_realized = 0.0 
         period_pnl_cash_realized = 0.0
         
@@ -596,6 +569,9 @@ def run_month(
                 "decision_ts": dts, "event": "mark",
                 "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
+                "pnl_price_bp": pos.pnl_price_bp,
+                "pnl_carry_bp": pos.pnl_carry_bp,
+                "pnl_roll_bp": pos.pnl_roll_bp,
                 "pnl_price_cash": pos.pnl_price_cash,
                 "pnl_carry_cash": pos.pnl_carry_cash,
                 "pnl_roll_cash": pos.pnl_roll_cash,
@@ -642,6 +618,9 @@ def run_month(
                     "conv_proxy": pos.conv_pnl_proxy,
                     "pnl_gross_bp": pos.pnl_bp, 
                     "pnl_gross_cash": pos.pnl_cash,
+                    "pnl_price_bp": pos.pnl_price_bp,
+                    "pnl_carry_bp": pos.pnl_carry_bp,
+                    "pnl_roll_bp": pos.pnl_roll_bp,
                     "pnl_carry_cash": pos.pnl_carry_cash, 
                     "pnl_roll_cash": pos.pnl_roll_cash,   
                     "tcost_bp": tcost_bp, 
@@ -662,7 +641,7 @@ def run_month(
         # 2) UPDATE HISTORY & DETECT NEW SHOCK
         # ============================================================
         metric_type = getattr(shock_cfg, "metric_type", "MTM_BPS") if shock_cfg else "MTM_BPS"
-        if metric_type == "REALIZED_CASH": metric_val = per_pnl_cash_realized
+        if metric_type == "REALIZED_CASH": metric_val = period_pnl_cash_realized
         elif metric_type == "REALIZED_BPS": metric_val = period_pnl_bps_realized
         elif metric_type == "MTM_BPS" or metric_type == "BPS": metric_val = period_pnl_bps_mtm
         else: metric_val = period_pnl_cash
@@ -685,24 +664,24 @@ def run_month(
                 
                 if shock_cfg.use_residuals and not is_new_shock and valid_reg_cols:
                     try:
-                         rel_dates = shock_state["dates"][-win:]
-                         sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
-                         if len(sig_slice_raw) == len(hist):
-                             valid_mask = np.isfinite(hist) & np.isfinite(sig_slice_raw).all(axis=1)
-                             if valid_mask.sum() >= sig_slice_raw.shape[1] + 1:
-                                 Y_cl, X_cl = hist[valid_mask], sig_slice_raw[valid_mask]
-                                 X_f = np.column_stack([np.ones(len(X_cl)), X_cl])
-                                 try:
-                                     beta, _, _, _ = np.linalg.lstsq(X_f, Y_cl, rcond=None)
-                                     y_hat = X_f @ beta
-                                     resid = Y_cl - y_hat
-                                     r_mu, r_sd = np.mean(resid), np.std(resid, ddof=1)
-                                     if r_sd > 1e-9:
-                                         last_r_z = (resid[-1] - r_mu) / r_sd
-                                         if last_r_z <= shock_cfg.resid_z_thresh:
-                                            is_new_shock = True
-                                 except np.linalg.LinAlgError:
-                                     pass
+                          rel_dates = shock_state["dates"][-win:]
+                          sig_slice_raw = sig_lookup.reindex(rel_dates)[valid_reg_cols].values
+                          if len(sig_slice_raw) == len(hist):
+                              valid_mask = np.isfinite(hist) & np.isfinite(sig_slice_raw).all(axis=1)
+                              if valid_mask.sum() >= sig_slice_raw.shape[1] + 1:
+                                  Y_cl, X_cl = hist[valid_mask], sig_slice_raw[valid_mask]
+                                  X_f = np.column_stack([np.ones(len(X_cl)), X_cl])
+                                  try:
+                                      beta, _, _, _ = np.linalg.lstsq(X_f, Y_cl, rcond=None)
+                                      y_hat = X_f @ beta
+                                      resid = Y_cl - y_hat
+                                      r_mu, r_sd = np.mean(resid), np.std(resid, ddof=1)
+                                      if r_sd > 1e-9:
+                                           last_r_z = (resid[-1] - r_mu) / r_sd
+                                           if last_r_z <= shock_cfg.resid_z_thresh:
+                                               is_new_shock = True
+                                  except np.linalg.LinAlgError:
+                                      pass
                     except Exception:
                          pass
         
@@ -732,6 +711,9 @@ def run_month(
                 closed_rows.append({
                     "open_ts": pos.open_ts, "close_ts": dts, "exit_reason": "shock_exit",
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    "pnl_price_bp": pos.pnl_price_bp,
+                    "pnl_carry_bp": pos.pnl_carry_bp,
+                    "pnl_roll_bp": pos.pnl_roll_bp,
                     "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
                     "mode": pos.mode, "trade_id": pos.meta.get("trade_id"), "side": pos.meta.get("side")
                 })
@@ -788,15 +770,15 @@ def run_month(
                 exec_z = _get_z_at_tenor(snap_srt, t_trade)
                 if exec_z is None: continue
                 exec_row = snap_srt.iloc[(snap_srt["tenor_yrs"] - t_trade).abs().idxmin()]
-                exec_tenor = float(exec_row["tenor_yrs"]) # Defined here
+                exec_tenor = float(exec_row["tenor_yrs"])
 
                 best_c, best_z = None, 0.0
                 for _, alt in snap_srt.iterrows():
-                    alt_tenor = float(alt["tenor_yrs"]) # Renamed t_alt to alt_tenor
+                    alt_tenor = float(alt["tenor_yrs"])
                     
                     # --- Alt Checks ---
                     if alt_tenor < ALT_LEG_THRESHOLD: continue
-                    if alt_tenor == exec_tenor: continue # uses exec_tenor
+                    if alt_tenor == exec_tenor: continue 
                     if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
                     
                     z_alt = _to_float(alt["z_comb"])
@@ -855,13 +837,62 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, mod
         if not b.empty: all_by.append(b.assign(yymm=yymm))
         
     if force_close_end and open_pos:
-        # EOC Close Logic
-        pass
+        final_ts = pd.Timestamp.now()
+        if all_led: final_ts = max(x["decision_ts"].max() for x in all_led if not x.empty)
+        
+        closed_rows = []
+        for pos in open_pos:
+            pos.closed, pos.close_ts, pos.exit_reason = True, final_ts, "eoc"
+            tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10)) if pos.mode == "overlay" else 0.0
+            tcost_cash = tcost_bp * pos.scale_dv01
+            closed_rows.append({
+                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc",
+                "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
+                "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                "pnl_price_bp": pos.pnl_price_bp,
+                "pnl_carry_bp": pos.pnl_carry_bp,
+                "pnl_roll_bp": pos.pnl_roll_bp,
+                "mode": pos.mode, "scale_dv01": pos.scale_dv01
+            })
+        if closed_rows:
+            all_pos.append(pd.DataFrame(closed_rows).assign(yymm=yymms[-1]))
 
     return (pd.concat(all_pos, ignore_index=True) if all_pos else pd.DataFrame(),
             pd.concat(all_led, ignore_index=True) if all_led else pd.DataFrame(),
             pd.concat(all_by, ignore_index=True) if all_by else pd.DataFrame())
 
 if __name__ == "__main__":
-    # ... CLI ...
-    pass
+    import hybrid_filter as hf
+    
+    if len(sys.argv) < 2:
+        print("Usage: python portfolio_test.py 2304 [2305 2306 ...]")
+        sys.exit(1)
+        
+    months = sys.argv[1:]
+    
+    trades_path = Path(f"{cr.TRADE_TYPES}.pkl")
+    trades = pd.read_pickle(trades_path) if trades_path.exists() else None
+    mode_run = cr.RUN_MODE if trades is not None else "strategy"
+
+    print(f"[INIT] Hybrid Filters...")
+    signals = hf.get_or_build_hybrid_signals()
+    regime_mask = hf.regime_mask_from_signals(signals)
+    shock_config = ShockConfig(
+        pnl_window=int(getattr(cr, "SHOCK_PNL_WINDOW", 10)),
+        use_raw_pnl=bool(getattr(cr, "SHOCK_USE_RAW_PNL", True)),
+        use_residuals=bool(getattr(cr, "SHOCK_USE_RESIDUALS", True)),
+        raw_pnl_z_thresh=float(getattr(cr, "SHOCK_RAW_PNL_Z_THRESH", -1.5)),
+        resid_z_thresh=float(getattr(cr, "SHOCK_RESID_Z_THRESH", -1.5)),
+        regression_cols=list(getattr(cr, "SHOCK_REGRESSION_COLS", [])),
+        block_length=int(getattr(cr, "SHOCK_BLOCK_LENGTH", 10)),
+    )
+
+    print(f"[EXEC] Running {mode_run} on {len(months)} months.")
+    pos, led, by = run_all(months, carry=True, force_close_end=True, mode=mode_run, hedge_df=trades, regime_mask=regime_mask, hybrid_signals=signals, shock_cfg=shock_config)
+
+    out_dir = Path(cr.PATH_OUT)
+    suffix = getattr(cr, "OUT_SUFFIX", "")
+    if not pos.empty: pos.to_parquet(out_dir / f"positions_ledger{suffix}.parquet")
+    if not led.empty: led.to_parquet(out_dir / f"marks_ledger{suffix}.parquet")
+    if not by.empty: by.to_parquet(out_dir / f"pnl_by_bucket{suffix}.parquet")
+    print(f"[DONE] Results saved to {out_dir}")
