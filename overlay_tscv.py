@@ -111,11 +111,12 @@ def _apply_config(params: Dict[str, Any]):
         safety_factor = getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0)
         
         dynamic_min = hold_days / safety_factor
-        limit = max(0.084, dynamic_min)
+        limit_exec = max(0.085, dynamic_min)
+        limit_alt = max(0.083, dynamic_min)
         
         # Enforce the calculated limit
-        setattr(cr, "EXEC_LEG_TENOR_YEARS", limit)
-        setattr(cr, "ALT_LEG_TENOR_YEARS", limit)
+        setattr(cr, "EXEC_LEG_TENOR_YEARS", limit_exec)
+        setattr(cr, "ALT_LEG_TENOR_YEARS", limit_alt)
 
 def _worker_task(task_tuple):
     """Executes backtest and calculates Winsorized Daily t-Stat."""
