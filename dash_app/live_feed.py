@@ -27,34 +27,27 @@ class LiveFeed:
         self.eod_triggered = False
         self.market_open = False 
         
-        # --- CONFIGURATION (MATCHING YOUR SCREENSHOT) ---
-        self.host = "x"
+        # --- NEW SWITCH ---
+        self.automate_eod = True # Default to True (App behavior)
+        
+        # Config
+        self.host = "vpce-0c2e4f845a98f340e-t2ggznxv.vpce-svc-0a1ace7960b600239.us-east-2.vpce.amazonaws.com"
         self.port = 8194
-        self.app_name = "x"
+        self.app_name = "USBANK:Rates_Data_Viewer"
         self.DB_LOG_INTERVAL = 5.0 
         
-        # Time Windows (Local Hours)
         self.OPEN_HOUR = 7
         self.CLOSE_HOUR = 16
 
     def start(self):
-        # Prevent double start
         if self.running: return
 
         self.session_options = blpapi.SessionOptions()
         self.session_options.setServerAddress(self.host, self.port, 0)
-        self.session_options.setServerPort(self.port) # Redundant but safe matches your snippet
         
-        # --- CRITICAL AUTHENTICATION BLOCK ---
-        # 1. Create Auth Options with specific App Name
         authOptions = blpapi.AuthOptions.createWithApp(self.app_name)
-        
-        # 2. Create the exact Correlation ID
         self.auth_correlation_id = blpapi.CorrelationId("authCorrelation")
-        
-        # 3. Bind Identity to Session Options
         self.session_options.setSessionIdentityOptions(authOptions, self.auth_correlation_id)
-        # -------------------------------------
         
         self.session = blpapi.Session(self.session_options)
         
@@ -66,7 +59,7 @@ class LiveFeed:
             print("[FEED] Failed to open //blp/mktdata service.")
             return
             
-        print("[FEED] Bloomberg Session Connected (Identity Verified).")
+        print("[FEED] Bloomberg Session Connected.")
         self._subscribe()
         
         self.running = True
@@ -88,30 +81,31 @@ class LiveFeed:
         print(f"[FEED] Listener Loop Active. Schedule: {self.OPEN_HOUR}:00 - {self.CLOSE_HOUR}:00.")
         while self.running:
             try:
-                # --- TIME & STATE MACHINE ---
                 now = datetime.now()
                 is_trading_hours = (self.OPEN_HOUR <= now.hour < self.CLOSE_HOUR)
                 
                 if is_trading_hours:
-                    # MORNING STARTUP
                     if not self.market_open:
                         print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Open. DB Recording Started.")
                         self.market_open = True
                         self.eod_triggered = False 
                 else:
-                    # EVENING SHUTDOWN
                     if self.market_open:
                         print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Closed. DB Recording Stopped.")
                         self.market_open = False
                         self._flush_to_db() 
                         
-                        if not self.eod_triggered:
+                        # --- MODIFIED EOD TRIGGER ---
+                        if not self.eod_triggered and self.automate_eod:
                             print("[SYSTEM] Auto-Triggering EOD Process...")
                             self.eod_triggered = True
                             eod_thread = threading.Thread(target=eod_process.run_eod_main)
                             eod_thread.start()
+                        elif not self.eod_triggered and not self.automate_eod:
+                            # Just mark flag so we don't spam logs, but DO NOT run script
+                            self.eod_triggered = True 
+                            print("[SYSTEM] Market Closed. EOD Automation is DISABLED (Recorder Only).")
 
-                # --- EVENT PROCESSING ---
                 event = self.session.nextEvent(1000)
                 for msg in event:
                     if msg.hasElement("LAST_PRICE"):
@@ -130,19 +124,14 @@ class LiveFeed:
             last_price = msg.getElementAsFloat("LAST_PRICE")
             ticker = msg.correlationIds()[0].value()
             current_time = time.time()
-            
-            # 1. Always Update RAM (For UI)
             self.live_map[ticker] = last_price
             
-            # 2. Only Update DB if Market Open + Throttled
             if self.market_open:
                 if (current_time - self.last_db_log.get(ticker, 0)) > self.DB_LOG_INTERVAL:
-                    # UTC for Data Consistency
                     ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                     with self.lock:
                         self.db_buffer.append({'ts': ts_str, 'ticker': ticker, 'rate': last_price})
                     self.last_db_log[ticker] = current_time
-                
         except Exception:
             pass
 
