@@ -7,8 +7,9 @@ current_dir = Path(__file__).resolve().parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 
-# Reuse the robust LiveFeed
+# Import the feed and the DB initializer
 from dash_app.live_feed import feed
+from dash_app.data_manager import init_dbs
 
 if __name__ == "__main__":
     # Check for optional test flag
@@ -22,18 +23,20 @@ if __name__ == "__main__":
     print(f"VISUAL TEST MODE: {'ON' if TEST_MODE else 'OFF'}")
     print("="*40)
     
-    # Start the feed thread
+    # 1. Initialize Databases (Creates tables if missing)
+    print("[SYSTEM] Verifying Database Schema...")
+    init_dbs()
+    
+    # 2. Start the feed thread
     feed.start()
     
-    # Keep the main thread alive forever
+    # 3. Keep the main thread alive forever
     try:
         while True:
             if TEST_MODE:
-                # Every 3 seconds, wipe console (optional) or just print block
-                # printing block is safer for logs.
+                # Visual Feedback Loop
                 print(f"\n--- TICK SNAPSHOT {time.strftime('%H:%M:%S')} ---")
                 
-                # Sort keys for readable output
                 active_tickers = sorted(feed.live_map.keys())
                 
                 if not active_tickers:
@@ -41,13 +44,12 @@ if __name__ == "__main__":
                 
                 for k in active_tickers:
                     val = feed.live_map[k]
-                    # Visual cue: If 0.0, we haven't received a tick yet
                     val_str = f"{val:.4f}" if val != 0.0 else "WAITING..."
                     print(f"{k:<30} : {val_str}")
                 
                 time.sleep(3)
             else:
-                # Silent Mode (Production)
+                # Silent Production Loop
                 time.sleep(1)
                 
     except KeyboardInterrupt:
