@@ -31,9 +31,9 @@ class LiveFeed:
         self.automate_eod = True # Default to True (App behavior)
         
         # Config
-        self.host = "vpce-0c2e4f845a98f340e-t2ggznxv.vpce-svc-0a1ace7960b600239.us-east-2.vpce.amazonaws.com"
+        self.host = "x"
         self.port = 8194
-        self.app_name = "USBANK:Rates_Data_Viewer"
+        self.app_name = "x"
         self.DB_LOG_INTERVAL = 5.0 
         
         self.OPEN_HOUR = 7
