@@ -16,10 +16,10 @@ import eod_process
 
 class LiveFeed:
     def __init__(self):
-        self.live_map = {}      
-        self.last_db_log = {}   
+        self.live_map = {}       
+        self.last_db_log = {}    
         self.running = False
-        self.db_buffer = []     
+        self.db_buffer = []      
         self.last_flush_time = time.time()
         self.lock = threading.Lock()
         
@@ -27,20 +27,30 @@ class LiveFeed:
         self.eod_triggered = False
         self.market_open = False 
         
-        # --- NEW SWITCH ---
-        self.automate_eod = True # Default to True (App behavior)
+        # --- CONFIGURATION FLAGS ---
+        self.automate_eod = True      # Can be disabled by run_recorder flags
+        self.enable_db_logging = True # Controlled by start() arg
         
-        # Config
-        self.host = "x"
+        # Bloomberg Config
+        self.host = "10.8.8.1"
         self.port = 8194
-        self.app_name = "x"
+        self.app_name = "demo:1.0.0"
         self.DB_LOG_INTERVAL = 5.0 
         
         self.OPEN_HOUR = 7
         self.CLOSE_HOUR = 16
 
-    def start(self):
+    def start(self, log_to_db=True):
+        """
+        Starts the feed.
+        :param log_to_db: If True, acts as 'Master' (Records Ticks + Runs EOD).
+                          If False, acts as 'Viewer' (UI updates only, no DB writes).
+        """
         if self.running: return
+
+        self.enable_db_logging = log_to_db
+        role = "MASTER (Recorder + EOD)" if log_to_db else "VIEWER (Read-Only)"
+        print(f"[FEED] Starting in {role} mode.")
 
         self.session_options = blpapi.SessionOptions()
         self.session_options.setServerAddress(self.host, self.port, 0)
@@ -84,34 +94,43 @@ class LiveFeed:
                 now = datetime.now()
                 is_trading_hours = (self.OPEN_HOUR <= now.hour < self.CLOSE_HOUR)
                 
+                # --- MARKET OPEN LOGIC ---
                 if is_trading_hours:
                     if not self.market_open:
-                        print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Open. DB Recording Started.")
                         self.market_open = True
                         self.eod_triggered = False 
+                        print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Open.")
+                        if self.enable_db_logging:
+                            print("[SYSTEM] DB Recording Started.")
+                
+                # --- MARKET CLOSE LOGIC ---
                 else:
                     if self.market_open:
-                        print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Closed. DB Recording Stopped.")
                         self.market_open = False
-                        self._flush_to_db() 
+                        print(f"[SYSTEM] {now.strftime('%H:%M:%S')} - Market Closed.")
                         
-                        # --- MODIFIED EOD TRIGGER ---
-                        if not self.eod_triggered and self.automate_eod:
-                            print("[SYSTEM] Auto-Triggering EOD Process...")
-                            self.eod_triggered = True
-                            eod_thread = threading.Thread(target=eod_process.run_eod_main)
-                            eod_thread.start()
-                        elif not self.eod_triggered and not self.automate_eod:
-                            # Just mark flag so we don't spam logs, but DO NOT run script
-                            self.eod_triggered = True 
-                            print("[SYSTEM] Market Closed. EOD Automation is DISABLED (Recorder Only).")
+                        if self.enable_db_logging:
+                            print("[SYSTEM] DB Recording Stopped. Flushing buffer...")
+                            self._flush_to_db() 
+                            
+                            # --- EOD TRIGGER (MASTER ONLY) ---
+                            if not self.eod_triggered and self.automate_eod:
+                                print("[SYSTEM] Auto-Triggering EOD Process...")
+                                self.eod_triggered = True
+                                eod_thread = threading.Thread(target=eod_process.run_eod_main)
+                                eod_thread.start()
+                            elif not self.eod_triggered and not self.automate_eod:
+                                self.eod_triggered = True 
+                                print("[SYSTEM] Market Closed. EOD Automation is DISABLED (Flag Set).")
 
+                # --- BLOOMBERG EVENT HANDLING ---
                 event = self.session.nextEvent(1000)
                 for msg in event:
                     if msg.hasElement("LAST_PRICE"):
                         self._process_message(msg)
                 
-                if self.market_open:
+                # --- FLUSH TIMER (MASTER ONLY) ---
+                if self.market_open and self.enable_db_logging:
                     if time.time() - self.last_flush_time > 10:
                         self._flush_to_db()
                     
@@ -124,9 +143,12 @@ class LiveFeed:
             last_price = msg.getElementAsFloat("LAST_PRICE")
             ticker = msg.correlationIds()[0].value()
             current_time = time.time()
+            
+            # 1. Update In-Memory Map (Always happens, for UI)
             self.live_map[ticker] = last_price
             
-            if self.market_open:
+            # 2. Update DB Buffer (Only if Master)
+            if self.market_open and self.enable_db_logging:
                 if (current_time - self.last_db_log.get(ticker, 0)) > self.DB_LOG_INTERVAL:
                     ts_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                     with self.lock:
@@ -136,16 +158,23 @@ class LiveFeed:
             pass
 
     def _flush_to_db(self):
+        # Safety check: if somehow called when logging disabled
+        if not self.enable_db_logging: 
+            return
+
         with self.lock:
             if not self.db_buffer:
                 self.last_flush_time = time.time()
                 return
             data = list(self.db_buffer)
             self.db_buffer.clear()
+        
         try:
             log_ticks(data)
         except Exception as e:
-            print(f"[DB ERROR] {e}")
+            print(f"[DB ERROR] Flush failed (Retrying next cycle): {e}")
+            # Optional: re-add data to buffer if critical, but for ticks we usually drop
+        
         self.last_flush_time = time.time()
 
 feed = LiveFeed()
