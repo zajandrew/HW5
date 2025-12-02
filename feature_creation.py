@@ -64,7 +64,7 @@ def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     # 2) Session hours (Strict Filter)
     # This guarantees that .head(1) later will be the OPEN (07:00), not midnight.
     tz_local = getattr(cr, "CAL_TZ", "America/New_York")
-    start_str, end_str = getattr(cr, "TRADING_HOURS", ("07:00", "17:30"))
+    start_str, end_str = getattr(cr, "TRADING_HOURS", ("07:00", "17:00"))
 
     df_wide = df_wide.copy()
     df_wide["ts_local"] = df_wide["ts"].dt.tz_localize("UTC").dt.tz_convert(tz_local)
