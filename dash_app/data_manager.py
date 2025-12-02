@@ -1,19 +1,35 @@
 import sqlite3
 import pandas as pd
+import time
 from datetime import datetime
 from pathlib import Path
-import time
 
 DB_POSITIONS = "positions.db"
 DB_MARKET = "market_data.db"
 
+def get_connection(db_name, retries=5):
+    """
+    Robust connection factory with retry logic for SQLite locking.
+    Centralizes the logic so ALL functions (Read & Write) are safe.
+    """
+    for i in range(retries):
+        try:
+            # timeout=10 makes SQLite driver wait 10s internally before throwing exception
+            conn = sqlite3.connect(db_name, timeout=10) 
+            return conn
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                time.sleep(0.2) # Short sleep before python retry
+            else:
+                raise e
+    raise sqlite3.OperationalError(f"Database {db_name} locked after {retries} retries.")
+
 def init_dbs():
     """
     Initialize SQLite tables.
-    Includes full PnL breakdown columns (Cash & BP) for attribution.
     """
     # 1. Positions DB
-    conn = sqlite3.connect(DB_POSITIONS)
+    conn = get_connection(DB_POSITIONS)
     c = conn.cursor()
     
     # Trade Blotter Schema
@@ -59,7 +75,7 @@ def init_dbs():
     conn.close()
 
     # 2. Market Data DB (Rolling Buffer)
-    conn = sqlite3.connect(DB_MARKET)
+    conn = get_connection(DB_MARKET)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS ticks (
         timestamp TEXT,
@@ -70,28 +86,22 @@ def init_dbs():
     conn.close()
 
 def log_ticks(tick_list):
-    """Batch insert ticks with retry logic for SQLite locking."""
+    """Batch insert ticks for EOD processing (Concurrency Safe)."""
     if not tick_list: return
     
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            conn = sqlite3.connect(DB_MARKET, timeout=10) # Increased timeout
-            c = conn.cursor()
-            data = [(t['ts'], t['ticker'], t['rate']) for t in tick_list]
-            c.executemany("INSERT INTO ticks (timestamp, ticker, rate) VALUES (?, ?, ?)", data)
-            conn.commit()
-            conn.close()
-            return
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e):
-                time.sleep(0.5) # Wait and retry
-            else:
-                raise e
+    try:
+        conn = get_connection(DB_MARKET)
+        c = conn.cursor()
+        data = [(t['ts'], t['ticker'], t['rate']) for t in tick_list]
+        c.executemany("INSERT INTO ticks (timestamp, ticker, rate) VALUES (?, ?, ?)", data)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB LOG ERROR] {e}")
 
 def add_position(trade_dict):
     """Insert a new open position."""
-    conn = sqlite3.connect(DB_POSITIONS)
+    conn = get_connection(DB_POSITIONS)
     c = conn.cursor()
     cols = ', '.join(trade_dict.keys())
     placeholders = ', '.join(['?'] * len(trade_dict))
@@ -104,13 +114,10 @@ def update_position_status(trade_id, status, close_reason=None, close_ts=None,
                            pnl_cash=None, pnl_bp=None):
     """
     Updates status and saves FULL PnL breakdown.
-    pnl_cash: dict {'total', 'price', 'carry', 'roll'}
-    pnl_bp: dict {'total', 'price', 'carry', 'roll'}
     """
-    conn = sqlite3.connect(DB_POSITIONS)
+    conn = get_connection(DB_POSITIONS)
     c = conn.cursor()
     
-    # Unpack safely (handle None or missing keys defaults)
     c_tot = pnl_cash.get('total', 0.0) if pnl_cash else 0.0
     c_prc = pnl_cash.get('price', 0.0) if pnl_cash else 0.0
     c_cry = pnl_cash.get('carry', 0.0) if pnl_cash else 0.0
@@ -136,7 +143,7 @@ def update_position_status(trade_id, status, close_reason=None, close_ts=None,
 
 def delete_position(trade_id):
     """Hard delete for mistakes."""
-    conn = sqlite3.connect(DB_POSITIONS)
+    conn = get_connection(DB_POSITIONS)
     c = conn.cursor()
     c.execute("DELETE FROM trades WHERE trade_id=?", (trade_id,))
     conn.commit()
@@ -144,21 +151,30 @@ def delete_position(trade_id):
 
 def get_open_positions():
     """Returns DataFrame of currently open trades."""
-    conn = sqlite3.connect(DB_POSITIONS)
-    df = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
+    conn = get_connection(DB_POSITIONS)
+    try:
+        df = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
+    except:
+        df = pd.DataFrame()
     conn.close()
     return df
 
 def get_all_positions():
     """Returns DataFrame of all trades (Open + Closed) for history view."""
-    conn = sqlite3.connect(DB_POSITIONS)
-    df = pd.read_sql("SELECT * FROM trades ORDER BY open_ts DESC", conn)
+    conn = get_connection(DB_POSITIONS)
+    try:
+        df = pd.read_sql("SELECT * FROM trades ORDER BY open_ts DESC", conn)
+    except:
+        df = pd.DataFrame()
     conn.close()
     return df
 
 def get_system_state():
     """Returns the single row containing regime and shock status."""
-    conn = sqlite3.connect(DB_POSITIONS)
-    row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
+    conn = get_connection(DB_POSITIONS)
+    try:
+        row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
+    except:
+        row = None
     conn.close()
     return row
