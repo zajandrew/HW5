@@ -2,6 +2,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+import time
 
 DB_POSITIONS = "positions.db"
 DB_MARKET = "market_data.db"
@@ -69,14 +70,24 @@ def init_dbs():
     conn.close()
 
 def log_ticks(tick_list):
-    """Batch insert ticks for EOD processing."""
+    """Batch insert ticks with retry logic for SQLite locking."""
     if not tick_list: return
-    conn = sqlite3.connect(DB_MARKET)
-    c = conn.cursor()
-    data = [(t['ts'], t['ticker'], t['rate']) for t in tick_list]
-    c.executemany("INSERT INTO ticks (timestamp, ticker, rate) VALUES (?, ?, ?)", data)
-    conn.commit()
-    conn.close()
+    
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_MARKET, timeout=10) # Increased timeout
+            c = conn.cursor()
+            data = [(t['ts'], t['ticker'], t['rate']) for t in tick_list]
+            c.executemany("INSERT INTO ticks (timestamp, ticker, rate) VALUES (?, ?, ?)", data)
+            conn.commit()
+            conn.close()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                time.sleep(0.5) # Wait and retry
+            else:
+                raise e
 
 def add_position(trade_dict):
     """Insert a new open position."""
