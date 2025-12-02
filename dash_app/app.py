@@ -24,7 +24,7 @@ import cr_config as cr
 
 # --- SETUP ---
 init_dbs()
-feed.start()
+feed.start(log_to_db=False)
 
 def get_latest_model_yymm():
     """Finds most recent _enh.parquet file to load as Midnight Model."""
