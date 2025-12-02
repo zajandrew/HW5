@@ -249,51 +249,78 @@ def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n
 # -----------------------
 # SMART LOADER (Consistency & Dynamic Lookback)
 # -----------------------
+# -----------------------
+# SMART LOADER WITH CACHING (The Speed Fix)
+# -----------------------
 def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
     """
-    Loads PREVIOUS N months based on PCA_LOOKBACK_DAYS. 
-    Downsamples strictly based on DECISION_FREQ config.
-    - If 'D': Keeps 1 tick per day (End of Day).
-    - If 'H': Keeps 1 tick per hour (End of Hour).
+    Loads PREVIOUS N months based on PCA_LOOKBACK_DAYS.
+    
+    OPTIMIZATION:
+    Checks for a pre-computed '{YYMM}_summary_{FREQ}.parquet' file first.
+    If it exists, loads that (KB size).
+    If not, loads raw (GB size), downsamples, SAVES the summary, and uses it.
     """
     path_data = Path(getattr(cr, "PATH_DATA", "."))
     target_dt = datetime.datetime.strptime(target_yymm, "%y%m")
     
+    # Config setup
     lookback_days = float(getattr(cr, "PCA_LOOKBACK_DAYS", 126))
     history_months = math.ceil(lookback_days / 20.0) + 1
-    
     freq = str(getattr(cr, "DECISION_FREQ", "D")).upper()
-    history_dfs = []
     tenormap = getattr(cr, "TENOR_YEARS", {})
     
-    print(f"[{_now()}] [HIST] Config Lookback={int(lookback_days)}d -> Loading {history_months} months (Downsampling to {freq})...")
+    history_dfs = []
+    
+    print(f"[{_now()}] [HIST] Loading {history_months} months history (Cache Mode: {freq})...")
     
     for i in range(history_months, 0, -1):
         curr_dt = target_dt - relativedelta(months=i)
         curr_str = curr_dt.strftime("%y%m")
-        fpath = path_data / f"{curr_str}_features.parquet"
         
-        if fpath.exists():
+        # 1. Define Paths
+        raw_path = path_data / f"{curr_str}_features.parquet"
+        cache_name = f"{curr_str}_summary_{freq}.parquet"
+        cache_path = path_data / cache_name
+        
+        # 2. Try Cache First
+        if cache_path.exists():
             try:
-                # Load Raw & Clean (Filter Hours Here)
-                df = pd.read_parquet(fpath)
+                # print(f"   -> Found Cache: {cache_name}")
+                df_long = pd.read_parquet(cache_path)
+                history_dfs.append(df_long)
+                continue # Skip to next month
+            except Exception as e:
+                print(f"[WARN] Cache corrupt {cache_name}, regenerating. Error: {e}")
+
+        # 3. Cache Miss: Load Raw & Generate
+        if raw_path.exists():
+            try:
+                print(f"   -> Cache Miss. Generatng summary for {curr_str}...")
+                
+                # Load Raw
+                df = pd.read_parquet(raw_path)
                 df = _to_ts_index(df)
-                df = _apply_calendar_and_hours(df) # Filters to 07:00-17:30
+                df = _apply_calendar_and_hours(df)
                 df = _zeros_to_nan(df)
                 
-                # Downsample Consistently
-                # Note: For history, we typically want the CLOSE of the period to represent the state.
-                # So we use .tail(1) here.
                 if not df.empty:
+                    # Downsample
                     bucket_key = _decision_key(df["ts"], freq)
                     df_sampled = df.sort_values("ts").groupby(bucket_key).tail(1)
                     
+                    # Melt
                     df_long = _melt_long(df_sampled, tenormap)
+                    
+                    # SAVE CACHE
+                    df_long.to_parquet(cache_path, index=False)
+                    # print(f"      Saved {cache_name} ({len(df_long)} rows)")
+                    
                     history_dfs.append(df_long)
                 
                 del df
             except Exception as e:
-                print(f"[WARN] Failed history {curr_str}: {e}")
+                print(f"[WARN] Failed to process raw history {curr_str}: {e}")
                 
     if not history_dfs:
         return pd.DataFrame()
