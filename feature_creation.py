@@ -55,11 +55,14 @@ def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     ts = pd.to_datetime(df_wide["ts"])
     
     if cal:
+        # Simplified for speed; assumes weekend filter handles most non-trading days
+        # Detailed holiday check is expensive on 10M rows
         df_wide = df_wide[ts.dt.weekday < 5]
     else:
         df_wide = df_wide[ts.dt.weekday < 5]
 
-    # 2) Session hours
+    # 2) Session hours (Strict Filter)
+    # This guarantees that .head(1) later will be the OPEN (07:00), not midnight.
     tz_local = getattr(cr, "CAL_TZ", "America/New_York")
     start_str, end_str = getattr(cr, "TRADING_HOURS", ("07:00", "17:30"))
 
@@ -121,12 +124,9 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     """
     Fits Spline. Returns (z_scores, scale).
-    Scale is used by Live Engine for dynamic volatility.
     """
     s = snap_long[["tenor_yrs", "rate"]].dropna()
     out = pd.Series(index=snap_long.index, dtype=float)
-    
-    # Default fallback (e.g. 5bps)
     DEFAULT_SCALE = 0.05 
 
     if s.shape[0] < 5:
@@ -141,7 +141,6 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         fit = np.polyval(coef, x)
         resid = y - fit
 
-        # Robust scale: MAD
         med = np.median(resid)
         mad = np.median(np.abs(resid - med))
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
@@ -152,7 +151,6 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         z = (resid - resid.mean()) / scale
         m = {ten: val for ten, val in zip(x, z)}
         out.loc[s.index] = s["tenor_yrs"].map(m).values
-        
         return out, scale
     except Exception:
         return out, DEFAULT_SCALE
@@ -166,7 +164,6 @@ def _pca_fit_panel(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps:
     W = (panel_long.pivot(index="ts", columns="tenor_yrs", values="rate").sort_index())
     W = W.reindex(columns=cols_ordered).ffill().dropna(how="any")
     
-    # Need enough rows to solve
     if W.shape[0] < (n_comps + 5) or W.shape[1] < n_comps:
         return None
 
@@ -179,21 +176,21 @@ def _pca_fit_panel(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps:
     return {"cols": list(W.columns), "mean": mu.ravel(), "components": comps, "evr": evr[:n_comps]}
 
 def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
-    """Applies PCA model to the CURRENT bucket."""
+    """Applies PCA model to the CURRENT bucket (Morning Snapshot)."""
     out = pd.Series(index=df_block.index, dtype=float)
     if not pca_model or df_block.empty: return out
 
     cols, mu, comps = pca_model["cols"], np.asarray(pca_model["mean"]), np.asarray(pca_model["components"])
 
-    # Score based on LAST tick in the bucket (Snapshot)
-    last = (df_block.sort_values("ts")
+    # Score based on HEAD (First tick in the bucket = Morning Open)
+    snap = (df_block.sort_values("ts")
                       .groupby("tenor_yrs", as_index=False)
-                      .tail(1)
+                      .head(1)
                       .set_index("tenor_yrs")["rate"])
     
-    if any(c not in last.index for c in cols): return out
+    if any(c not in snap.index for c in cols): return out
 
-    x = last.reindex(cols).values.astype(float)
+    x = snap.reindex(cols).values.astype(float)
     xc = x - mu
     score = comps @ xc
     recon = comps.T @ score
@@ -209,9 +206,14 @@ def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
 # Per-bucket processor
 # -----------------------
 def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n_comps, yymm):
-    out = df_bucket[["ts","tenor_yrs","rate"]].copy().reset_index(drop=True)
+    # --- CRITICAL CHANGE: GRAB THE OPEN (HEAD) INSTEAD OF TAIL ---
+    # We sort by timestamp and take the 1st valid tick per tenor.
+    # This represents the "Morning Call" execution price (e.g. 07:00 AM).
+    # Since df_bucket was already filtered for [07:00, 17:30], head(1) is guaranteed to be >= 07:00.
+    out = df_bucket.sort_values("ts").groupby("tenor_yrs", as_index=False).head(1)
+    out = out.reset_index(drop=True)
 
-    # 1) Spline Z + SCALE (The Fix for Live Engine)
+    # 1) Spline Z + SCALE 
     z_spline, scale_val = _spline_fit_safe(out)
     out["z_spline"] = z_spline
     out["scale"] = scale_val 
@@ -219,17 +221,21 @@ def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n
     # 2) PCA Z (Using History)
     out["z_pca"] = np.nan
     if pca_enable:
-        cols_now = sorted(df_bucket["tenor_yrs"].unique().tolist())
+        cols_now = sorted(out["tenor_yrs"].unique().tolist())
         if len(cols_now) >= pca_n_comps:
-            t_end   = df_bucket["ts"].min()
+            # We use the timestamp of the MORNING snapshot to filter history
+            t_end   = out["ts"].min() 
             t_start = t_end - pd.Timedelta(days=float(lookback_days))
             
-            # Filter history panel (fast because it is small/daily)
+            # History Panel: We use the Daily CLOSES from history (df_history).
+            # This is the "Hybrid" approach:
+            # "Project today's Morning Price onto the Covariance of the last 6 months of Closes."
             panel = df_history[(df_history["ts"]>=t_start) & (df_history["ts"]<t_end) & 
                                (df_history["tenor_yrs"].isin(cols_now))]
             
             model = _pca_fit_panel(panel, cols_now, pca_n_comps)
             if model:
+                # Apply the model to the MORNING snapshot
                 out["z_pca"] = _pca_apply_block(out, model)
 
     # 3) Combine
@@ -248,19 +254,15 @@ def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
     Loads PREVIOUS N months based on PCA_LOOKBACK_DAYS. 
     Downsamples strictly based on DECISION_FREQ config.
     - If 'D': Keeps 1 tick per day (End of Day).
-    - If 'H': Keeps 1 tick per hour (Top of Hour).
+    - If 'H': Keeps 1 tick per hour (End of Hour).
     """
     path_data = Path(getattr(cr, "PATH_DATA", "."))
     target_dt = datetime.datetime.strptime(target_yymm, "%y%m")
     
-    # 1. Determine how many months to load based on config
     lookback_days = float(getattr(cr, "PCA_LOOKBACK_DAYS", 126))
-    # Divide by 20 trading days to approximate months, round up + 1 buffer
     history_months = math.ceil(lookback_days / 20.0) + 1
     
-    # 2. Get Frequency Config (D or H)
     freq = str(getattr(cr, "DECISION_FREQ", "D")).upper()
-    
     history_dfs = []
     tenormap = getattr(cr, "TENOR_YEARS", {})
     
@@ -273,21 +275,19 @@ def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
         
         if fpath.exists():
             try:
-                # Load Raw
+                # Load Raw & Clean (Filter Hours Here)
                 df = pd.read_parquet(fpath)
                 df = _to_ts_index(df)
-                df = _apply_calendar_and_hours(df)
+                df = _apply_calendar_and_hours(df) # Filters to 07:00-17:30
                 df = _zeros_to_nan(df)
                 
                 # Downsample Consistently
+                # Note: For history, we typically want the CLOSE of the period to represent the state.
+                # So we use .tail(1) here.
                 if not df.empty:
-                    # Create the bucket key (Day or Hour)
                     bucket_key = _decision_key(df["ts"], freq)
-                    
-                    # Group by bucket -> Take Last Tick
                     df_sampled = df.sort_values("ts").groupby(bucket_key).tail(1)
                     
-                    # Melt
                     df_long = _melt_long(df_sampled, tenormap)
                     history_dfs.append(df_long)
                 
@@ -316,8 +316,7 @@ def build_month(yymm: str) -> None:
     print(f"[{_now()}] [TARGET] Loading {yymm}...")
     df_wide = pd.read_parquet(in_path)
     df_wide = _to_ts_index(df_wide)
-    df_wide = df_wide[~df_wide["ts"].duplicated(keep="last")]
-    df_wide = _apply_calendar_and_hours(df_wide)
+    df_wide = _apply_calendar_and_hours(df_wide) # Filters to 07:00-17:30
     df_wide = _zeros_to_nan(df_wide)
 
     tenormap = getattr(cr, "TENOR_YEARS", {})
@@ -330,11 +329,11 @@ def build_month(yymm: str) -> None:
     buckets.sort()
 
     # 2. Load History (Smart Downsampled)
-    # No manual argument passed; it calculates based on config
     df_history = load_history_downsampled(yymm)
     
     # 3. Create PCA Context Panel
-    # Combine History + Target's Daily Closes (Progressive)
+    # Combine History + Target's Progress
+    # Note: For history panel, we want closes to match df_history
     df_target_daily = df_long.sort_values("ts").groupby(["decision_ts", "tenor_yrs"], as_index=False).tail(1)
     df_context = pd.concat([df_history, df_target_daily]).sort_values("ts").reset_index(drop=True)
 
@@ -353,12 +352,12 @@ def build_month(yymm: str) -> None:
     lookback_days = float(getattr(cr, "PCA_LOOKBACK_DAYS", 126))
     pca_components = int(getattr(cr, "PCA_COMPONENTS", 3))
 
-    print(f"[{_now()}] [PROCESS] Processing {len(buckets)} buckets (PCA={pca_enable}, Scale=True)...")
+    print(f"[{_now()}] [PROCESS] Processing {len(buckets)} buckets (PCA={pca_enable}, Scale=True, Mode=MORNING_OPEN)...")
 
     def _one(dts):
         snap = df_long[df_long["decision_ts"] == dts]
         # Pass df_context as the history panel
-        out = _process_bucket(
+        return _process_bucket(
             dts=dts,
             df_bucket=snap,
             df_history=df_context,
@@ -367,7 +366,6 @@ def build_month(yymm: str) -> None:
             pca_n_comps=pca_components,
             yymm=yymm
         )
-        return out
 
     parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one)(d) for d in buckets)
     
@@ -385,9 +383,6 @@ def build_month(yymm: str) -> None:
     z_valid_pct = float(np.isfinite(zr).mean() * 100.0) if not out.empty else 0.0
     print(f"[DONE] {yymm} rows:{len(out):,} z_valid%:{z_valid_pct:.2f} -> {out_path}")
 
-# -----------------------
-# CLI
-# -----------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python feature_creation.py 2304 [2305 2306 ...]")
