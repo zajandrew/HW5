@@ -43,7 +43,7 @@ TRADE_TYPES = "synth_trades"
 USE_QL_CALENDAR = True
 QL_US_MARKET    = "FederalReserve"
 CAL_TZ          = "America/New_York"
-TRADING_HOURS = ("07:00", "17:30")
+TRADING_HOURS = ("07:00", "17:00")
 
 # ========= Feature (builder) settings =========
 # PCA trained on a rolling panel built at the chosen decision frequency (D/H).
