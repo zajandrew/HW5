@@ -24,31 +24,54 @@ import cr_config as cr
 
 # --- SETUP ---
 init_dbs()
+
+# START MODE: Viewer Only (log_to_db=False)
+# We assume 'run_recorder.py' is running separately to handle recording/EOD.
 feed.start(log_to_db=False)
+
+# Global State for Hot Reloading
+CURRENT_LOADED_YYMM = None
 
 def get_latest_model_yymm():
     """Finds most recent _enh.parquet file to load as Midnight Model."""
     enh_dir = Path(cr.PATH_ENH)
+    # Glob all enhanced files
     files = list(enh_dir.glob("*_enh.parquet"))
-    if not files: return datetime.now().strftime("%y%m")
+    if not files: 
+        return datetime.now().strftime("%y%m")
+    
+    # Sort by filename (YYMM is sortable string)
     files.sort() 
-    return files[-1].name.split('_')[0]
+    latest_file = files[-1]
+    return latest_file.name.split('_')[0]
 
-CURRENT_YYMM = get_latest_model_yymm()
-print(f"[SYSTEM] Initializing App with Model Month: {CURRENT_YYMM}")
-le.load_midnight_model(CURRENT_YYMM)
+def check_and_reload_model():
+    """Checks if a new model file exists and reloads if necessary."""
+    global CURRENT_LOADED_YYMM
+    latest = get_latest_model_yymm()
+    
+    if latest != CURRENT_LOADED_YYMM:
+        print(f"[SYSTEM] Loading Model: {latest} (Previous: {CURRENT_LOADED_YYMM})")
+        success = le.load_midnight_model(latest)
+        if success:
+            CURRENT_LOADED_YYMM = latest
+            return f"Model Updated: {latest}"
+    return dash.no_update
+
+# Initial Load
+check_and_reload_model()
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
 app.title = "RV Overlay DSS"
 
 # --- HELPERS ---
 def get_z_color(z):
-    if z is None: return "grey"
+    if z is None: return "#444" # Dark Grey
     if z > 2.0: return "#00FF00" # Bright Green
     if z > 0.5: return "#90EE90" # Light Green
     if z < -2.0: return "#FF0000" # Bright Red
     if z < -0.5: return "#CD5C5C" # Indian Red
-    return "#FFD700" # Neutral
+    return "#444" # Dark Grey (Noise)
 
 def format_tenor(ticker, float_years):
     if float_years is None: return "N/A"
@@ -57,14 +80,12 @@ def format_tenor(ticker, float_years):
     if abs(y - 1/12) < tol: return "1M"
     if abs(y - 2/12) < tol: return "2M"
     if abs(y - 3/12) < tol: return "3M"
+    if abs(y - 0.25) < tol: return "3M" # Common 3M
     if abs(y - 4/12) < tol: return "4M"
     if abs(y - 5/12) < tol: return "5M"
     if abs(y - 6/12) < tol: return "6M"
-    if abs(y - 7/12) < tol: return "7M"
-    if abs(y - 8/12) < tol: return "8M"
-    if abs(y - 9/12) < tol: return "9M"
-    if abs(y - 10/12) < tol: return "10M"
-    if abs(y - 11/12) < tol: return "11M"
+    if abs(y - 0.5) < tol:  return "6M"
+    if abs(y - 1.0) < tol:  return "1Y"
     if abs(y - 1.5) < tol: return "18M"
     if abs(y - round(y)) < tol: return f"{int(round(y))}Y"
     return f"{y:.1f}Y"
@@ -86,15 +107,16 @@ def aggregate_pnl_columns(df):
 
 # --- LAYOUT ---
 app.layout = html.Div([
-    dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates
-    dcc.Interval(id='slow-interval', interval=10000, n_intervals=0), # 10s updates
+    dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates (Prices)
+    dcc.Interval(id='slow-interval', interval=60000, n_intervals=0), # 1m updates (Model Check)
     
     # Header
     dbc.NavbarSimple(
         children=[
             dbc.Badge("REGIME: SAFE", color="success", className="ms-2", id="badge-regime"),
             dbc.Badge("SHOCK: OFF", color="success", className="ms-2", id="badge-shock"),
-            dbc.Button("Run EOD Batch", id="btn-run-eod", size="sm", color="secondary", className="ms-4")
+            html.Span(id="model-version-display", className="ms-3 text-muted small"),
+            dbc.Button("Force EOD", id="btn-run-eod", size="sm", color="secondary", className="ms-4")
         ],
         brand="Systematic Overlay Framework // Live Desk",
         brand_href="#",
@@ -177,7 +199,7 @@ app.layout = html.Div([
                         html.Div(id="time-stats-container")
                     ], width=6),
                     dbc.Col([
-                        html.H5("Risk Profile (Net DV01)"), 
+                        html.H5("Risk Profile (Net vs Gross)"), 
                         html.Div(id="risk-profile-container")
                     ], width=6)
                 ])
@@ -202,7 +224,17 @@ app.layout = html.Div([
 
 # --- CALLBACKS ---
 
-# 1. Update Ticker Grid (SMART DISABLE)
+# 1. Slow Interval (Model Reload & Header)
+@app.callback(
+    Output('model-version-display', 'children'),
+    Input('slow-interval', 'n_intervals')
+)
+def auto_reload_model(n):
+    # This runs every 60s. Checks if new parquet exists (e.g. after EOD run)
+    msg = check_and_reload_model()
+    return f"Model: {CURRENT_LOADED_YYMM}"
+
+# 2. Update Ticker Grid (SMART DISABLE)
 @app.callback(
     Output('ticker-grid', 'children'),
     Output('badge-regime', 'children'),
@@ -213,8 +245,11 @@ app.layout = html.Div([
 )
 def update_grid(n):
     state = get_system_state()
-    shock_days = state[2]
-    regime = state[3]
+    # state tuple: (id, ts, shock, regime, pnl...)
+    # Ensure index matching if schema changed. 
+    # Usually: id=0, last_update=1, shock=2, regime=3
+    shock_days = state[2] if state else 0
+    regime = state[3] if state else "SAFE"
     
     is_shocked = (shock_days > 0)
     is_unstable = (regime != 'SAFE')
@@ -234,7 +269,6 @@ def update_grid(n):
         if global_disable:
             can_pay, can_rec = False, False
         else:
-            # Check availability of partners
             partners_pay = le.get_valid_partners(t, 'PAY', z_map)
             partners_rec = le.get_valid_partners(t, 'REC', z_map)
             can_pay = len(partners_pay) > 0
@@ -243,7 +277,6 @@ def update_grid(n):
         pay_style = {'opacity': 0.5 if not can_pay else 1.0}
         rec_style = {'opacity': 0.5 if not can_rec else 1.0}
         
-        # Visual cue if feed is dead (0.0)
         if z_val == 0.0 and data['model_z'] != 0.0: color = "#444"
 
         card = dbc.Card([
@@ -269,7 +302,7 @@ def update_grid(n):
     
     return cards, regime_text, regime_color, shock_text, shock_color
 
-# 2. Modal Logic
+# 3. Modal Logic
 @app.callback(
     Output("modal-trade", "is_open"),
     Output("modal-body-content", "children"),
@@ -310,7 +343,6 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         best_ticker = candidates[0]['ticker']
         best_rate = feed.live_map.get(best_ticker, 0.0)
         
-        # Switch Logic Text
         if intent == "PAY":
             leg1_label = "LEG 1: PAY (Alternative)"
             leg2_label = f"LEG 2: REC (Original {label_orig})"
@@ -339,7 +371,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         return True, content
     return is_open, dash.no_update
 
-# 3. Submit Trade
+# 4. Submit Trade
 @app.callback(
     Output("scanner-msg", "children"),
     Input("btn-submit-trade", "n_clicks"),
@@ -383,7 +415,7 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
 
-# 4. Update Blotter (Both Tables + Breakdown)
+# 5. Update Blotter
 @app.callback(
     Output('tbl-open-positions', 'data'),
     Output('tbl-open-positions', 'columns'),
@@ -400,12 +432,11 @@ def update_blotter(n, click):
     Z_EXIT, Z_STOP, MAX_HOLD = cr.Z_EXIT, cr.Z_STOP, cr.MAX_HOLD_DAYS
     now_dt = datetime.now()
     
-    # --- PROCESS OPEN TRADES ---
+    # --- OPEN TRADES ---
     open_df = all_trades[all_trades['status'] == 'OPEN']
     open_data = []
     
     for _, row in open_df.iterrows():
-        # Live Engine Returns: (Cash_Tuple, BP_Tuple)
         (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(row, feed.live_map, now_dt)
         
         z_map = le.get_live_z_scores(feed.live_map)
@@ -438,19 +469,11 @@ def update_blotter(n, click):
             'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            
-            # PnL Cash (Displayed)
             'total_pnl': round(c_tot, 0),
             'price_pnl': round(c_prc, 0),
             'carry_pnl': round(c_cry, 0),
             'roll_pnl': round(c_rol, 0),
-            
-            # PnL BP (Hidden for DB pass-through)
-            'total_bp': b_tot,
-            'price_bp': b_prc,
-            'carry_bp': b_cry,
-            'roll_bp': b_rol,
-            
+            'total_bp': b_tot, # Hidden but useful
             'curr_z': round(curr_z, 2),
             'target_z': f"0.0 ± {Z_EXIT}",
             'stop_z': round(stop_z_level, 2),
@@ -459,7 +482,7 @@ def update_blotter(n, click):
             '_row_color': bg_color 
         })
 
-    # --- PROCESS CLOSED HISTORY ---
+    # --- CLOSED TRADES ---
     hist_df = all_trades[all_trades['status'] == 'CLOSED'].sort_values('close_ts', ascending=False)
     hist_data = []
     
@@ -477,7 +500,6 @@ def update_blotter(n, click):
             'reason': row['close_reason']
         })
 
-    # Column Definitions
     open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'curr_z', 'target_z', 'stop_z']
     open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
@@ -491,7 +513,7 @@ def update_blotter(n, click):
 
     return open_data, open_cols, style_cond, hist_data, hist_cols
 
-# 5. Modify Trade (Save BPs to DB)
+# 6. Modify Trade (PNL INTEGRITY FIX)
 @app.callback(
     Output('summary-content', 'children'), 
     Input('btn-close-trade', 'n_clicks'),
@@ -504,26 +526,43 @@ def update_blotter(n, click):
 def modify_trade(n_close, n_del, rows, data, reason):
     ctx = callback_context
     if not rows or not ctx.triggered: return dash.no_update
+    
     row_idx = rows[0]
-    trade_id = data[row_idx]['trade_id']
+    ui_row = data[row_idx]
+    trade_id = ui_row['trade_id']
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-    if button_id == "btn-delete-trade": delete_position(trade_id)
+    if button_id == "btn-delete-trade": 
+        delete_position(trade_id)
+        return "Trade Deleted"
+
     elif button_id == "btn-close-trade":
-        row = data[row_idx]
+        # RE-CALCULATE PNL ON THE MICROSECOND
+        all_pos = get_all_positions()
+        # Find exact row from DB to get raw entry fields
+        matches = all_pos[all_pos['trade_id'] == trade_id]
+        if matches.empty: return "Error: Trade Not Found"
         
-        # Pass breakdown to DataManager
-        c_dict = {'total': row['total_pnl'], 'price': row['price_pnl'], 'carry': row['carry_pnl'], 'roll': row['roll_pnl']}
-        b_dict = {'total': row['total_bp'], 'price': row['price_bp'], 'carry': row['carry_bp'], 'roll': row['roll_bp']}
+        original_trade = matches.iloc[0]
+        now_dt = datetime.now()
+        
+        # Calculate FRESH PnL
+        (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(
+            original_trade, feed.live_map, now_dt
+        )
+        
+        c_dict = {'total': c_tot, 'price': c_prc, 'carry': c_cry, 'roll': c_rol}
+        b_dict = {'total': b_tot, 'price': b_prc, 'carry': b_cry, 'roll': b_rol}
         
         update_position_status(
             trade_id, "CLOSED", reason or "manual", 
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            now_dt.strftime("%Y-%m-%d %H:%M:%S"), 
             pnl_cash=c_dict, pnl_bp=b_dict
         )
+        
     return "Action Complete"
 
-# 6. EOD Trigger
+# 7. EOD Trigger
 @app.callback(
     Output('btn-run-eod', 'children'),
     Input('btn-run-eod', 'n_clicks'),
@@ -585,16 +624,31 @@ def update_summary(n, close_trigger):
         "Trades": [len(all_trades[mask_mtd]), len(all_trades[mask_ytd]), len(all_trades)]
     }), striped=True, bordered=True, dark=True)
     
-    # Risk Profile
-    bucket_risk = {"Short (<2Y)": 0, "Belly (2-7Y)": 0, "Long (>7Y)": 0}
+    # NET vs GROSS RISK FIX
+    bucket_risk = {"Short (<2Y)": [0,0], "Belly (2-7Y)": [0,0], "Long (>7Y)": [0,0]}
+    
     for _, row in open_trades.iterrows():
         b_pay = assign_bucket(row['tenor_pay'])
         b_rec = assign_bucket(row['tenor_rec'])
-        bucket_risk[b_pay] += row['dv01']
-        bucket_risk[b_rec] += row['dv01']
+        dv = row['dv01']
         
-    risk_df = pd.DataFrame(list(bucket_risk.items()), columns=["Bucket", "Gross DV01"])
-    risk_table = dbc.Table.from_dataframe(risk_df, striped=True, bordered=True, dark=True)
+        # Pay = Short = Negative Net DV01
+        bucket_risk[b_pay][0] -= dv
+        bucket_risk[b_pay][1] += dv
+        
+        # Rec = Long = Positive Net DV01
+        bucket_risk[b_rec][0] += dv
+        bucket_risk[b_rec][1] += dv
+        
+    risk_data = []
+    for b, (net, gross) in bucket_risk.items():
+        risk_data.append({
+            "Bucket": b,
+            "Net DV01 (Dir)": f"{int(net/1000)}k", 
+            "Gross DV01 (Cap)": f"{int(gross/1000)}k"
+        })
+        
+    risk_table = dbc.Table.from_dataframe(pd.DataFrame(risk_data), striped=True, bordered=True, dark=True)
     
     return cards, time_table, risk_table
 
