@@ -35,7 +35,7 @@ if __name__ == "__main__":
     init_dbs()
     
     # 2. Start the feed
-    feed.start()
+    feed.start(log_to_db=True)
     
     # 3. Keep alive
     try:
