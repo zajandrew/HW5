@@ -1,7 +1,7 @@
 # feature_creation.py
 import os, sys, time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -193,16 +193,23 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 # -----------------------
 # Spline “shape” z (robust)
 # -----------------------
-def _spline_fit_safe(snap_long: pd.DataFrame) -> pd.Series:
+def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     """
     Per-bucket cross-section: fit low-order polynomial (cubic) to rate(tenor),
     z-score residuals using robust scale.
+    
+    Returns:
+       (z_scores_series, scale_value)
     """
     s = snap_long[["tenor_yrs", "rate"]].dropna()
     out = pd.Series(index=snap_long.index, dtype=float)
+    
+    # Default fallback for scale if fitting fails (e.g. 5bps)
+    # This prevents the Live Engine from blowing up if a bucket is empty
+    DEFAULT_SCALE = 0.05 
 
     if s.shape[0] < 5:
-        return out  # leave NaN
+        return out, DEFAULT_SCALE # leave NaN z-scores, return default scale
 
     x = s["tenor_yrs"].values.astype(float)
     y = s["rate"].values.astype(float)
@@ -218,15 +225,18 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> pd.Series:
         med = np.median(resid)
         mad = np.median(np.abs(resid - med))
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
+        
         if not np.isfinite(scale) or scale == 0:
-            return out
+            return out, DEFAULT_SCALE
 
         z = (resid - resid.mean()) / scale
         m = {ten: val for ten, val in zip(x, z)}
         out.loc[s.index] = s["tenor_yrs"].map(m).values
-        return out
+        
+        return out, scale
+        
     except Exception:
-        return out
+        return out, DEFAULT_SCALE
 
 
 # -----------------------
@@ -246,7 +256,7 @@ def _pca_fit_panel(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps:
     mu = X.mean(axis=0, keepdims=True)
     Xc = X - mu
     U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    comps = VT[:n_comps, :]           # (k, n_features)
+    comps = VT[:n_comps, :]            # (k, n_features)
     evr = (S**2) / (S**2).sum()
     return {"cols": list(W.columns), "mean": mu.ravel(), "components": comps, "evr": evr[:n_comps]}
 
@@ -268,9 +278,9 @@ def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
 
     # Last observation per tenor in this bucket
     last = (df_block.sort_values("ts")
-                     .groupby("tenor_yrs", as_index=False)
-                     .tail(1)
-                     .set_index("tenor_yrs")["rate"])
+                      .groupby("tenor_yrs", as_index=False)
+                      .tail(1)
+                      .set_index("tenor_yrs")["rate"])
     # Align to model cols (exact set + order)
     if any(c not in last.index for c in cols):
         # Missing a required tenor → skip PCA for this bucket
@@ -298,8 +308,10 @@ def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
 def _process_bucket(dts, df_bucket, df_all, lookback_days, pca_enable, pca_n_comps, yymm):
     out = df_bucket[["ts","tenor_yrs","rate"]].copy().reset_index(drop=True)
 
-    # 1) spline z
-    out["z_spline"] = _spline_fit_safe(out)
+    # 1) spline z + scale extraction (UPDATED)
+    z_spline, scale_val = _spline_fit_safe(out)
+    out["z_spline"] = z_spline
+    out["scale"] = scale_val # Broadcast scalar to the whole bucket
 
     # 2) PCA z (fit on lookback restricted to current columns)
     out["z_pca"] = np.nan
@@ -308,7 +320,7 @@ def _process_bucket(dts, df_bucket, df_all, lookback_days, pca_enable, pca_n_com
         if len(cols_now) >= pca_n_comps:
             t_end   = df_bucket["ts"].min()
             t_start = t_end - pd.Timedelta(days=float(lookback_days))
-            panel = df_all[(df_all["ts"]>=t_start) & (df_all["ts"]<t_end) &
+            panel = df_all[(df_all["ts"]>=t_start) & (df_all["ts"]<t_end) & 
                            (df_all["tenor_yrs"].isin(cols_now))]
             model = _pca_fit_panel(panel, cols_now, pca_n_comps)
             if model:
@@ -399,7 +411,7 @@ def build_month(yymm: str) -> None:
           f"| PCA={'on' if pca_enable else 'off'} | lookback_days={lookback_days} | comps={pca_components}{cap_str}")
 
     if not buckets:
-        pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb']).to_parquet(out_path, index=False)
+        pd.DataFrame(columns=['ts','tenor_yrs','rate','z_spline','z_pca','z_comb','scale']).to_parquet(out_path, index=False)
         print(f"[SAVE] {out_path}")
         return
 
