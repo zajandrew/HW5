@@ -169,7 +169,7 @@ def optimize_signal_construction():
     
     df_trades = pd.read_parquet(base_path)
     # Aggregated Daily PnL
-    pnl = df_trades.groupby(pd.to_datetime(df_trades["close_ts"]).dt.floor("D"))["pnl_net_bp"].sum()
+    pnl = df_trades.groupby(pd.to_datetime(df_trades["open_ts"]).dt.floor("D"))["pnl_net_bp"].sum()
     pnl.name = "next_day_pnl"
     
     best_score = -999.0
