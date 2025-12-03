@@ -38,6 +38,10 @@ N_JOBS = max(1, os.cpu_count() - 2)
 R1_TOP_PCT = 0.15         # Top 15% of N_ITER survive Round 1
 R2_TOP_PCT = 0.25         # Top 25% of Round 1 survivors survive Round 2
 
+# --- NEW: STATISTICAL SIGNIFICANCE GATE ---
+# Require a minimum number of trades to consider the result valid.
+MIN_TRADES_REQUIRED = 500
+
 # Checkpoint Filenames (Fixed names allow resumability)
 OUT_DIR = Path(cr.PATH_OUT)
 R1_FILE = OUT_DIR / "mc_checkpoint_r1.parquet"
@@ -164,29 +168,38 @@ def _worker_task(task_tuple):
             count = 0
             avg_daily = 0.0
         else:
-            pos["day"] = pos["close_ts"].dt.floor("D")
-            daily_series = pos.groupby("day")["pnl_net_bp"].sum()
-            daily_vals = daily_series.values
+            count = len(pos)
             
-            if len(daily_vals) < 10:
-                daily_t_stat = -10.0
-                avg_daily = daily_vals.mean() if len(daily_vals) > 0 else 0.0
+            # --- MINIMUM TRADE COUNT GATE ---
+            if count < MIN_TRADES_REQUIRED:
+                daily_t_stat = -10.0 # Discard
+                # Calculate avg daily just for logging reference, or 0.0
+                pos["day"] = pos["close_ts"].dt.floor("D")
+                avg_daily = pos.groupby("day")["pnl_net_bp"].sum().mean()
             else:
-                # Winsorize Left Tail (5%)
-                floor_val = np.percentile(daily_vals, 5)
-                clipped_vals = np.clip(daily_vals, a_min=floor_val, a_max=None)
+                # Sufficient trades -> Calculate robust stats
+                pos["day"] = pos["close_ts"].dt.floor("D")
+                daily_series = pos.groupby("day")["pnl_net_bp"].sum()
+                daily_vals = daily_series.values
                 
-                mu = clipped_vals.mean()
-                sigma = clipped_vals.std(ddof=1)
-                n_days = len(clipped_vals)
-                
-                if sigma < 1e-9:
-                    daily_t_stat = 0.0
+                if len(daily_vals) < 10:
+                    daily_t_stat = -10.0
+                    avg_daily = daily_vals.mean() if len(daily_vals) > 0 else 0.0
                 else:
-                    daily_t_stat = (mu / sigma) * np.sqrt(n_days)
-                
-                avg_daily = mu
-                count = len(pos)
+                    # Winsorize Left Tail (5%)
+                    floor_val = np.percentile(daily_vals, 5)
+                    clipped_vals = np.clip(daily_vals, a_min=floor_val, a_max=None)
+                    
+                    mu = clipped_vals.mean()
+                    sigma = clipped_vals.std(ddof=1)
+                    n_days = len(clipped_vals)
+                    
+                    if sigma < 1e-9:
+                        daily_t_stat = 0.0
+                    else:
+                        daily_t_stat = (mu / sigma) * np.sqrt(n_days)
+                    
+                    avg_daily = mu
 
     except Exception:
         daily_t_stat = -99.0
