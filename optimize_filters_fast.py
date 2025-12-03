@@ -340,104 +340,110 @@ def simulate_single_tape(params, signals, trades_df, resid_map):
 from numba import njit
 
 @njit(cache=True)
-def _numba_sim_core(
-    potential_pnl,    # array: float64 (daily aggregated pnl if no blocks)
-    sig_health,       # array: float64
-    sig_trend,        # array: float64
-    sig_xs,           # array: float64
-    resid_z,          # array: float64
-    min_health,       # float
-    max_trend,        # float
-    max_xs,           # float
-    shock_win,        # int
-    shock_raw_th,     # float
-    shock_resid_th,   # float
-    block_len         # int
+def _numba_sim_core_lagged(
+    n_days,             # Length of contiguous timeline
+    trade_pnl,          # Array of all trade PnLs (sorted by close date)
+    trade_open_idx,     # Array mapping each trade to its Open Day index
+    trade_close_idx,    # Array mapping each trade to its Close Day index
+    sig_health,         # Array: Signal Health aligned to timeline
+    sig_trend,          # Array: Signal Trend aligned to timeline
+    sig_xs,             # Array: Signal XS aligned to timeline
+    resid_z,            # Array: Residuals aligned to timeline
+    min_health, max_trend, max_xs,
+    shock_win, shock_raw_th, shock_resid_th, block_len
 ):
-    """
-    The JIT-compiled core logic. 
-    Iterates through the timeline checking regime & updating shock state.
-    """
-    n = len(potential_pnl)
-    realized_pnl = np.zeros(n, dtype=np.float64)
+    # 1. State Arrays
+    # accepted[t] = True if we allowed entries on day t
+    accepted = np.zeros(n_days, dtype=np.bool_)
     
-    # State variables
+    # We need a history of DAILY realized PnL for the shock calculation
+    daily_realized_history = np.zeros(n_days, dtype=np.float64)
+    
     block_rem = 0
+    trade_ptr = 0
+    n_trades = len(trade_pnl)
     
-    # To mimic the original logic: "len(shock_history) >= shock_win + 2"
-    # We need to build history as we go. realized_pnl acts as the history.
-    
-    for i in range(n):
-        # 1. Decrement Block
-        is_blocked = (block_rem > 0)
+    # 2. Iterate through the Timeline (Day by Day)
+    for t in range(n_days):
+        
+        # --- MORNING: Decision Phase (Entry Logic) ---
+        
+        # Decrement Block
         if block_rem > 0:
             block_rem -= 1
-            
-        # 2. Check Regime
-        # Original logic: defaults to True if signal missing (handled in prep).
-        # We assume 999.0 or similar safe values were filled for missing signals.
         
-        # Check thresholds
-        regime_ok = (sig_health[i] >= min_health) and \
-                    (sig_trend[i] <= max_trend) and \
-                    (np.abs(sig_xs[i]) <= max_xs)
+        # Check Regime for Day t (Can we enter TODAY?)
+        # Note: We assume signals are already shifted/aligned to be available at Open
+        regime_ok = (sig_health[t] >= min_health) and \
+                    (sig_trend[t] <= max_trend) and \
+                    (np.abs(sig_xs[t]) <= max_xs)
         
-        # 3. Realize PnL
-        # "If not blocked AND regime is ok"
-        current_val = 0.0
-        if (not is_blocked) and regime_ok:
-            current_val = potential_pnl[i]
+        # If not blocked and regime is good, mark today as a valid entry day
+        if (block_rem == 0) and regime_ok:
+            accepted[t] = True
             
-        realized_pnl[i] = current_val
+        # --- EVENING: Realization Phase (Exit Logic) ---
         
-        # 4. Update Shock Logic
-        # Condition: block_rem == 0 and len(history) >= shock_win + 2
-        # In array terms, we need i >= shock_win + 1
+        # Sum up PnL for all trades CLOSING today (t)
+        # But ONLY if their OPEN day (trade_open_idx) was 'accepted'
+        daily_sum = 0.0
         
-        if block_rem == 0 and i >= (shock_win + 1):
+        # While the pointer is on a trade that closes today...
+        while trade_ptr < n_trades and trade_close_idx[trade_ptr] == t:
             
-            # Slice the WINDOW (last 'shock_win' days INCLUDING today)
-            # Original code: recent = shock_history[-shock_win:]
-            # slice indices: from (i - shock_win + 1) to (i + 1)
+            entry_day = trade_open_idx[trade_ptr]
             
-            start_idx = i - shock_win + 1
-            end_idx = i + 1
+            # Boundary check + Acceptance check
+            if entry_day >= 0 and entry_day < n_days:
+                if accepted[entry_day]:
+                    daily_sum += trade_pnl[trade_ptr]
             
-            # Manual stats calculation is faster/safer in Numba loops than array calls sometimes,
-            # but numpy slice ops are supported.
-            window = realized_pnl[start_idx:end_idx]
+            trade_ptr += 1
             
-            # Compute Mean/Std
+        daily_realized_history[t] = daily_sum
+        
+        # --- NIGHT: Shock Update Phase ---
+        
+        # Update Shock Logic based on the history of REALIZED PnL
+        # We need at least 'shock_win' days of history relative to now
+        # logic: len(shock_history) >= shock_win + 2
+        # current index t corresponds to length t+1. So we need t+1 >= shock_win + 2
+        # implying t >= shock_win + 1
+        
+        if block_rem == 0 and t >= (shock_win + 1):
+            
+            # Slice the last 'shock_win' days of REALIZED PnL
+            # slice: t - shock_win + 1 to t + 1
+            start_i = t - shock_win + 1
+            end_i = t + 1
+            
+            # Manual Rolling Stats
             w_sum = 0.0
-            for k in range(shock_win):
-                w_sum += window[k]
+            for k in range(start_i, end_i):
+                w_sum += daily_realized_history[k]
             w_mean = w_sum / shock_win
             
             w_var = 0.0
-            for k in range(shock_win):
-                diff = window[k] - w_mean
-                w_var += diff * diff
+            for k in range(start_i, end_i):
+                d = daily_realized_history[k] - w_mean
+                w_var += d*d
             w_std = np.sqrt(w_var / shock_win)
             
-            # 4a. Raw PnL Shock
+            # 1. Raw Shock
             if w_std > 1e-9:
-                z = (current_val - w_mean) / w_std
+                z = (daily_sum - w_mean) / w_std
                 if z <= shock_raw_th:
                     block_rem = block_len
             
-            # 4b. Residual Shock (only if not already blocked by Raw)
+            # 2. Residual Shock
             if block_rem == 0:
-                # Use pre-aligned residual array
-                rz = resid_z[i] 
-                if rz <= shock_resid_th:
+                # Use residual z-score pre-calculated for day t
+                if resid_z[t] <= shock_resid_th:
                     block_rem = block_len
-                    
-    return realized_pnl
 
-def simulate_single_tape_numba(params, signals, trades_df, resid_map):
-    """
-    Drop-in replacement. Prepares numpy arrays and calls Numba kernel.
-    """
+    return daily_realized_history
+
+def simulate_single_tape(params, signals, trades_df, resid_map):
     # 1. Unpack Params
     min_health = float(params["MIN_SIGNAL_HEALTH_Z"])
     max_trend = float(params["MAX_TRENDINESS_ABS"])
@@ -448,48 +454,53 @@ def simulate_single_tape_numba(params, signals, trades_df, resid_map):
     shock_resid_th = float(params["SHOCK_RESID_Z_THRESH"])
     block_len = int(params["SHOCK_BLOCK_LENGTH"])
 
-    # 2. Align Data to Daily Timeline
-    # We aggregate ALL potential trades by close_date first
-    daily_potential = trades_df.groupby("close_date")["pnl_net_bp"].sum()
-    all_dates = daily_potential.index.sort_values()
+    # 2. Build Contiguous Timeline (Min Open to Max Close)
+    # This fixes the "Quiet Day" bug in the original code where Open dates 
+    # that weren't also Close dates might have been skipped.
+    min_date = min(trades_df["open_date"].min(), trades_df["close_date"].min())
+    max_date = trades_df["close_date"].max()
+    timeline = pd.date_range(min_date, max_date, freq="D")
     
-    # 3. Create Aligned Arrays (The Vectorization Prep)
-    # Reindex signals to match the trade dates perfectly
-    # Fill defaults to ensure "True" behavior if signal is missing (passable values)
+    # Map dates to Integers (0 to N)
+    date_to_idx = {d: i for i, d in enumerate(timeline)}
+    n_days = len(timeline)
+
+    # 3. Prepare Trade Arrays (Sorted by CLOSE date)
+    # We must sort trades by close date to let the 'trade_ptr' work linearly
+    df_sorted = trades_df.sort_values("close_date").copy()
     
-    # We grab the signals that exist on these dates
-    sig_aligned = signals.reindex(all_dates)
+    # Map trade dates to indices
+    # We use .map for speed, filling -1 for out-of-bounds (safety)
+    open_idxs = df_sorted["open_date"].map(date_to_idx).fillna(-1).values.astype(np.int32)
+    close_idxs = df_sorted["close_date"].map(date_to_idx).fillna(-1).values.astype(np.int32)
+    pnl_vals = df_sorted["pnl_net_bp"].values.astype(np.float64)
     
-    # Default values that will PASS the check if data is NaN:
-    # Health: 999 (High is good)
-    # Trend: 0 (Low is good)
-    # XS: 0 (Low is good)
+    # 4. Align Signals to Timeline
+    # Reindex signals to the full continuous timeline
+    sig_aligned = signals.reindex(timeline)
+    
+    # Fill NaNs with "Passable" values so we don't block on missing data
     arr_health = sig_aligned["signal_health_z"].fillna(999.0).values.astype(np.float64)
     arr_trend = sig_aligned["trendiness_abs"].fillna(0.0).values.astype(np.float64)
     arr_xs = sig_aligned["z_xs_mean_roll_z"].fillna(0.0).values.astype(np.float64)
     
-    # Resid Map alignment
-    # resid_map is Dict[Timestamp, float]. Convert to array aligned with all_dates.
-    # Default residual Z to 0.0 (neutral) if missing.
-    arr_resid = np.array([resid_map.get(d, 0.0) for d in all_dates], dtype=np.float64)
+    # Align Residuals
+    arr_resid = np.array([resid_map.get(d, 0.0) for d in timeline], dtype=np.float64)
     
-    # PnL Array
-    arr_pnl_potential = daily_potential.values.astype(np.float64)
-
-    # 4. Run Numba Kernel
-    realized_pnl = _numba_sim_core(
-        arr_pnl_potential, arr_health, arr_trend, arr_xs, arr_resid,
+    # 5. Run Numba Kernel
+    realized_daily_pnl = _numba_sim_core_lagged(
+        n_days, pnl_vals, open_idxs, close_idxs,
+        arr_health, arr_trend, arr_xs, arr_resid,
         min_health, max_trend, max_xs,
         shock_win, shock_raw_th, shock_resid_th, block_len
     )
     
-    # 5. Calculate Metrics
-    total_pnl = np.sum(realized_pnl)
+    # 6. Calc Metrics
+    total_pnl = np.sum(realized_daily_pnl)
     
-    # Sortino Logic
-    # We define downside deviation on the Daily Realized PnL series
-    avg_daily = np.mean(realized_pnl)
-    downside = realized_pnl[realized_pnl < 0]
+    # Sortino (on daily realized series)
+    avg_daily = np.mean(realized_daily_pnl)
+    downside = realized_daily_pnl[realized_daily_pnl < 0]
     
     sortino = 0.0
     if len(downside) > 0:
