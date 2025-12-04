@@ -17,6 +17,54 @@ import hybrid_filter as hf
 # ------------------------
 Path(getattr(cr, "PATH_OUT", ".")).mkdir(parents=True, exist_ok=True)
 
+def calc_trade_drift(tenor, direction, snap_last):
+    """
+    Estimates Daily Drift (Carry + Rolldown) in Basis Points of Price (BP) per unit of DV01.
+    
+    Args:
+        tenor (float): The tenor of the swap (e.g., 7.0).
+        direction (float): +1.0 for Receiver, -1.0 for Payer.
+        snap_last (pd.DataFrame): The daily curve snapshot.
+        
+    Returns:
+        float: Expected Daily PnL in BPs (normalized to 1 unit of DV01).
+               If > 0, the trade has positive drift.
+    """
+    # 1. Get Data
+    row = snap_last.loc[snap_last["tenor_yrs"] == tenor]
+    if row.empty: return -999.0
+    
+    rate_fixed = float(row["rate"])
+    # Uses 1M or shortest tenor available as funding proxy
+    rate_float = _get_funding_rate(snap_last) 
+    
+    # 2. Rolldown Setup (Linear Interpolation for speed)
+    # We roll down 1 day (1/360)
+    day_fraction = 1.0 / 360.0
+    t_roll = max(0.0, tenor - day_fraction)
+    
+    xp = snap_last["tenor_yrs"].values
+    fp = snap_last["rate"].values
+    
+    # Simple linear interp is sufficient for pre-calc ranking
+    rate_rolled = np.interp(t_roll, xp, fp)
+    
+    # 3. Calculate Components 
+    # Carry PnL per unit DV01 = (Fixed - Float) * 100 * (1/360)
+    raw_carry_bps = (rate_fixed - rate_float) * 100.0 * day_fraction
+    
+    # Roll PnL per unit DV01 = (CurrentRate - RolledRate) * 100
+    # Note: No time fraction here because rate change IS the price change.
+    raw_roll_bps = (rate_fixed - rate_rolled) * 100.0
+    
+    # 4. Apply Direction (The Payer/Receiver Switch)
+    # If Payer (-1): 
+    #   Carry becomes (Float - Fixed) -> Positive if Inverted
+    #   Roll becomes (Rolled - Current) -> Positive if Inverted (Rate rises, Price falls)
+    total_drift_bps = (raw_carry_bps + raw_roll_bps) * direction
+    
+    return total_drift_bps
+
 def _to_float(x, default=np.nan):
     """Safe scalar float extraction."""
     try:
@@ -757,26 +805,32 @@ def run_month(
             
             snap_srt = snap_last.sort_values("tenor_yrs").reset_index(drop=True)
             
+            # --- NEW ARGS ---
+            DRIFT_GATE = float(getattr(cr, "DRIFT_GATE_BPS", -100.0)) 
+            DRIFT_W = float(getattr(cr, "DRIFT_WEIGHT", 0.0)) 
+
             for _, h in h_here.iterrows():
                 if len(open_positions) >= cr.MAX_CONCURRENT_PAIRS: break
                 t_trade = float(h["tenor_yrs"])
                 
-                # --- Granular Checks ---
+                # --- Granular Checks (UNCHANGED) ---
                 if t_trade < EXEC_LEG_THRESHOLD: continue
                 if abs(float(h["dv01"])) > _per_trade_dv01_cap_for_bucket(assign_bucket(t_trade)): continue
 
                 side_s = 1.0 if str(h["side"]).upper() == "CRCV" else -1.0
                 z_ent_eff = _overlay_effective_z_entry(float(h["dv01"]))
+                
                 exec_z = _get_z_at_tenor(snap_srt, t_trade)
                 if exec_z is None: continue
                 exec_row = snap_srt.iloc[(snap_srt["tenor_yrs"] - t_trade).abs().idxmin()]
                 exec_tenor = float(exec_row["tenor_yrs"])
 
-                best_c, best_z = None, 0.0
+                best_c_row, best_score = None, -999.0
+
                 for _, alt in snap_srt.iterrows():
                     alt_tenor = float(alt["tenor_yrs"])
                     
-                    # --- Alt Checks ---
+                    # --- Alt Checks (UNCHANGED) ---
                     if alt_tenor < ALT_LEG_THRESHOLD: continue
                     if alt_tenor == exec_tenor: continue 
                     if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
@@ -791,18 +845,26 @@ def run_month(
                     c_t, r_t = (alt_tenor, exec_tenor) if z_alt > exec_z else (exec_tenor, alt_tenor)
                     if not (fly_alignment_ok(c_t, 1, snap_srt, zdisp_for_pair=disp) and fly_alignment_ok(r_t, -1, snap_srt, zdisp_for_pair=disp)): continue
                     
-                    if disp > best_z: best_z, best_c = disp, alt
+                    # --- NEW LOGIC START ---
+                    drift_bps = calc_trade_drift(alt_tenor, side_s, snap_srt)
+                    if drift_bps < DRIFT_GATE: continue
+                    
+                    score = disp + (drift_bps * DRIFT_W)
+                    if score > best_score: 
+                        best_score, best_c_row = score, alt
+                    # --- NEW LOGIC END ---
                 
-                if best_c is not None:
+                if best_c_row is not None:
+                    # --- Trade Construction (UNCHANGED) ---
                     rate_i, rate_j = None, None
-                    ti, tj = tenor_to_ticker(float(best_c["tenor_yrs"])), tenor_to_ticker(t_trade)
+                    ti, tj = tenor_to_ticker(float(best_c_row["tenor_yrs"])), tenor_to_ticker(t_trade)
                     if ti and f"{ti}_mid" in h: rate_i = _to_float(h[f"{ti}_mid"])
                     if tj and f"{tj}_mid" in h: rate_j = _to_float(h[f"{tj}_mid"])
                     
-                    if rate_i is None: rate_i = _to_float(best_c["rate"])
+                    if rate_i is None: rate_i = _to_float(best_c_row["rate"])
                     if rate_j is None: rate_j = _to_float(exec_row["rate"])
 
-                    pos = PairPos(dts, best_c, exec_row, side_s*1.0, side_s*-1.0, decisions_per_day, 
+                    pos = PairPos(dts, best_c_row, exec_row, side_s*1.0, side_s*-1.0, decisions_per_day, 
                                   scale_dv01=float(h["dv01"]), mode="overlay", 
                                   meta={"trade_id": h.get("trade_id"), "side": h.get("side")},
                                   entry_rate_i=rate_i, entry_rate_j=rate_j)
