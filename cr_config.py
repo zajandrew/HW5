@@ -77,6 +77,8 @@ Z_EXIT        = 0.75     # take profit when |z-spread| <= Z_EXIT
 Z_STOP        = 1.00     # stop if divergence since entry >= Z_STOP
 BPS_PNL_STOP = 0.00
 MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
+DRIFT_GATE_BPS = -0.5
+DRIFT_WEIGHT = 0.2
 
 # ========= Safety: The "20% Rule" =========
 # We enforce that Tenor >= 5x Holding Period to ensure linear decay assumptions hold.
