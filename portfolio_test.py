@@ -358,7 +358,6 @@ def choose_pairs_under_caps(snap_last, max_pairs, per_bucket_cap, total_cap, fro
     low_take, high_take = min(5, len(sig)), min(8, len(sig))
     
     MIN_SEP = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-    MAX_SPAN = float(getattr(cr, "MAX_SPAN_YEARS", 10))
     Z_ENT = float(getattr(cr, "Z_ENTRY", 0.75))
     SHORT_EXTRA = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
     # Use ALT_LEG_TENOR_YEARS as floor for Mode A
@@ -371,7 +370,11 @@ def choose_pairs_under_caps(snap_last, max_pairs, per_bucket_cap, total_cap, fro
             Ti, Tj = float(cheap["tenor_yrs"]), float(rich["tenor_yrs"])
             if Ti in used or Tj in used: continue
             if (Ti < MIN_TEN) or (Tj < MIN_TEN): continue
-            if abs(Ti - Tj) < MIN_SEP or abs(Ti - Tj) > MAX_SPAN: continue
+            if abs(Ti - Tj) < MIN_SEP: continue
+            b1_idx = next(i for i, b in enumerate(config.buckets) if Ti <= b)
+            b2_idx = next(i for i, b in enumerate(config.buckets) if Tj <= b)
+            is_valid_topology = (min(b1_idx, b2_idx) > 0) or (max(b1_idx, b2_idx) <= 2)
+            if not is_valid_topology: continue
             
             zdisp = float(cheap["z_comb"] - rich["z_comb"])
             if zdisp < (Z_ENT + extra_z_entry): continue
@@ -536,7 +539,6 @@ def run_month(
     EXEC_LEG_THRESHOLD = float(getattr(cr, "EXEC_LEG_TENOR_YEARS", 0.084))
     ALT_LEG_THRESHOLD  = float(getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0))
     MIN_SEP_YEARS = float(getattr(cr, "MIN_SEP_YEARS", 0.5))
-    MAX_SPAN_YEARS = float(getattr(cr, "MAX_SPAN_YEARS", 10.0))
     
     SHORT_EXTRA = SHORT_END_EXTRA_Z 
 
@@ -833,8 +835,13 @@ def run_month(
                     # --- Alt Checks (UNCHANGED) ---
                     if alt_tenor < ALT_LEG_THRESHOLD: continue
                     if alt_tenor == exec_tenor: continue 
-                    if not (MIN_SEP_YEARS <= abs(alt_tenor - exec_tenor) <= MAX_SPAN_YEARS): continue
-                    
+                    # 1. Determine bucket indices for both tenors (t1, t2)
+                    # Returns 0 for Short, 1 for Front, 2 for Belly, 3 for Long
+                    b1_idx = next(i for i, b in enumerate(config.buckets) if alt_tenor <= b)
+                    b2_idx = next(i for i, b in enumerate(config.buckets) if exec_tenor <= b)
+                    is_valid_topology = (min(b1_idx, b2_idx) > 0) or (max(b1_idx, b2_idx) <= 2)
+                    if not is_valid_topology: continue
+                                        
                     z_alt = _to_float(alt["z_comb"])
                     disp = (z_alt - exec_z) if side_s > 0 else (exec_z - z_alt)
                     if disp < z_ent_eff: continue
