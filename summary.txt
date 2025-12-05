@@ -139,3 +139,122 @@ We did not just test on historical data. We generated **10 Parallel Universes** 
 The strategy configuration was required to remain profitable across *all* 10 synthetic universes to be considered valid.
 * **Finding:** The optimization process revealed a strong preference for **High Drift Weight**.
 * **Conclusion:** The most robust version of this strategy is not pure statistical arbitrage; it is a **Systematic Carry Strategy** that uses statistical Z-Scores to time the entry points. This confirms that "Time" and "Carry" are the primary drivers of Alpha, providing a high degree of confidence in the strategy's economic viability.
+
+
+This document provides a functional and architectural overview of the **Systematic Curve Overlay: Live Decision Support System (DSS)**.
+
+It is intended for Trading Leadership, Product Heads, and the Risk Committee to understand how the strategy is deployed operationally, how it ensures consistency with research, and how it fits into the desk's workflow.
+
+---
+
+# Systematic Curve Overlay: Live Decision Support System
+**Operational Architecture & User Guide**
+
+## 1. Executive Summary
+
+The Live DSS is the "Cockpit" for the Systematic Curve Overlay strategy. It is a web-based dashboard that sits on the trader's desktop, providing real-time scanning, signal generation, and performance tracking.
+
+**Primary Mandate:**
+To bridge the gap between **Historical Research** and **Live Markets**. It translates the complex statistical models (Splines, PCA, Drift Analysis) into simple, actionable visual signals (Green/Red indicators) in real-time.
+
+**Operational Role:**
+The system functions strictly as **Decision Support**, not Auto-Execution.
+* **The System:** Identifies the opportunity, validates the math, and calculates the "Drift" (Cost of Carry).
+* **The Trader:** Validates the liquidity, checks the macro context, and physically executes the trade in the market.
+
+---
+
+## 2. Core Philosophy: The "Shared Kernel"
+
+A common point of failure in quantitative trading is **"Strategy Drift,"** where the code running in the live app differs slightly from the code used in the backtest (e.g., different rounding, different funding assumptions).
+
+We have eliminated this risk via a **Shared Kernel Architecture**.
+* **One Codebase:** The Live App imports the *exact same* mathematical libraries (`portfolio_test.py`, `feature_creation.py`) used in our 10-year backtests.
+* **Consistency:** When the dashboard displays a **Z-Score of 2.0** or a **Drift of +0.5 bps**, it is calculated using the identical logic that validated the strategy historically. There is zero "translation error" between research and production.
+
+
+
+---
+
+## 3. Functional Walkthrough
+
+The Dashboard is divided into four strategic views, mirroring the lifecycle of a trade.
+
+### Tab 1: The Ticker Scanner (The Radar)
+This is the default view. It displays the entire USD SOFR Swap curve as a grid of "Cards."
+* **Visual Logic:**
+    * **Green Border:** The tenor is statistically "Cheap" (High Z-Score).
+    * **Red Border:** The tenor is statistically "Rich" (Low Z-Score).
+    * **Drift Indicator:** Explicitly shows the **Daily Carry + Rolldown** in basis points.
+        * *Green Text:* Positive Carry (Paid to wait).
+        * *Red Text:* Negative Carry (Bleeding value).
+* **Smart Disable:** If the **Regime Filter** (Safety Layer) detects a market crash or curve break, the entire grid "Grays Out," physically preventing the trader from generating new signals until the market stabilizes.
+
+### Tab 2: The Blotter (Active Management)
+Once a trade is entered, it moves here. Unlike standard risk systems which only show "Mark-to-Market," this Blotter breaks down **Where the money is coming from**:
+* **Price PnL:** Profit from the yield curve moving in our favor.
+* **Carry PnL:** Interest income accrued from the coupon spread.
+* **Roll PnL:** Capital gains from the bond "rolling down" the curve.
+* **Composite Score:** Displays the live "Quality" of the trade ($Z\_Score + Weight \times Drift$). The trader can see if a position is degrading *before* it hits a stop loss.
+
+### Tab 3: Performance Analytics
+A real-time dashboard for the Group Head to monitor strategy health.
+* **Attribution Charts:** Bar charts showing the daily contribution of Price vs. Carry.
+* **Risk Profile:** A breakdown of **Net DV01** (Directional Risk) vs. **Gross DV01** (Capital Usage) by bucket (Short/Belly/Long).
+* **Toggle Views:** Allows viewing PnL in **Cash ($)** for accounting or **Basis Points (bps)** for relative value analysis.
+
+### Tab 4: System Health (The "Check Engine" Light)
+Transparency into *why* the system might be blocking trades.
+* **Signal Health:** Is the PCA model fitting the curve well, or is the market chaotic?
+* **Trendiness:** Is the market in a violent directional move (unsafe for mean reversion)?
+
+---
+
+## 4. The "Dual-Loop" Engine: How It Works
+
+The system solves the problem of "Flickering Signals" (where a trade looks good one second and bad the next due to noise) by using a **Dual-Loop Architecture**.
+
+### Loop A: The Morning Calibration (07:01 AM)
+* **Event:** Every morning at 07:01 AM, an automated scheduler wakes up.
+* **Action:** It takes a high-resolution snapshot of the market open.
+* **Result:** It builds the "Statistical Ruler" (Splines/PCA) for the day. This model is **Frozen**.
+* *Why:* This ensures that a trade executed at 2:00 PM is measured against the stable morning benchmark, not a moving target.
+
+### Loop B: The Live Feed (Real-Time)
+* **Event:** Every 2 seconds, the app ingests live market ticks.
+* **Action:** It projects the *Live Price* onto the *Frozen Morning Model*.
+* **Calculation:**
+    1.  Calculates **Live Z-Score** (Rich/Cheap).
+    2.  Calculates **Live Drift** (Carry/Roll based on current pricing).
+    3.  Updates the **Composite Score**.
+* **Result:** The trader sees real-time opportunities without the noise of a recalibrating model.
+
+---
+
+## 5. Execution Workflow & Governance
+
+This tool is designed to fit into the firm's existing execution and risk framework.
+
+### The "Suggest, Don't Act" Protocol
+1.  **Trigger:** The trader identifies a client need (e.g., "Client wants to Pay Fixed 10Y").
+2.  **Consult:** The trader checks the App. The App highlights that the **10Y is Rich** (Red) but the **12Y is Cheap** (Green).
+3.  **Analysis:** The trader clicks "Pay 12Y". The App calculates the **Composite Score**, verifying that the 12Y has positive carry and statistically reverts to the 10Y.
+4.  **Execution:** The trader **manually executes** the trade in the market (e.g., Bloomberg/Tradeweb).
+5.  **Recording:** The trader clicks "Execute" in the App. This creates a "Shadow Record" in the DSS database.
+
+### Risk Systems & PnL Accounting
+It is critical to distinguish between the **DSS (Decision Support System)** and the **Enterprise Risk System (ERS)**.
+
+* **The DSS (This App):** Tracks PnL "More or Less." It uses simplified funding assumptions (e.g., Shortest Tenor = Funding Cost) to provide real-time estimates and attribution. It is used for *Strategy Validation*.
+* **The ERS (Official):** The trade booked in the market flows into the Bank's official Risk System. **The ERS is the source of truth for PnL, VaR, and Counterparty Risk.**
+    * *Note:* The DSS does *not* send trades to the ERS. Reconciliation is done end-of-day.
+
+---
+
+## 6. Data Integrity & Auditing
+
+The system maintains a rigorous audit trail for post-trade analysis.
+
+* **The Recorder:** A background process runs 24/7, capturing every market tick. This allows us to "replay" the market later to investigate why a specific signal was generated.
+* **The Trade Blotter:** Stores a permanent record of *why* we entered a trade (Entry Z, Entry Drift, Model Health at time of trade).
+* **Morning Batch:** The daily 7:01 AM recalibration is logged and saved, allowing Risk Management to audit the model parameters for any specific historical date.
