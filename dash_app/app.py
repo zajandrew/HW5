@@ -624,120 +624,157 @@ def run_eod_batch(n):
     eod_process.run_eod_main()
     return "Batch Completed"
 
-# --- SUMMARY & HEALTH ---
 @app.callback(
     Output('summary-cards', 'children'),
-    Output('time-stats-container', 'children'),
+    Output('chart-cumulative-pnl', 'figure'),
+    Output('chart-attribution', 'figure'),
+    Output('stats-table-container', 'children'),
     Output('risk-profile-container', 'children'),
     Input('slow-interval', 'n_intervals'),
+    Input('pnl-unit-toggle', 'value'),
+    Input('time-filter', 'value'),
     Input('btn-close-trade', 'n_clicks')
 )
-def update_summary(n, close_trigger):
+def update_enhanced_summary(n, unit, time_filter, close_trig):
     all_trades = get_all_positions()
-    if all_trades.empty: return [], "No Data", "No Data"
+    if all_trades.empty: 
+        empty_fig = go.Figure().update_layout(template='plotly_dark')
+        return [], empty_fig, empty_fig, "No Data", "No Data"
     
-    closed = all_trades[all_trades['status'] == 'CLOSED']
-    open_trades = all_trades[all_trades['status'] == 'OPEN']
+    # 1. Unit Selection (Cash vs Bps)
+    is_cash = (unit == 'cash')
+    col_map = {
+        'tot': 'realized_pnl_cash' if is_cash else 'realized_pnl_bp',
+        'prc': 'realized_pnl_price' if is_cash else 'realized_pnl_price_bp',
+        'cry': 'realized_pnl_carry' if is_cash else 'realized_pnl_carry_bp',
+        'rol': 'realized_pnl_roll' if is_cash else 'realized_pnl_roll_bp'
+    }
+    fmt = "${:,.0f}" if is_cash else "{:,.1f} bp"
     
-    c_tot, c_prc, c_cry, c_rol = aggregate_pnl_columns(closed)
+    # 2. Time Filtering
+    all_trades['dt'] = pd.to_datetime(all_trades['open_ts'])
+    now = datetime.now()
     
-    # Approx live PnL for Open Trades
+    if time_filter == '1M':
+        start_date = now - timedelta(days=30)
+    elif time_filter == '3M':
+        start_date = now - timedelta(days=90)
+    elif time_filter == 'YTD':
+        start_date = datetime(now.year, 1, 1)
+    else:
+        start_date = datetime(1900, 1, 1)
+        
+    df_filtered = all_trades[all_trades['dt'] >= start_date].copy()
+    
+    # 3. Cards (Closed Trades Only for PnL)
+    closed = df_filtered[df_filtered['status'] == 'CLOSED']
+    
+    def sum_col(c): return closed[c].sum() if not closed.empty else 0
+    
+    # Add Open PnL if needed? Usually summary focuses on Realized for charts, but Total for cards.
+    # Let's stick to realized for charts, Total for Top Card.
+    
+    c_tot = sum_col(col_map['tot'])
+    
+    # Open PnL (Approx)
+    open_trades = df_filtered[df_filtered['status'] == 'OPEN']
     o_tot = 0
-    now_dt = datetime.now()
     for _, row in open_trades.iterrows():
-        (ct,_,_,_),_ = le.calculate_live_pnl(row, feed.live_map, now_dt)
-        o_tot += ct
+        (c_cash, _, _, _), (c_bp, _, _, _) = le.calculate_live_pnl(row, feed.live_map, now)
+        o_tot += c_cash if is_cash else c_bp
         
     grand_total = c_tot + o_tot
     
-    def make_card(title, value, color="primary"):
-        return dbc.Card([dbc.CardBody([html.H6(title, className="card-title"), html.H4(value, className=f"text-{color}")])], style={"width": "180px"})
-
     cards = [
-        make_card("Total PnL", f"${grand_total:,.0f}", "success" if grand_total >=0 else "danger"),
-        make_card("Realized Price", f"${c_prc:,.0f}", "info"),
-        make_card("Realized Carry", f"${c_cry:,.0f}", "warning"),
-        make_card("Realized Roll", f"${c_rol:,.0f}", "warning"),
+        dbc.Card([dbc.CardBody([html.H6("Total PnL (Net)", className="card-title"), html.H4(fmt.format(grand_total), className="text-success" if grand_total>=0 else "text-danger")])], style={"width": "180px"}),
+        dbc.Card([dbc.CardBody([html.H6("Realized Price", className="card-title"), html.H4(fmt.format(sum_col(col_map['prc'])), className="text-info")])], style={"width": "180px"}),
+        dbc.Card([dbc.CardBody([html.H6("Realized Carry", className="card-title"), html.H4(fmt.format(sum_col(col_map['cry'])), className="text-warning")])], style={"width": "180px"}),
+        dbc.Card([dbc.CardBody([html.H6("Realized Roll", className="card-title"), html.H4(fmt.format(sum_col(col_map['rol'])), className="text-warning")])], style={"width": "180px"}),
     ]
     
-    # Time Stats
-    now = datetime.now()
-    all_trades['dt'] = pd.to_datetime(all_trades['open_ts'])
-    mask_mtd = (all_trades['dt'].dt.month == now.month) & (all_trades['dt'].dt.year == now.year)
-    mask_ytd = (all_trades['dt'].dt.year == now.year)
-    
-    def calc_stat_pnl(mask):
-        sub = all_trades[mask & (all_trades['status']=='CLOSED')]
-        return sub['realized_pnl_cash'].sum()
+    # 4. Charts (Daily Aggregation)
+    if not closed.empty:
+        closed['day'] = pd.to_datetime(closed['close_ts']).dt.floor('D')
+        daily = closed.groupby('day')[[col_map['tot'], col_map['prc'], col_map['cry'], col_map['rol']]].sum().reset_index()
+        daily = daily.sort_values('day')
+        daily['cum_pnl'] = daily[col_map['tot']].cumsum()
+        
+        # Chart 1: Cumulative
+        fig_cum = px.line(daily, x='day', y='cum_pnl', title="Cumulative Realized PnL", template='plotly_dark')
+        fig_cum.update_traces(line_color='#00FF00', line_width=3)
+        
+        # Chart 2: Attribution
+        fig_attr = go.Figure()
+        fig_attr.add_trace(go.Bar(x=daily['day'], y=daily[col_map['prc']], name='Price', marker_color='#1E90FF'))
+        fig_attr.add_trace(go.Bar(x=daily['day'], y=daily[col_map['cry']], name='Carry', marker_color='#FFD700'))
+        fig_attr.add_trace(go.Bar(x=daily['day'], y=daily[col_map['rol']], name='Roll', marker_color='#FFA500'))
+        fig_attr.update_layout(barmode='relative', title="Daily PnL Attribution", template='plotly_dark')
+    else:
+        fig_cum = go.Figure().update_layout(template='plotly_dark', title="No Closed Trades")
+        fig_attr = go.Figure().update_layout(template='plotly_dark', title="No Closed Trades")
 
-    time_table = dbc.Table.from_dataframe(pd.DataFrame({
-        "Period": ["Month to Date", "Year to Date", "All Time"],
-        "Realized PnL": [f"${calc_stat_pnl(mask_mtd):,.0f}", f"${calc_stat_pnl(mask_ytd):,.0f}", f"${c_tot:,.0f}"],
-        "Trades": [len(all_trades[mask_mtd]), len(all_trades[mask_ytd]), len(all_trades)]
-    }), striped=True, bordered=True, dark=True)
+    # 5. Stats Table
+    stats_data = {
+        "Metric": ["Trades Executed", "Win Rate", "Avg Trade", "Best Trade", "Worst Trade"],
+        "Value": [
+            len(closed),
+            f"{(len(closed[closed[col_map['tot']] > 0]) / len(closed) * 100):.1f}%" if len(closed)>0 else "N/A",
+            fmt.format(closed[col_map['tot']].mean()) if not closed.empty else "N/A",
+            fmt.format(closed[col_map['tot']].max()) if not closed.empty else "N/A",
+            fmt.format(closed[col_map['tot']].min()) if not closed.empty else "N/A",
+        ]
+    }
+    stats_table = dbc.Table.from_dataframe(pd.DataFrame(stats_data), striped=True, bordered=True, dark=True)
     
-    # Risk
-    bucket_risk = {"Short (<2Y)": [0,0], "Belly (2-7Y)": [0,0], "Long (>7Y)": [0,0]}
-    
-    for _, row in open_trades.iterrows():
-        b_pay = assign_bucket(row['tenor_pay'])
-        b_rec = assign_bucket(row['tenor_rec'])
-        dv = row['dv01']
-        
-        bucket_risk[b_pay][0] -= dv
-        bucket_risk[b_pay][1] += dv
-        
-        bucket_risk[b_rec][0] += dv
-        bucket_risk[b_rec][1] += dv
-        
+    # 6. Risk Profile
     risk_data = []
-    for b, (net, gross) in bucket_risk.items():
-        risk_data.append({
-            "Bucket": b,
-            "Net DV01 (Dir)": f"{int(net/1000)}k", 
-            "Gross DV01 (Cap)": f"{int(gross/1000)}k"
-        })
+    bucket_risk = {"Short": [0,0], "Belly": [0,0], "Long": [0,0]}
+    for _, row in open_trades.iterrows():
+        b_pay, b_rec = assign_bucket(row['tenor_pay']).split()[0], assign_bucket(row['tenor_rec']).split()[0]
+        dv = row['dv01']
+        bucket_risk[b_pay][0] -= dv; bucket_risk[b_pay][1] += dv
+        bucket_risk[b_rec][0] += dv; bucket_risk[b_rec][1] += dv
         
+    for b, (net, gross) in bucket_risk.items():
+        risk_data.append({"Bucket": b, "Net DV01": f"{int(net/1000)}k", "Gross DV01": f"{int(gross/1000)}k"})
     risk_table = dbc.Table.from_dataframe(pd.DataFrame(risk_data), striped=True, bordered=True, dark=True)
     
-    return cards, time_table, risk_table
+    return cards, fig_cum, fig_attr, stats_table, risk_table
 
 @app.callback(
+    Output('chart-signal-health', 'figure'),
     Output('health-cards', 'children'),
     Output('tbl-signal-history', 'data'),
     Output('tbl-signal-history', 'columns'),
     Input('slow-interval', 'n_intervals')
 )
-def update_health(n):
+def update_health_charts(n):
     signals = hf.get_or_build_hybrid_signals()
-    if signals.empty: return [], [], []
+    if signals.empty: return go.Figure(), [], [], []
+    
+    # Chart
+    recent_sig = signals.tail(60).copy()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=recent_sig['decision_ts'], y=recent_sig['signal_health_z'], name="Health Z", line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=recent_sig['decision_ts'], y=recent_sig['trendiness_abs'], name="Trendiness", line=dict(color='red', dash='dot')))
+    fig.add_hline(y=cr.MIN_SIGNAL_HEALTH_Z, line_color="white", annotation_text="Health Limit")
+    fig.update_layout(template='plotly_dark', title="Regime History (Last 60 Days)", yaxis_title="Z-Score")
+    
+    # Cards
     last = signals.iloc[-1]
-    
     metrics = {
-        "Signal Health (Z)": (last.get('signal_health_z', -99), cr.MIN_SIGNAL_HEALTH_Z, "gt"),
-        "Trendiness (Abs)": (last.get('trendiness_abs', 0), cr.MAX_TRENDINESS_ABS, "lt"),
-        "Curve Mean (Z)": (last.get('z_xs_mean_roll_z', 0), cr.MAX_Z_XS_MEAN_ABS_Z, "lt"),
-        "Curve Vol (Z)": (last.get('z_xs_std_roll_z', 0), 2.0, "lt")
+        "Health (Z)": (last.get('signal_health_z', -99), cr.MIN_SIGNAL_HEALTH_Z, "gt"),
+        "Trend (Abs)": (last.get('trendiness_abs', 0), cr.MAX_TRENDINESS_ABS, "lt"),
+        "Mean (Z)": (last.get('z_xs_mean_roll_z', 0), cr.MAX_Z_XS_MEAN_ABS_Z, "lt")
     }
-    
     cards = []
     for name, (val, thresh, op) in metrics.items():
         is_good = (val > thresh) if op == "gt" else (abs(val) < thresh)
         col = "success" if is_good else "danger"
-        cards.append(dbc.Card([dbc.CardBody([
-            html.H6(name, className="card-title"),
-            html.H4(f"{val:.2f}", className=f"text-{col}"),
-            html.Small(f"Limit: {thresh}", className="text-muted")
-        ])], style={"width": "180px"}))
+        cards.append(dbc.Card([dbc.CardBody([html.H6(name), html.H4(f"{val:.2f}", className=f"text-{col}"), html.Small(f"Limit: {thresh}")])], style={"width": "150px"}))
         
-    recent = signals.tail(10).sort_values('decision_ts', ascending=False)
-    recent['decision_ts'] = recent['decision_ts'].astype(str)
-    cols = [{"name": i, "id": i} for i in recent.columns if "z_" in i or "health" in i or "trend" in i or "ts" in i]
-    
-    return cards, recent.to_dict('records'), cols
-
-@app.callback(Output('btn-run-eod', 'children'), Input('btn-run-eod', 'n_clicks'), prevent_initial_call=True)
-def man_eod(n): eod_process.run_eod_main(); return "Done"
+    cols = [{"name": i, "id": i} for i in ['decision_ts', 'signal_health_z', 'trendiness_abs', 'z_xs_mean_roll_z']]
+    return fig, cards, recent_sig.tail(10).to_dict('records'), cols
 
 # --- SCHEDULER LOGIC (NO CRON REQUIRED) ---
 def run_schedule_loop():
