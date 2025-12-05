@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import sqlite3
 import sys
+import time
 import datetime
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
@@ -19,8 +20,21 @@ import hybrid_filter as hf
 DB_MARKET = "market_data.db"
 DB_POSITIONS = "positions.db"
 
-def get_db_connection(db_name):
-    return sqlite3.connect(db_name)
+def get_db_connection(db_name, retries=5):
+    """
+    Robust connection with retry logic to handle Recorder locks.
+    """
+    for i in range(retries):
+        try:
+            # timeout=10 tells SQLite driver to busy-wait for 10s
+            conn = sqlite3.connect(db_name, timeout=10)
+            return conn
+        except sqlite3.OperationalError:
+            if i < retries - 1:
+                time.sleep(1) # Explicit python-side wait
+            else:
+                raise
+    raise Exception(f"Could not connect to {db_name} after {retries} retries.")
 
 def get_lookback_files(current_yymm, months_back=6):
     """
