@@ -50,7 +50,7 @@ HYBRID_SIGNALS_PATH = Path(cr.PATH_OUT) / HYBRID_SIGNALS_NAME
 @dataclass
 class RegimeConfig:
     # rolling window length in buckets (days if DECISION_FREQ='D')
-    base_window: int = 10
+    base_window: int = 5
 
     # which rolling features to build (all per-bucket)
     use_mean: bool = True
