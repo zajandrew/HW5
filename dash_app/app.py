@@ -521,14 +521,15 @@ def update_blotter(n, click):
             'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            'total_pnl': round(c_tot, 0),
-            'price_pnl': round(c_prc, 0),
-            'carry_pnl': round(c_cry, 0),
-            'roll_pnl': round(c_rol, 0),
+            'entry_z': round(entry_z, 2),  # Added
             'curr_z': round(curr_z, 2),
             'curr_drift': round(curr_drift, 2),
             'curr_comp': round(curr_comp, 2),
             'target_z': f"0.0 ± {Z_EXIT}",
+            'total_pnl': round(c_tot, 0),
+            'price_pnl': round(c_prc, 0),
+            'carry_pnl': round(c_cry, 0),
+            'roll_pnl': round(c_rol, 0),
             'aging': f"{days_held} / {MAX_HOLD}",
             'status': flag,
             '_row_color': bg_color 
@@ -541,10 +542,15 @@ def update_blotter(n, click):
     for _, row in hist_df.iterrows():
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
         label_rec = format_tenor(row['ticker_rec'], row['tenor_rec'])
+        
         hist_data.append({
+            'trade_id': row['trade_id'], # Added
+            'open_date': str(row['open_ts']).split(' ')[0], # Added
             'close_ts': row['close_ts'],
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
+            'entry_z': round(row.get('entry_z_spread', 0), 2), # Added
+            'exit_z': round(row.get('close_z_spread', 0), 2),  # Added (assuming column exists)
             'total_pnl': f"${row['realized_pnl_cash']:,.0f}",
             'price_pnl': f"${row.get('realized_pnl_price', 0):,.0f}",
             'carry_pnl': f"${row.get('realized_pnl_carry', 0):,.0f}",
@@ -552,19 +558,34 @@ def update_blotter(n, click):
             'reason': row['close_reason']
         })
 
-    # Update Columns to include Drift/Composite
-    open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 
-                      'price_pnl', 'carry_pnl', 'roll_pnl', 
-                      'curr_z', 'curr_drift', 'curr_comp']
+    # --- COLUMNS DEFINITIONS ---
+    
+    # Updated Open Columns (reordered logically)
+    open_cols_list = [
+        'trade_id', 'open_date', 'pair', 'dv01', 
+        'entry_z', 'curr_z', 'curr_drift', 'curr_comp', 'target_z', 
+        'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 
+        'aging', 'status'
+    ]
     open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
-    hist_cols_list = ['close_ts', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'reason']
+    # Updated History Columns
+    hist_cols_list = [
+        'trade_id', 'open_date', 'close_ts', 'pair', 'dv01', 
+        'entry_z', 'exit_z', 
+        'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 
+        'reason'
+    ]
     hist_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in hist_cols_list]
 
     style_cond = []
     for i, row in enumerate(open_data):
         if row['_row_color'] != "#222":
-            style_cond.append({'if': {'filter_query': f'{{trade_id}} = {row["trade_id"]}'}, 'backgroundColor': row['_row_color'], 'color': 'white'})
+            style_cond.append({
+                'if': {'filter_query': f'{{trade_id}} = {row["trade_id"]}'}, 
+                'backgroundColor': row['_row_color'], 
+                'color': 'white'
+            })
 
     return open_data, open_cols, style_cond, hist_data, hist_cols
 
