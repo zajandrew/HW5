@@ -34,7 +34,7 @@ from hybrid_filter import ShockConfig, RegimeThresholds
 N_JOBS = max(1, os.cpu_count() - 2)
 
 # Tournament Survival Rates (Percentages)
-R1_TOP_PCT = 0.15         
+R1_TOP_PCT = 0.20         
 R2_TOP_PCT = 0.25         
 
 # --- STATISTICAL SIGNIFICANCE GATE ---
@@ -59,13 +59,17 @@ LOCKED_FILTERS = {
 
 # UPDATED PARAMETER SPACE (From your Image)
 PARAM_SPACE = {
-    "Z_ENTRY": [0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2],
+    "Z_ENTRY": [1.7, 1.8, 1.9, 2.0],
     
-    "Z_EXIT":  [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+    "Z_EXIT":  [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
     
-    "Z_STOP":  [0.75, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 3.0, 3.5, 4.0],
+    "Z_STOP":  [2.3, 2.4, 2.5, 3.0],
     
-    "MAX_HOLD_DAYS": [3, 5, 7, 10, 12, 15, 20, 30],
+    "MAX_HOLD_DAYS": [5, 7, 10],
+
+    "DRIFT_GATE_BPS": [-0.15, -0.05, -0.01, 0.02, 0.05],
+
+    "DRIFT_WEIGHT": [0.0, 2.0, 5.0, 10.0, 20.0]
 }
 
 # ==============================================================================
