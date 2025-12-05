@@ -25,8 +25,7 @@ import cr_config as cr
 # --- SETUP ---
 init_dbs()
 
-# START MODE: Viewer Only (log_to_db=False)
-# We assume 'run_recorder.py' is running separately to handle recording/EOD.
+# START MODE: Viewer Only (assuming recorder is running)
 feed.start(log_to_db=False)
 
 # Global State for Hot Reloading
@@ -35,12 +34,10 @@ CURRENT_LOADED_YYMM = None
 def get_latest_model_yymm():
     """Finds most recent _enh.parquet file to load as Midnight Model."""
     enh_dir = Path(cr.PATH_ENH)
-    # Glob all enhanced files
     files = list(enh_dir.glob("*_enh.parquet"))
     if not files: 
         return datetime.now().strftime("%y%m")
     
-    # Sort by filename (YYMM is sortable string)
     files.sort() 
     latest_file = files[-1]
     return latest_file.name.split('_')[0]
@@ -66,27 +63,26 @@ app.title = "RV Overlay DSS"
 
 # --- HELPERS ---
 def get_z_color(z):
-    if z is None: return "#444" # Dark Grey
-    if z > 2.0: return "#00FF00" # Bright Green
-    if z > 0.5: return "#90EE90" # Light Green
-    if z < -2.0: return "#FF0000" # Bright Red
-    if z < -0.5: return "#CD5C5C" # Indian Red
-    return "#444" # Dark Grey (Noise)
+    if z is None: return "#444"
+    if z > 2.0: return "#00FF00" 
+    if z > 0.5: return "#90EE90"
+    if z < -2.0: return "#FF0000"
+    if z < -0.5: return "#CD5C5C"
+    return "#444"
+
+def get_drift_color(bps):
+    if bps > 0.1: return "#00FF00"  # Positive Carry
+    if bps < -0.1: return "#FF0000" # Negative Carry
+    return "#888" # Neutral
 
 def format_tenor(ticker, float_years):
     if float_years is None: return "N/A"
     y = float(float_years)
     tol = 0.001
     if abs(y - 1/12) < tol: return "1M"
-    if abs(y - 2/12) < tol: return "2M"
-    if abs(y - 3/12) < tol: return "3M"
-    if abs(y - 0.25) < tol: return "3M" # Common 3M
-    if abs(y - 4/12) < tol: return "4M"
-    if abs(y - 5/12) < tol: return "5M"
-    if abs(y - 6/12) < tol: return "6M"
+    if abs(y - 0.25) < tol: return "3M"
     if abs(y - 0.5) < tol:  return "6M"
     if abs(y - 1.0) < tol:  return "1Y"
-    if abs(y - 1.5) < tol: return "18M"
     if abs(y - round(y)) < tol: return f"{int(round(y))}Y"
     return f"{y:.1f}Y"
 
@@ -96,7 +92,6 @@ def assign_bucket(tenor):
     return "Long (>7Y)"
 
 def aggregate_pnl_columns(df):
-    """Sums cash columns for summary."""
     if df.empty: return 0,0,0,0
     return (
         df['realized_pnl_cash'].sum(),
@@ -107,8 +102,8 @@ def aggregate_pnl_columns(df):
 
 # --- LAYOUT ---
 app.layout = html.Div([
-    dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), # 2s updates (Prices)
-    dcc.Interval(id='slow-interval', interval=60000, n_intervals=0), # 1m updates (Model Check)
+    dcc.Interval(id='fast-interval', interval=2000, n_intervals=0), 
+    dcc.Interval(id='slow-interval', interval=60000, n_intervals=0), 
     
     # Header
     dbc.NavbarSimple(
@@ -139,7 +134,7 @@ app.layout = html.Div([
         # TAB 1: TICKER SCANNER
         dbc.Tab(label="Ticker Scanner", children=[
             dbc.Container([
-                html.H5("Market Grid (Live Z-Scores)", className="mt-3"),
+                html.H5("Market Grid (Live Z-Scores & Drift)", className="mt-3"),
                 html.Div(id="ticker-grid", className="d-flex flex-wrap gap-2"),
                 html.Div(id="scanner-msg", className="text-danger mt-2")
             ], fluid=True)
@@ -150,7 +145,7 @@ app.layout = html.Div([
             dbc.Container([
                 # Open Positions
                 dbc.Row([
-                    dbc.Col(html.H5("Active Positions (Live PnL Breakdown)"), width=10),
+                    dbc.Col(html.H5("Active Positions (Composite Score & PnL Breakdown)"), width=10),
                     dbc.Col(dbc.Button("Refresh", id="btn-refresh-blotter", size="sm"), width=2)
                 ], className="mt-3"),
                 dash_table.DataTable(
@@ -230,11 +225,10 @@ app.layout = html.Div([
     Input('slow-interval', 'n_intervals')
 )
 def auto_reload_model(n):
-    # This runs every 60s. Checks if new parquet exists (e.g. after EOD run)
     msg = check_and_reload_model()
     return f"Model: {CURRENT_LOADED_YYMM}"
 
-# 2. Update Ticker Grid (SMART DISABLE)
+# 2. Update Ticker Grid (Scanner)
 @app.callback(
     Output('ticker-grid', 'children'),
     Output('badge-regime', 'children'),
@@ -245,9 +239,6 @@ def auto_reload_model(n):
 )
 def update_grid(n):
     state = get_system_state()
-    # state tuple: (id, ts, shock, regime, pnl...)
-    # Ensure index matching if schema changed. 
-    # Usually: id=0, last_update=1, shock=2, regime=3
     shock_days = state[2] if state else 0
     regime = state[3] if state else "SAFE"
     
@@ -263,26 +254,32 @@ def update_grid(n):
         data = z_map[t]
         z_val = data['z_live']
         tenor_label = format_tenor(t, data['tenor'])
-        color = get_z_color(z_val)
+        
+        # Calculate Natural Drift (Rec direction +1) for display
+        drift_bps = le.calc_live_drift(data['tenor'], 1.0, feed.live_map)
+        
+        z_color = get_z_color(z_val)
+        drift_color = get_drift_color(drift_bps)
         
         # Smart Disable Logic
         if global_disable:
             can_pay, can_rec = False, False
         else:
-            partners_pay = le.get_valid_partners(t, 'PAY', z_map)
-            partners_rec = le.get_valid_partners(t, 'REC', z_map)
+            partners_pay = le.get_valid_partners(t, 'PAY', z_map, feed.live_map)
+            partners_rec = le.get_valid_partners(t, 'REC', z_map, feed.live_map)
             can_pay = len(partners_pay) > 0
             can_rec = len(partners_rec) > 0
         
         pay_style = {'opacity': 0.5 if not can_pay else 1.0}
         rec_style = {'opacity': 0.5 if not can_rec else 1.0}
         
-        if z_val == 0.0 and data['model_z'] != 0.0: color = "#444"
+        if z_val == 0.0 and data['model_z'] != 0.0: z_color = "#444"
 
         card = dbc.Card([
             dbc.CardBody([
                 html.H6(f"{tenor_label}", className="card-title text-center"),
-                html.P(f"Z: {z_val:.2f}", className="text-center small mb-1"),
+                html.P(f"Z: {z_val:.2f}", className="text-center small mb-1", style={"fontWeight": "bold"}),
+                html.P(f"Drift: {drift_bps:.2f}bp", className="text-center small mb-2", style={"color": drift_color}),
                 html.Div([
                     dbc.Button("PAY", id={'type': 'btn-pay', 'index': t}, 
                                color="success" if can_pay else "secondary", 
@@ -292,7 +289,7 @@ def update_grid(n):
                                size="sm", disabled=not can_rec, style=rec_style)
                 ], className="d-flex justify-content-center")
             ])
-        ], style={"width": "120px", "border": f"2px solid {color}"})
+        ], style={"width": "120px", "border": f"2px solid {z_color}"})
         cards.append(card)
         
     regime_text = f"REGIME: {regime}"
@@ -330,16 +327,26 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         intent = "PAY" if "btn-pay" in trigger_id else "REC"
         
         z_map = le.get_live_z_scores(feed.live_map)
-        candidates = le.get_valid_partners(ticker_orig, intent, z_map)
+        # Pass live_map to get drift/composite
+        candidates = le.get_valid_partners(ticker_orig, intent, z_map, feed.live_map)
         
         if not candidates:
             return True, html.Div(f"No valid overlay candidates found for {label_orig}.")
             
         current_rate = feed.live_map.get(ticker_orig, 0.0)
+        
+        # Build options with Composite Score visibility
         options = []
         for c in candidates:
-            lbl = f"{format_tenor(c['ticker'], c['tenor'])} ({c['ticker']}) | Z: {c['z_live']:.2f} | Imp: {c['spread_imp']:.2f}"
-            options.append({'label': lbl, 'value': c['ticker']})
+            # Format: Ticker | Comp: X.X | Drift: X.Xbp | Z-Imp: X.X
+            lbl = (f"{format_tenor(c['ticker'], c['tenor'])} "
+                   f"| Comp: {c['composite']:.2f} "
+                   f"| Drift: {c['drift_bps']:.2f}bp "
+                   f"| Z: {c['z_live']:.2f}")
+            
+            disabled = c.get('is_gated', False)
+            options.append({'label': lbl, 'value': c['ticker'], 'disabled': disabled})
+            
         best_ticker = candidates[0]['ticker']
         best_rate = feed.live_map.get(best_ticker, 0.0)
         
@@ -352,7 +359,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         
         content = html.Div([
             html.H5(f"Original Req: {intent} Fixed {label_orig}"),
-            html.P("Strategy: Switch exposure to cheaper alternative.", className="text-muted small"),
+            html.P("Select candidate based on Composite Score (Z + Drift).", className="text-muted small"),
             html.Hr(),
             dbc.Row([
                 dbc.Col([
@@ -389,15 +396,25 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     if intent == "PAY":
         t_pay, t_rec = ticker_alt, ticker_orig
         r_pay, r_rec = r_alt, r_orig
+        pay_dir, rec_dir = -1.0, 1.0
     else:
         t_pay, t_rec = ticker_orig, ticker_alt
         r_pay, r_rec = r_orig, r_alt
+        pay_dir, rec_dir = -1.0, 1.0
         
     tenor_pay = cr.TENOR_YEARS.get(t_pay)
     tenor_rec = cr.TENOR_YEARS.get(t_rec)
     z_map = le.get_live_z_scores(feed.live_map)
     z_spread = z_map.get(t_pay, {}).get('z_live', 0) - z_map.get(t_rec, {}).get('z_live', 0)
     model_z = z_map.get(t_pay, {}).get('model_z', 0) - z_map.get(t_rec, {}).get('model_z', 0)
+    
+    # Capture Entry Drift & Composite for Record Keeping
+    drift_pay = le.calc_live_drift(tenor_pay, pay_dir, feed.live_map)
+    drift_rec = le.calc_live_drift(tenor_rec, rec_dir, feed.live_map)
+    total_drift = drift_pay + drift_rec
+    
+    DRIFT_WEIGHT = float(getattr(cr, "DRIFT_WEIGHT", 0.2))
+    composite = z_spread + (DRIFT_WEIGHT * total_drift)
     
     trade = {
         'open_ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -410,7 +427,9 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
         'entry_rate_pay': float(r_pay),
         'entry_rate_rec': float(r_rec),
         'entry_z_spread': z_spread,
-        'model_z_score': model_z
+        'model_z_score': model_z,
+        'entry_drift_bps': total_drift,   # NEW FIELD
+        'entry_composite_score': composite # NEW FIELD
     }
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
@@ -430,6 +449,7 @@ def update_blotter(n, click):
     if all_trades.empty: return [], [], [], [], []
     
     Z_EXIT, Z_STOP, MAX_HOLD = cr.Z_EXIT, cr.Z_STOP, cr.MAX_HOLD_DAYS
+    DRIFT_WEIGHT = float(getattr(cr, "DRIFT_WEIGHT", 0.2))
     now_dt = datetime.now()
     
     # --- OPEN TRADES ---
@@ -439,12 +459,20 @@ def update_blotter(n, click):
     for _, row in open_df.iterrows():
         (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(row, feed.live_map, now_dt)
         
+        # Calculate Live Composite Score
         z_map = le.get_live_z_scores(feed.live_map)
         zp = z_map.get(row['ticker_pay'], {}).get('z_live', 0)
         zr = z_map.get(row['ticker_rec'], {}).get('z_live', 0)
         curr_z = zp - zr
-        entry_z = row['entry_z_spread']
         
+        # Live Drift
+        drift_p = le.calc_live_drift(row['tenor_pay'], -1.0, feed.live_map)
+        drift_r = le.calc_live_drift(row['tenor_rec'], 1.0, feed.live_map)
+        curr_drift = drift_p + drift_r
+        
+        curr_comp = curr_z + (DRIFT_WEIGHT * curr_drift)
+
+        entry_z = row['entry_z_spread']
         open_dt = pd.to_datetime(row['open_ts'])
         days_held = (now_dt - open_dt).days
         stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
@@ -473,10 +501,10 @@ def update_blotter(n, click):
             'price_pnl': round(c_prc, 0),
             'carry_pnl': round(c_cry, 0),
             'roll_pnl': round(c_rol, 0),
-            'total_bp': b_tot, # Hidden but useful
             'curr_z': round(curr_z, 2),
+            'curr_drift': round(curr_drift, 2),
+            'curr_comp': round(curr_comp, 2),
             'target_z': f"0.0 ± {Z_EXIT}",
-            'stop_z': round(stop_z_level, 2),
             'aging': f"{days_held} / {MAX_HOLD}",
             'status': flag,
             '_row_color': bg_color 
@@ -500,7 +528,10 @@ def update_blotter(n, click):
             'reason': row['close_reason']
         })
 
-    open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'curr_z', 'target_z', 'stop_z']
+    # Update Columns to include Drift/Composite
+    open_cols_list = ['trade_id', 'status', 'aging', 'pair', 'dv01', 'total_pnl', 
+                      'price_pnl', 'carry_pnl', 'roll_pnl', 
+                      'curr_z', 'curr_drift', 'curr_comp']
     open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
     hist_cols_list = ['close_ts', 'pair', 'dv01', 'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 'reason']
@@ -513,7 +544,7 @@ def update_blotter(n, click):
 
     return open_data, open_cols, style_cond, hist_data, hist_cols
 
-# 6. Modify Trade (PNL INTEGRITY FIX)
+# 6. Modify Trade
 @app.callback(
     Output('summary-content', 'children'), 
     Input('btn-close-trade', 'n_clicks'),
@@ -537,16 +568,13 @@ def modify_trade(n_close, n_del, rows, data, reason):
         return "Trade Deleted"
 
     elif button_id == "btn-close-trade":
-        # RE-CALCULATE PNL ON THE MICROSECOND
         all_pos = get_all_positions()
-        # Find exact row from DB to get raw entry fields
         matches = all_pos[all_pos['trade_id'] == trade_id]
         if matches.empty: return "Error: Trade Not Found"
         
         original_trade = matches.iloc[0]
         now_dt = datetime.now()
         
-        # Calculate FRESH PnL
         (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(
             original_trade, feed.live_map, now_dt
         )
@@ -589,7 +617,7 @@ def update_summary(n, close_trigger):
     
     c_tot, c_prc, c_cry, c_rol = aggregate_pnl_columns(closed)
     
-    # Calculate approx live PnL for Open Trades
+    # Approx live PnL for Open Trades
     o_tot = 0
     now_dt = datetime.now()
     for _, row in open_trades.iterrows():
@@ -608,7 +636,7 @@ def update_summary(n, close_trigger):
         make_card("Realized Roll", f"${c_rol:,.0f}", "warning"),
     ]
     
-    # Time Horizon Stats
+    # Time Stats
     now = datetime.now()
     all_trades['dt'] = pd.to_datetime(all_trades['open_ts'])
     mask_mtd = (all_trades['dt'].dt.month == now.month) & (all_trades['dt'].dt.year == now.year)
@@ -624,7 +652,7 @@ def update_summary(n, close_trigger):
         "Trades": [len(all_trades[mask_mtd]), len(all_trades[mask_ytd]), len(all_trades)]
     }), striped=True, bordered=True, dark=True)
     
-    # NET vs GROSS RISK FIX
+    # Risk
     bucket_risk = {"Short (<2Y)": [0,0], "Belly (2-7Y)": [0,0], "Long (>7Y)": [0,0]}
     
     for _, row in open_trades.iterrows():
@@ -632,11 +660,9 @@ def update_summary(n, close_trigger):
         b_rec = assign_bucket(row['tenor_rec'])
         dv = row['dv01']
         
-        # Pay = Short = Negative Net DV01
         bucket_risk[b_pay][0] -= dv
         bucket_risk[b_pay][1] += dv
         
-        # Rec = Long = Positive Net DV01
         bucket_risk[b_rec][0] += dv
         bucket_risk[b_rec][1] += dv
         
