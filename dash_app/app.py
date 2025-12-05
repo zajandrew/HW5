@@ -30,31 +30,53 @@ init_dbs()
 # START MODE: Viewer Only (assuming recorder is running)
 feed.start(log_to_db=False)
 
-# Global State for Hot Reloading
-CURRENT_LOADED_YYMM = None
+# --- GLOBAL STATE ---
+# Stores (filename, modification_timestamp)
+CURRENT_LOADED_STATE = (None, 0.0)
 
-def get_latest_model_yymm():
-    """Finds most recent _enh.parquet file to load as Midnight Model."""
+def get_latest_model_info():
+    """
+    Returns (filename_yymm, mod_time) of the latest model file.
+    """
     enh_dir = Path(cr.PATH_ENH)
     files = list(enh_dir.glob("*_enh.parquet"))
     if not files: 
-        return datetime.now().strftime("%y%m")
+        return (None, 0.0)
     
-    files.sort() 
+    # Sort by YYMM name
+    files.sort()
     latest_file = files[-1]
-    return latest_file.name.split('_')[0]
+    
+    # Get file stats
+    stats = latest_file.stat()
+    yymm = latest_file.name.split('_')[0]
+    
+    return (yymm, stats.st_mtime)
 
 def check_and_reload_model():
-    """Checks if a new model file exists and reloads if necessary."""
-    global CURRENT_LOADED_YYMM
-    latest = get_latest_model_yymm()
+    """
+    Checks if the model file has been modified (Morning Update).
+    Reloads if timestamp or filename has changed.
+    """
+    global CURRENT_LOADED_STATE
     
-    if latest != CURRENT_LOADED_YYMM:
-        print(f"[SYSTEM] Loading Model: {latest} (Previous: {CURRENT_LOADED_YYMM})")
-        success = le.load_midnight_model(latest)
+    new_yymm, new_mtime = get_latest_model_info()
+    
+    curr_yymm, curr_mtime = CURRENT_LOADED_STATE
+    
+    # Reload if:
+    # 1. We have no model loaded
+    # 2. The filename changed (New Month)
+    # 3. The file was modified (Same Month, New Morning Data)
+    if (new_yymm is not None) and (new_yymm != curr_yymm or new_mtime > curr_mtime):
+        
+        print(f"[SYSTEM] Detected New Model: {new_yymm} (Time: {datetime.fromtimestamp(new_mtime)})")
+        success = le.load_midnight_model(new_yymm)
+        
         if success:
-            CURRENT_LOADED_YYMM = latest
-            return f"Model Updated: {latest}"
+            CURRENT_LOADED_STATE = (new_yymm, new_mtime)
+            return f"Model Updated: {new_yymm} @ {datetime.fromtimestamp(new_mtime).strftime('%H:%M')}"
+            
     return dash.no_update
 
 # Initial Load
