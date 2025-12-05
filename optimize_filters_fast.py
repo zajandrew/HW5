@@ -34,34 +34,36 @@ N_JOBS = max(1, int(os.cpu_count()) - 2)
 
 # --- INPUT: PASTE YOUR WINNING STAGE 1 PARAMETERS HERE ---
 STAGE1_PARAMS = {
-    "Z_ENTRY": 0.85,          
-    "Z_EXIT": 0.2,            
-    "Z_STOP": 2.5,            
-    "MAX_HOLD_DAYS": 15,      
+    "Z_ENTRY": 1.8,          
+    "Z_EXIT": 0.9,            
+    "Z_STOP": 2.4,            
+    "MAX_HOLD_DAYS": 5,      
 }
 
 # --- GRID 1: SIGNAL CONSTRUCTION (META-OPTIMIZATION) ---
 # We test these combinations to find the most predictive signal definition.
-SIGNAL_WINDOW_GRID = [10, 15, 20, 30, 45, 60]
+SIGNAL_WINDOW_GRID = [5, 10, 15, 20, 30, 45, 60, 75, 100, 120]
 SIGNAL_WEIGHTS = [
     # (name, mean_w, std_w, slope_w)
     ("Standard", 0.5, -0.5, -0.5),
-    ("Trend_Sensitive", 0.2, -0.2, -0.8),
+    ("Vol_Sensitive", 0.2, -0.8, -0.2),
+    ("Trend_Sensitive", 0.2, -0.2, -0.8)
 ]
 
 # --- GRID 2: THRESHOLD OPTIMIZATION (SAFETY BRAKES) ---
 # Once signals are built, we optimize the cutoffs.
 THRESHOLD_GRID = {
     # Regime (Curve)
-    "MIN_SIGNAL_HEALTH_Z":    [-1.0, -0.5, 0.0],
-    "MAX_TRENDINESS_ABS":     [1.5, 2.0, 3.0],
-    "MAX_Z_XS_MEAN_ABS_Z":    [2.0, 3.0],
+    "MIN_SIGNAL_HEALTH_Z":    [-1.0, -0.9, -0.8, -0.7, -0.6, -0.5, -0.4],
+    "MAX_TRENDINESS_ABS":     [2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 10.0],
+    "MAX_Z_XS_MEAN_ABS_Z":    [2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 10.0],
     
     # Shock (PnL)
     # Note: Window is tied to the Signal Window winner usually, but we can fine tune
-    "SHOCK_RAW_PNL_Z_THRESH": [-1.5, -2.0, -2.5, -3.0],
-    "SHOCK_RESID_Z_THRESH":   [-1.5, -2.0, -2.5],
-    "SHOCK_BLOCK_LENGTH":     [10, 20],
+    "SHOCK_PNL_WINDOW": [5, 10, 15, 20, 30, 45]
+    "SHOCK_RAW_PNL_Z_THRESH": [-1.5, -1.75, 2.0, -2.25, -2.5, -3.0],
+    "SHOCK_RESID_Z_THRESH":   [-1.5, -1.75, -2.0, -2.25, -2.5, -3.0],
+    #"SHOCK_BLOCK_LENGTH":     [3, 5, 7, 10, 15, 20, 25, 30]
 }
 
 
@@ -554,7 +556,7 @@ def run_threshold_optimization(baselines, signals, resid_caches):
     
     final_tasks = []
     for p in param_dicts:
-        p["SHOCK_PNL_WINDOW"] = fixed_win 
+        p["SHOCK_PNL_LENGTH"] = p["SHOCK_PNL_WINDOW"]
         final_tasks.append((p, baselines, signals, resid_caches))
         
     results = []
