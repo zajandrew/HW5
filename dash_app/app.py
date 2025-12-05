@@ -6,6 +6,8 @@ import numpy as np
 import sys
 from pathlib import Path
 from datetime import datetime
+import threading
+import time
 
 # --- Hook into Parent Directory ---
 current_dir = Path(__file__).resolve().parent
@@ -711,6 +713,32 @@ def update_health(n):
     cols = [{"name": i, "id": i} for i in recent.columns if "z_" in i or "health" in i or "trend" in i or "ts" in i]
     
     return cards, recent.to_dict('records'), cols
+
+@app.callback(Output('btn-run-eod', 'children'), Input('btn-run-eod', 'n_clicks'), prevent_initial_call=True)
+def man_eod(n): eod_process.run_eod_main(); return "Done"
+
+# --- SCHEDULER LOGIC (NO CRON REQUIRED) ---
+def run_schedule_loop():
+    print("[SCHEDULER] Background thread started.")
+    last_run = None
+    while True:
+        now = datetime.now()
+        # Trigger at 07:01 AM
+        if now.hour == 7 and now.minute == 1:
+            today_str = now.strftime("%Y-%m-%d")
+            if last_run != today_str:
+                print(f"[SCHEDULER] Running Morning Batch for {today_str}...")
+                try:
+                    eod_process.run_eod_main()
+                    last_run = today_str
+                except Exception as e:
+                    print(f"[SCHEDULER] Error: {e}")
+        time.sleep(30) # Check every 30s
+
+# Start the Scheduler Thread
+t = threading.Thread(target=run_schedule_loop)
+t.daemon = True
+t.start()
 
 if __name__ == '__main__':
     app.run_server(debug=True, port=8050)
