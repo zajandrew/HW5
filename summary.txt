@@ -1,0 +1,141 @@
+This document provides a comprehensive architectural and strategic overview of the **Systematic Curve Overlay Framework**. It is designed for the Risk Committee and Product Leadership to evaluate the business logic, risk controls, and economic rationale behind the strategy.
+
+---
+
+# Systematic Curve Overlay Framework
+**Strategic Rationale, Architecture, and Risk Governance**
+
+## 1. Executive Summary
+
+**The Objective:**
+To transform the desk’s flow hedging operations from a mechanical "Cost Center" into a systematic "Alpha Source." We aim to capture structural inefficiencies in the USD SOFR Swap curve without altering the core risk profile (DV01/Duration) of the book.
+
+**The Solution:**
+We have developed a "Decision Support Tool" that acts as a **Smart Router** for risk execution. Rather than mechanically hedging client flow at the exact tenor requested (e.g., executing a 10Y hedge against a 10Y client trade), the system scans the yield curve for statistically "cheap" tenors (e.g., 9.5Y or 10.5Y).
+
+**The Edge:**
+The strategy employs a **"Drift-Aware" Mean Reversion** logic. It identifies trades that offer a dual margin of safety:
+1.  **Statistical Value:** The point is mathematically "cheap" relative to the curve (Mean Reversion).
+2.  **Positive Carry:** The position earns net interest income while we wait for the price to correct (Drift).
+
+---
+
+## 2. The Problem & The Solution
+
+### The Friction: Why the Opportunity Exists
+The USD interest rate market is highly efficient at the macro level but inefficient at the micro level due to segmentation:
+* **Client Rigidity:** Corporate treasurers and pension funds demand hedges at specific dates (e.g., "10 Years from today"). They are price-insensitive to adjacent points on the curve.
+* **Supply/Demand Knots:** These rigid flows create local supply/demand imbalances. A massive receiver flow at the 10Y point might depress the 10Y rate temporarily, making the 9Y or 11Y look "expensive" (or the 10Y "cheap") by comparison.
+* **The Execution Gap:** Human traders process this flow too quickly to analyze the full curve for relative value optimization on every ticket.
+
+### The Overlay Solution: "Smart Routing"
+The Framework functions as an intelligent layer between Client Flow and Street Execution.
+
+1.  **Input:** The Desk receives a Client Risk request (e.g., Receive Fixed $100k DV01 in 10Y).
+2.  **Scan:** The system analyzes the curve to find the most efficient instrument to hedge this risk.
+3.  **Optimization:** It might identify that the 9Y tenor is statistically 2.0 standard deviations "richer" (better price) than the 10Y.
+4.  **Output:** The Trader executes the hedge in the 9Y instead of the 10Y.
+    * **Result:** The Desk is hedged against interest rate moves (Beta Neutral) but captures the relative value spread (Alpha) as the 9Y and 10Y relationships normalize.
+
+**Operational Note:** This system is a **Trader Tool**. It provides signals; it does not auto-execute. All final trade booking and enterprise risk accounting remain within the firm’s official Risk Management Systems.
+
+
+
+---
+
+## 3. The Statistical Engine (The "Ruler")
+
+To identify "Rich" or "Cheap" points, we must first define "Fair Value." Since raw interest rates are volatile, we cannot use simple price changes. We use a **Frozen Daily Model** to create a stable statistical ruler.
+
+### A. Defining "Fair Value"
+We employ a hybrid approach to model the curve:
+1.  **Spline Model (Micro):** Think of this as a flexible ruler that bends to fit the curve points. It is excellent at detecting local kinks (e.g., a dislocation between the 7Y and 8Y).
+2.  **PCA Model (Macro):** Principal Component Analysis identifies the global factors driving the curve (Level, Slope, Curvature). It tells us where a tenor *should* be based on the broad market movement.
+3.  **The "Z-Score":** We combine these models to generate a Z-Score. A Z-Score of **+2.0** means a tenor is 2 standard deviations "Cheap" vs. fair value. A score of **0.0** is Fair Value.
+
+### B. The "Frozen" Convention
+To ensure stability for the trader, the statistical parameters are calculated at the **Market Open** and frozen for the day.
+* **Why?** If we recalculated the model every second, a "cheap" asset might suddenly look "fair" just because the market moved slightly, creating "flickering" signals.
+* **Benefit:** This ensures that intraday price movements are measured against a stationary benchmark.
+
+---
+
+## 4. The "Drift-Aware" Logic: Valuation Methodology
+
+A pure Mean Reversion strategy (betting on price convergence) is risky—market irrationality can persist longer than solvency. To mitigate this, we have integrated **Drift Awareness**.
+
+### The Two Components of Return
+We assess every potential trade on its **Total Return Profile**, not just its price.
+
+1.  **Mean Reversion (The "Snap Back"):**
+    * The profit made when the Z-Score returns to 0.
+    * *Nature:* High Upside, Uncertain Timing.
+
+2.  **Drift (The "Rent"):**
+    * **Carry:** The net coupon income (Fixed Rate received vs. Floating Rate paid).
+    * **Rolldown:** The capital gain generated as a bond/swap slides down a steep yield curve over time (e.g., a 7Y swap becoming a 6.9Y swap).
+    * *Nature:* Steady Income, Deterministic.
+
+### The Drift Gate & Composite Score
+The system enforces a strict discipline regarding Carry:
+
+* **The Drift Gate (The "Do No Harm" Rule):**
+    We explicitly reject any trade where the Drift (Carry + Roll) is significantly negative, regardless of how "cheap" the Z-Score looks. We refuse to bleed money while waiting for a reversion.
+
+* **The Composite Score:**
+    Trades are ranked by a weighted combination:
+    $$Score = Z_{Score} + (Weight \times Drift_{bps})$$
+    * *Implication:* We will prefer a trade with a lower Z-Score (less "cheap") if it pays a massive positive Carry. This creates a portfolio that is "Paid to Wait."
+
+
+
+---
+
+## 5. Modeling Assumptions & Accounting
+
+To facilitate rapid decision-making, the model makes specific working simplifications. Note that these affect the *Signal Generation* only; actual PnL is tracked by the official Enterprise Risk System.
+
+1.  **Funding Proxy:**
+    * *Assumption:* The system calculates the "Cost of Carry" (Float Leg) using the shortest available tenor in the curve snapshot (e.g., 1M SOFR) as a proxy for the funding rate.
+    * *Reality:* Actual funding costs may vary slightly based on OIS spreads or internal transfer pricing. This simplification allows for robust relative comparisons between tenors without integrating complex bank-internal funding grids.
+
+2.  **Linear Risk Decay:**
+    * *Assumption:* We model the risk exposure (DV01) of a swap fading linearly over time (Actual/360 basis).
+    * *Reality:* This is a standard industry approximation for swaps and aligns sufficiently with official valuation for holding periods of <30 days.
+
+---
+
+## 6. Risk Management & Governance
+
+The system is architected with a "Safety First" philosophy, employing three distinct layers of defense.
+
+### Layer 1: The Regime Filter (Exogenous)
+* **Function:** Monitors the macro environment.
+* **Logic:** It tracks the "Trendiness" and "Signal Health" of the curve. If the curve begins trending violently (e.g., a macro breakout or Fed surprise), the assumption of Mean Reversion is violated.
+* **Action:** The system flags the regime as "Unsafe" and blocks new entries. The trader is advised to stand down.
+
+### Layer 2: The Shock Filter (Endogenous)
+* **Function:** Monitors the strategy's own performance.
+* **Logic:** It regresses the Realized PnL against the Model's Predictions. If the strategy begins losing money in a way the model cannot explain (e.g., residuals exceed 1.5 standard deviations), it indicates a "Model Break."
+* **Action:** Triggers a **Panic Exit**. The system recommends liquidating positions immediately to preserve capital.
+
+### Layer 3: Fly Gates (Structural)
+* **Function:** Prevents entering broken curve structures.
+* **Logic:** Before buying a "cheap" 7Y tenor, the system checks the 5s7s10s Butterfly. If the butterfly is statistically broken, the 7Y isn't "cheap"—it's structurally dislocated.
+* **Action:** The trade is rejected to avoid "catching a falling knife."
+
+---
+
+## 7. Robustness & Validation
+
+To prove this strategy relies on structural market inefficiencies rather than historical luck ("Overfitting"), we subjected it to a rigorous **"Tournament" Stress Test**.
+
+### The "Multiverse" Methodology
+We did not just test on historical data. We generated **10 Parallel Universes** (Synthetic Data Sets) by:
+1.  **Jittering Time:** Randomly shifting historical trade dates by ±5 business days.
+2.  **Jittering Size:** Randomly altering trade sizes by ±10%.
+
+### The Tournament Results
+The strategy configuration was required to remain profitable across *all* 10 synthetic universes to be considered valid.
+* **Finding:** The optimization process revealed a strong preference for **High Drift Weight**.
+* **Conclusion:** The most robust version of this strategy is not pure statistical arbitrage; it is a **Systematic Carry Strategy** that uses statistical Z-Scores to time the entry points. This confirms that "Time" and "Carry" are the primary drivers of Alpha, providing a high degree of confidence in the strategy's economic viability.
