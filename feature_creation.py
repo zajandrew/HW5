@@ -187,6 +187,7 @@ def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
     Uses HEAD(1) (Opens) for history to match target execution logic.
     """
     path_data = Path(getattr(cr, "PATH_DATA", "."))
+    path_enh = Path(getattr(cr, "PATH_ENH", "."))
     target_dt = datetime.datetime.strptime(target_yymm, "%y%m")
     
     lookback_days = float(getattr(cr, "PCA_LOOKBACK_DAYS", 126))
@@ -202,20 +203,23 @@ def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
         curr_str = curr_dt.strftime("%y%m")
         
         raw_path = path_data / f"{curr_str}_features.parquet"
-        cache_name = f"{curr_str}_summary_{freq}_OPEN.parquet"
-        cache_path = path_data / cache_name
+        cache_name = f"{curr_str}_summary_{freq}.parquet"
+        cache_path = path_enh / cache_name
         
         # 1. Try Cache
         if cache_path.exists():
             try:
-                history_dfs.append(pd.read_parquet(cache_path))
+                df_long = pd.read_parquet(cache_path)
+                history_dfs.append(df_long)
                 continue 
-            except: pass
+            except Exception as e:
+                print(f"[WARN] Cache corrupt {cache_name}, regenerating. Error: {e}")
 
         # 2. Cache Miss: Generate
         if raw_path.exists():
             try:
                 print(f"   -> Cache Miss. Generating OPEN summary for {curr_str}...")
+                
                 df = pd.read_parquet(raw_path)
                 df = _to_ts_index(df)
                 df = _apply_calendar_and_hours(df) 
@@ -223,8 +227,8 @@ def load_history_downsampled(target_yymm: str) -> pd.DataFrame:
                 
                 if not df.empty:
                     bucket_key = _decision_key(df["ts"], freq)
-                    # HEAD(1) = Open
                     df_sampled = df.sort_values("ts").groupby(bucket_key).head(1)
+                    
                     df_long = _melt_long(df_sampled, tenormap)
                     
                     df_long.to_parquet(cache_path, index=False)
@@ -256,34 +260,40 @@ def build_month(yymm: str) -> None:
     df_wide = _zeros_to_nan(df_wide)
 
     tenormap = getattr(cr, "TENOR_YEARS", {})
+    df_long = _melt_long(df_wide, tenormap)
     
     decision_freq = str(getattr(cr, "DECISION_FREQ", "D")).upper()
+    df_long['decision_ts'] = _decision_key(df_long['ts'], decision_freq)
     
-    # 2. REUSE: Downsample Target Immediately
-    # This creates the small dataframe we use for processing AND for caching.
-    bucket_key = _decision_key(df_wide["ts"], decision_freq)
-    # HEAD(1) = Open
-    df_target_sampled = df_wide.sort_values("ts").groupby(bucket_key).head(1)
-    df_long_target = _melt_long(df_target_sampled, tenormap)
-    df_long_target["decision_ts"] = _decision_key(df_long_target["ts"], decision_freq)
-
-    # 3. Pay It Forward: Save Cache
-    cache_name = f"{yymm}_summary_{decision_freq}_OPEN.parquet"
-    cache_path = path_data / cache_name
+    cache_name = f"{yymm}_summary_{decision_freq}.parquet"
+    cache_path = path_enh / cache_name
     if not cache_path.exists():
-        df_long_target.to_parquet(cache_path, index=False)
+        bucket_key = _decision_key(df_wide['ts'], decision_freq)
+        df_sampled = df_wide.sort_values("ts").groupby(bucket_key).head(1)
+        df_cache = _melt_long(df_sampled, tenormap)
+        df_cache.to_parquet(cache_path, index=False)
         print(f"[{_now()}] [CACHE] Saved self-summary: {cache_name}")
 
-    # 4. Load History & Combine
-    df_history = load_history_downsampled(yymm)
-    df_context = pd.concat([df_history, df_long_target]).sort_values("ts").reset_index(drop=True)
-
-    # 5. Process
-    buckets = (df_long_target["decision_ts"].dropna().unique().tolist())
+    buckets = (df_long["decision_ts"].dropna().unique().tolist())
     buckets.sort()
 
+    # 2. Load History & Combine
+    df_history = load_history_downsampled(yymm)
+
+    # 3. Create PCA Context Panel
+    df_target_daily = df_long.sort_values("ts").groupby(["decision_ts", "tenor_yrs"], as_index=False).head(1)
+    df_context = pd.concat([df_history, df_target_daily]).sort_values("ts").reset_index(drop=True)
+
+    # 4. Process
     N_JOBS = int(getattr(cr, "N_JOBS", 1))
-    jobs = max(1, min((os.cpu_count() // 2), 8)) if N_JOBS == 0 else max(1, N_JOBS)
+    if isinstance(N_JOBS, int):
+        if N_JOBS == 0:
+            import multiprocessing as mp
+            jobs = max(1, min((mp.cpu_count() // 2), 8))
+        else:
+            jobs = int(N_JOBS)
+    else:
+        jobs = 1
     
     pca_enable = bool(getattr(cr, "PCA_ENABLE", True))
     lookback_days = float(getattr(cr, "PCA_LOOKBACK_DAYS", 126))
@@ -292,7 +302,7 @@ def build_month(yymm: str) -> None:
     print(f"[{_now()}] [PROCESS] Processing {len(buckets)} buckets (Mode=MORNING_OPEN)...")
 
     def _one(dts):
-        snap = df_long_target[df_long_target["decision_ts"] == dts]
+        snap = df_long[df_long["decision_ts"] == dts]
         return _process_bucket(
             dts=dts,
             df_bucket=snap,
