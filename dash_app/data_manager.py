@@ -46,6 +46,8 @@ def init_dbs():
         entry_rate_rec REAL,
         entry_z_spread REAL,
         model_z_score REAL,
+        entry_drift_bps REAL,
+        entry_composite_score REAL,
         close_ts TEXT,
         close_reason TEXT,
         
