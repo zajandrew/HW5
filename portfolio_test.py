@@ -302,13 +302,16 @@ class PairPos:
         
         xp = snap_last["tenor_yrs"].values
         fp = snap_last["rate"].values
+        sort_idx = np.argsort(xp)
+        xp_sorted = xp[sort_idx]
+        fp_sorted = fp[sort_idx]
         
         t_roll_i = max(0.0, self.tenor_i_orig - (days_total/360.0))
-        y_roll_i = np.interp(t_roll_i, xp, fp)
+        y_roll_i = np.interp(t_roll_i, xp_sorted, fp_sorted)
         roll_gain_i = (ri - y_roll_i) * 100.0 * self.dv01_i_curr
         
         t_roll_j = max(0.0, self.tenor_j_orig - (days_total/360.0))
-        y_roll_j = np.interp(t_roll_j, xp, fp)
+        y_roll_j = np.interp(t_roll_j, xp_sorted, fp_sorted)
         roll_gain_j = (rj - y_roll_j) * 100.0 * self.dv01_j_curr
         
         self.pnl_roll_cash = roll_gain_i + roll_gain_j
@@ -371,10 +374,8 @@ def choose_pairs_under_caps(snap_last, max_pairs, per_bucket_cap, total_cap, fro
             if Ti in used or Tj in used: continue
             if (Ti < MIN_TEN) or (Tj < MIN_TEN): continue
             if abs(Ti - Tj) < MIN_SEP: continue
-            b1_idx = next(i for i, b in enumerate(config.buckets) if Ti <= b)
-            b2_idx = next(i for i, b in enumerate(config.buckets) if Tj <= b)
-            is_valid_topology = (min(b1_idx, b2_idx) > 0) or (max(b1_idx, b2_idx) <= 2)
-            if not is_valid_topology: continue
+            if assign_bucket(Ti) == "short" and assign_bucket(Tj) == "long": continue
+            if assign_bucket(Tj) == "short" and assign_bucket(Ti) == "long": continue
             
             zdisp = float(cheap["z_comb"] - rich["z_comb"])
             if zdisp < (Z_ENT + extra_z_entry): continue
@@ -837,10 +838,8 @@ def run_month(
                     if alt_tenor == exec_tenor: continue 
                     # 1. Determine bucket indices for both tenors (t1, t2)
                     # Returns 0 for Short, 1 for Front, 2 for Belly, 3 for Long
-                    b1_idx = next(i for i, b in enumerate(config.buckets) if alt_tenor <= b)
-                    b2_idx = next(i for i, b in enumerate(config.buckets) if exec_tenor <= b)
-                    is_valid_topology = (min(b1_idx, b2_idx) > 0) or (max(b1_idx, b2_idx) <= 2)
-                    if not is_valid_topology: continue
+                    if assign_bucket(Ti) == "short" and assign_bucket(Tj) == "long": continue
+                    if assign_bucket(Tj) == "short" and assign_bucket(Ti) == "long": continue
                                         
                     z_alt = _to_float(alt["z_comb"])
                     disp = (z_alt - exec_z) if side_s > 0 else (exec_z - z_alt)
