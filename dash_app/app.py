@@ -1,11 +1,13 @@
 import dash
 from dash import dcc, html, dash_table, Input, Output, State, callback_context
 import dash_bootstrap_components as dbc
+import plotly_express as px
+import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import time
 
@@ -250,7 +252,7 @@ app.layout = html.Div([
 )
 def auto_reload_model(n):
     msg = check_and_reload_model()
-    return f"Model: {CURRENT_LOADED_YYMM}"
+    return f"Model: {CURRENT_LOADED_STATE}"
 
 # 2. Update Ticker Grid (Scanner)
 @app.callback(
