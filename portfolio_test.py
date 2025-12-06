@@ -851,11 +851,34 @@ def run_month(
                     c_t, r_t = (alt_tenor, exec_tenor) if z_alt > exec_z else (exec_tenor, alt_tenor)
                     if not (fly_alignment_ok(c_t, 1, snap_srt, zdisp_for_pair=disp) and fly_alignment_ok(r_t, -1, snap_srt, zdisp_for_pair=disp)): continue
                     
-                    # --- NEW LOGIC START ---
-                    drift_bps = calc_trade_drift(alt_tenor, side_s, snap_srt)
-                    if drift_bps < DRIFT_GATE: continue
+                    # --- 1. The Baseline (The trade you are avoiding) ---
+                    # Note: side_s is the direction of the NEW trade. 
+                    # The hedge we are replacing is the OPPOSITE direction.
+                    # If we are Buying 9Y (Receiver), we are replacing Buying 10Y (Receiver).
+                    # So we calculate the drift of the 10Y Receiver.
+                    drift_exec = calc_trade_drift(exec_tenor, side_s, snap_srt)
                     
-                    score = disp + (drift_bps * DRIFT_W)
+                    # --- 2. The Candidate (The trade you are entering) ---
+                    drift_alt = calc_trade_drift(alt_tenor, side_s, snap_srt)
+                    
+                    # --- 3. The Net Advantage (The "Alpha") ---
+                    # How much BETTER is the candidate than the baseline?
+                    net_drift_bps = drift_alt - drift_exec 
+                    
+                    # --- 4. The Distance (The "Cost" in Duration Mismatch) ---
+                    dist_years = abs(alt_tenor - exec_tenor)
+                    scaling_factor = dist_years
+                    
+                    # --- 5. The Normalization (Option B) ---
+                    # "Bps of pickup per year of extension"
+                    norm_drift_bps = net_drift_bps / scaling_factor
+                    
+                    # --- 6. The Decision ---
+                    # GATE on the RAW Net Drift (Don't bleed too much total cash)
+                    if net_drift_bps < DRIFT_GATE: continue 
+                    
+                    # SCORE on the NORMALIZED Drift (Efficiency of the trade)
+                    score = disp + (norm_drift_bps * DRIFT_WEIGHT)
                     if score > best_score: 
                         best_score, best_c_row = score, alt
                     # --- NEW LOGIC END ---
