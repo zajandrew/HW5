@@ -838,8 +838,8 @@ def run_month(
                     if alt_tenor == exec_tenor: continue 
                     # 1. Determine bucket indices for both tenors (t1, t2)
                     # Returns 0 for Short, 1 for Front, 2 for Belly, 3 for Long
-                    if assign_bucket(Ti) == "short" and assign_bucket(Tj) == "long": continue
-                    if assign_bucket(Tj) == "short" and assign_bucket(Ti) == "long": continue
+                    if assign_bucket(alt_tenor) == "short" and assign_bucket(exec_tenor) == "long": continue
+                    if assign_bucket(exec_tenor) == "short" and assign_bucket(alt_tenor) == "long": continue
                                         
                     z_alt = _to_float(alt["z_comb"])
                     disp = (z_alt - exec_z) if side_s > 0 else (exec_z - z_alt)
