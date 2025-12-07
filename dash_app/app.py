@@ -308,6 +308,11 @@ def update_grid(n):
     global_disable = is_shocked or is_unstable
     
     z_map = le.get_live_z_scores(feed.live_map)
+    if not z_map:
+        # Return a placeholder card saying "Waiting for Market Data..."
+        placeholder = dbc.Card(dbc.CardBody("System Initializing / No Live Data"), className="m-2")
+        return [placeholder], "REGIME: INIT", "secondary", "SHOCK: OFF", "secondary"
+    
     sorted_tickers = sorted(z_map.keys(), key=lambda t: cr.TENOR_YEARS.get(t, 99))
     
     cards = []
