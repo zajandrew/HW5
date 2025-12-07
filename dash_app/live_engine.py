@@ -18,8 +18,10 @@ MODEL_SNAPSHOT = {}
 GLOBAL_FUNDING_ANCHOR = 0.0 
 DEFAULT_VOL_PROXY = 0.05 
 
+# In live_engine.py
+
 def load_midnight_model(yymm_str):
-    """Loads the EOD parquet file (The Ruler)."""
+    """Loads the EOD parquet file with robust timestamp handling."""
     global MODEL_SNAPSHOT, GLOBAL_FUNDING_ANCHOR
     
     try:
@@ -35,12 +37,29 @@ def load_midnight_model(yymm_str):
             print(f"[WARN] Model file empty: {path}")
             return False
 
-        last_ts = df['ts'].max()
-        snapshot = df[df['ts'] == last_ts].copy()
+        # --- FIX: ROBUST TIMESTAMP SELECTION ---
+        # 1. Round timestamps to the nearest minute to group fragmented writes
+        #    (This handles 'loop-writing' where every row has a slightly diff microsecond)
+        df['ts_group'] = df['ts'].dt.floor('min')
+        
+        # 2. Find the latest "Minute Batch"
+        last_batch_time = df['ts_group'].max()
+        
+        # 3. Filter for that entire batch
+        snapshot = df[df['ts_group'] == last_batch_time].copy()
+        
+        # 4. Deduplicate (just in case) - keep last entry per tenor
+        snapshot = snapshot.sort_values('ts').drop_duplicates(subset=['tenor_yrs'], keep='last')
+        # ---------------------------------------
         
         if not snapshot.empty:
             min_tenor_idx = snapshot['tenor_yrs'].idxmin()
-            GLOBAL_FUNDING_ANCHOR = float(snapshot.loc[min_tenor_idx, 'rate'])
+            # Safety check if index is integer or label
+            if isinstance(min_tenor_idx, int) and min_tenor_idx in snapshot.index:
+                 GLOBAL_FUNDING_ANCHOR = float(snapshot.loc[min_tenor_idx, 'rate'])
+            else:
+                 # Fallback if index reset
+                 GLOBAL_FUNDING_ANCHOR = float(snapshot.loc[snapshot['tenor_yrs'].idxmin()]['rate'])
         
         has_scale = 'scale' in snapshot.columns
         has_vol = 'vol' in snapshot.columns
@@ -55,10 +74,12 @@ def load_midnight_model(yymm_str):
             else:
                 row['vol_proxy'] = DEFAULT_VOL_PROXY
         
-        print(f"[SYSTEM] Loaded Midnight Model: {last_ts} ({len(MODEL_SNAPSHOT)} tenors). Funding Anchor: {GLOBAL_FUNDING_ANCHOR:.4f}%")
+        print(f"[SYSTEM] Loaded Midnight Model: {last_batch_time} ({len(MODEL_SNAPSHOT)} tenors). Funding Anchor: {GLOBAL_FUNDING_ANCHOR:.4f}%")
         return True
     except Exception as e:
         print(f"[ERROR] Failed to load model: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ==============================================================================
