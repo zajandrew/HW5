@@ -236,8 +236,8 @@ def step_4_mark_positions(yymm):
     Sets 'close_reason' flag if Max Hold or Stops are hit.
     """
     print(f"[EOD] Step 4: Marking Positions against Official Close...")
-    
-    enh_path = Path(cr.PATH_ENH) / f"{yymm}_enh.parquet"
+    suffix = cr.ENH_SUFFIX
+    enh_path = Path(cr.PATH_ENH) / f"{yymm}_enh{suffix}.parquet"
     if not enh_path.exists():
         print("[ERROR] EOD Model file missing.")
         return
