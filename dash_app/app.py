@@ -40,8 +40,9 @@ def get_latest_model_info():
     """
     Returns (filename_yymm, mod_time) of the latest model file.
     """
+    suffix = cr.ENH_SUFFIX
     enh_dir = Path(cr.PATH_ENH)
-    files = list(enh_dir.glob("*_enh.parquet"))
+    files = list(enh_dir.glob(f"*_enh{suffix}.parquet"))
     if not files: 
         return (None, 0.0)
     
