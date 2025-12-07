@@ -36,44 +36,25 @@ def get_db_connection(db_name, retries=5):
                 raise
     raise Exception(f"Could not connect to {db_name} after {retries} retries.")
 
-def get_lookback_files(current_yymm, months_back=6):
-    """
-    Finds the previous N months of _features.parquet files.
-    Used to stitch history so PCA works correctly.
-    """
-    curr_date = datetime.datetime.strptime(current_yymm, "%y%m")
-    found_files = []
-    
-    # Loop backwards to gather history
-    for i in range(1, months_back + 1):
-        prev_date = curr_date - relativedelta(months=i)
-        prev_yymm = prev_date.strftime("%y%m")
-        
-        path = Path(cr.PATH_DATA) / f"{prev_yymm}_features.parquet"
-        if path.exists():
-            found_files.append(path)
-        else:
-            print(f"[WARN] Missing history file: {path}. PCA might be unstable.")
-            
-    # Return sorted (oldest first)
-    return sorted(found_files)
-
 def step_1_export_and_stitch(yymm):
     """
     1. Query SQLite for CURRENT month ticks.
-    2. Load PREVIOUS 6 months of parquet files.
-    3. Stitch together.
-    4. Save as {YYMM}_features.parquet.
+    2. Save as {YYMM}_features.parquet.
+    
+    CRITICAL CHANGE: No longer stitches historical RAW files. 
+    Relies on feature_creation.py to load historical SUMMARIES.
     """
-    print(f"[EOD] Step 1: Stitching History + Live Ticks for {yymm}...")
+    print(f"[EOD] Step 1: Exporting Live Ticks for {yymm}...")
     
     # --- A. Get Live Ticks from SQLite ---
     conn = get_db_connection(DB_MARKET)
+    
+    # Calculate date filter for SQLite
+    # Assuming yymm is "2512" -> "2025-12"
     year = "20" + yymm[:2]
     month = yymm[2:]
     date_filter = f"{year}-{month}"
     
-    # Filter strictly for the current month to avoid pollution
     sql = f"""
         SELECT timestamp, ticker, rate 
         FROM ticks 
@@ -82,41 +63,23 @@ def step_1_export_and_stitch(yymm):
     df_live = pd.read_sql(sql, conn)
     conn.close()
     
-    df_live_wide = pd.DataFrame()
-    if not df_live.empty:
-        df_live['ts'] = pd.to_datetime(df_live['timestamp'])
-        df_live_wide = df_live.pivot_table(index='ts', columns='ticker', values='rate', aggfunc='last')
-    else:
+    if df_live.empty:
         print(f"[WARN] No live ticks found for {date_filter} in SQLite.")
-
-    # --- B. Get Historical Data ---
-    hist_files = get_lookback_files(yymm, months_back=6)
-    dfs_to_concat = []
-    
-    for p in hist_files:
-        try:
-            d = pd.read_parquet(p)
-            dfs_to_concat.append(d)
-        except Exception as e:
-            print(f"[ERROR] Failed to read {p}: {e}")
-            
-    if not df_live_wide.empty:
-        dfs_to_concat.append(df_live_wide)
-        
-    if not dfs_to_concat:
-        print("[ERROR] No data available (History or Live). Aborting.")
         return False
-        
-    # --- C. Stitch and Save ---
-    df_final = pd.concat(dfs_to_concat).sort_index()
-    # Deduplicate overlapping timestamps if EOD is run multiple times
-    df_final = df_final[~df_final.index.duplicated(keep='last')]
+
+    # Pivot to Wide Format
+    df_live['ts'] = pd.to_datetime(df_live['timestamp'])
+    df_live_wide = df_live.pivot_table(index='ts', columns='ticker', values='rate', aggfunc='last')
+    
+    # --- B. Save DIRECTLY (No Stitching) ---
+    # We simply save the current month's data. 
+    # feature_creation.py will load this as the "Target" and load "History" from summaries.
     
     out_path = Path(cr.PATH_DATA) / f"{yymm}_features.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
-    df_final.to_parquet(out_path)
-    print(f"[EOD] Stitched {len(df_final)} rows. Saved to {out_path}")
+    df_live_wide.to_parquet(out_path)
+    print(f"[EOD] Exported {len(df_live_wide)} rows to {out_path}")
     return True
 
 def step_2_build_model(yymm):
