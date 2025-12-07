@@ -366,7 +366,7 @@ def update_grid(n):
     
     return cards, regime_text, regime_color, shock_text, shock_color
 
-# 3. Modal Logic
+# 3. Modal Logic (Fixed Ghost Click)
 @app.callback(
     Output("modal-trade", "is_open"),
     Output("modal-body-content", "children"),
@@ -380,8 +380,19 @@ def update_grid(n):
 def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
     ctx = callback_context
     if not ctx.triggered: return is_open
-    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
+    # Get the trigger property and value
+    triggered_prop = ctx.triggered[0]
+    trigger_id = triggered_prop['prop_id'].split('.')[0]
+    trigger_value = triggered_prop['value']
+
+    # --- FIX: IGNORE INITIALIZATION EVENTS ---
+    # Dash fires dynamic components with n_clicks=0 or None on creation.
+    # We must explicitly ignore these to prevent the "Ghost Pop-up".
+    if trigger_value == 0 or trigger_value is None:
+        return is_open, dash.no_update
+    # ----------------------------------------
+
     if "btn-cancel" in trigger_id or "btn-submit" in trigger_id:
         return False, dash.no_update
         
