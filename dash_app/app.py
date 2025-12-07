@@ -84,7 +84,7 @@ def check_and_reload_model():
 # Initial Load
 check_and_reload_model()
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
 app.title = "RV Overlay DSS"
 
 # --- HELPERS ---
