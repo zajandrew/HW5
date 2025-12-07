@@ -1,3 +1,71 @@
+It is great to hear the system is fully operational. Understanding Drift is critical because it explains why you might hold a trade even if the Z-Score (the statistical signal) isn't moving.
+Here is an explanation of the concept and a guide to every field in your blotter.
+Part 1: What is "Drift"?
+In Fixed Income, Drift represents the money you make (or lose) purely from the passage of time, assuming the market curve stays exactly the same (static). It is your "waiting fee" or "holding reward."
+You can think of your total PnL as:
+
+Drift is composed of two specific forces:
+1. Carry (The "Rent")
+This is the difference between the coupon you receive and the cost to fund the trade.
+ * If you Receive Fixed (Long): You earn the Swap Rate (e.g., 5%) and pay the Funding Rate (e.g., 4% overnight).
+   * Result: Positive Carry (+1%). You get paid to wait.
+ * If you Pay Fixed (Short): You pay the Swap Rate (5%) and receive Funding (4%).
+   * Result: Negative Carry (-1%). You are bleeding money every day you hold this.
+2. Roll-Down (The "Slide")
+This is the capital gain you make by your bond/swap "sliding down" the yield curve as it gets closer to maturity.
+ * The Scenario: Imagine the yield curve is upward sloping (steep). A 10Y rate is 4.0%, but a 9Y rate is 3.8%.
+ * The Mechanism: If you buy the 10Y at 4.0% and hold it for a year, it becomes a 9Y bond. If the market hasn't changed, 9Y bonds trade at 3.8%.
+ * The Profit: You own something yielding 4.0% in a market where fair value is 3.8%. Your asset is now "Premium" (more valuable). That price increase is the Roll-down.
+Summary: Your Drift column combines these two. A Positive Drift means the wind is at your back—even if the Z-Score stays flat, you are making money every day.
+Part 2: The Blotter Legend (Field by Field)
+Here is how to interpret every column in your "Active Positions" tab.
+A. Identity & Size
+| Field | Definition | How to Think About It |
+|---|---|---|
+| Trade ID | Unique database key. | Administrative only. |
+| Pair | The Strategy (e.g., Pay 5Y / Rec 3Y). | Shows your hedge structure. You are betting the spread between these two will revert. |
+| DV01 | Dollar Value of a 01 (1bp). | Risk Size. If rates move 1bp against you, this is how much cash you lose. |
+B. The Signal (Why are we here?)
+| Field | Definition | How to Think About It |
+|---|---|---|
+| Entry Z | The Z-Score when you opened the trade. | Your Reference Point. If you entered at +2.0, you want it to go to 0.0. |
+| Curr Z | The Live Z-Score right now. | The Scoreboard. 
+• If Entry=2.0 and Curr=0.5, you are winning (mean reversion happened).
+• If Curr=3.0, the dislocation got worse (you are losing). |
+| Target Z | The exit goal (usually 0.0). | The Finish Line. When Curr Z hits this, the "Status" will flag "TAKE PROFIT". |
+C. The Edge (Time & Quality)
+| Field | Definition | How to Think About It |
+|---|---|---|
+| Curr Drift | Carry + Roll (in basis points). | The Bleed/Feed Rate. 
+• Green (+): You are getting paid to hold this. You can be patient.
+• Red (-): You are paying rent. If the Z-score doesn't revert fast, this cost will eat your profits. |
+| Curr Comp | Z-Score + Drift. | The "Real" Attractiveness. A trade might have a mediocre Z-Score but massive positive drift, making it a "Great" trade (High Composite). This number tells you if the trade is still worth holding. |
+D. Performance (Show me the money)
+| Field | Definition | How to Think About It |
+|---|---|---|
+| Total PnL | Price + Carry + Roll. | Net Profit. The actual cash amount you would book if you closed now. |
+| Price PnL | Gain/Loss from curve moves. | Luck/Timing. Did the market move in your favor? |
+| Carry PnL | Coupon vs. Funding. | Income. The "Rent" collected so far. |
+| Roll PnL | Capital gain from aging. | Slide. The value gained from the curve shape. |
+E. Management (What to do)
+| Field | Definition | How to Think About It |
+|---|---|---|
+| Aging | Days Held / Max Allowed. | Expiration. If this gets close to Max (e.g., 40/45 days), you should look for an exit, even if you haven't hit your profit target. Signals decay over time. |
+| Status | Action Flag (e.g., OPEN, TAKE PROFIT). | The Command. 
+• OPEN: Do nothing.
+• TAKE PROFIT: You won. Close it.
+• STOP LOSS: You lost. Cut it.
+• MAX HOLD: Time is up. Liquidity it. |
+Summary Checklist for a Trader
+When you look at the blotter, scan in this order:
+ * Status: Is anything flashing TAKE PROFIT or STOP LOSS? (Act on these first).
+ * Total PnL: Am I making money?
+ * Curr Z vs Entry Z: Is the "story" working? (Is the spread compressing?)
+ * Drift: If the trade is flat (not winning or losing), check the Drift.
+   * Positive Drift: Keep holding. Time is on your side.
+   * Negative Drift: Consider cutting it early. Time is your enemy.
+
+
 This document provides a comprehensive architectural and strategic overview of the **Systematic Curve Overlay Framework**. It is designed for the Risk Committee and Product Leadership to evaluate the business logic, risk controls, and economic rationale behind the strategy.
 
 ---
