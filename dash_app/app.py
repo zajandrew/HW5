@@ -209,37 +209,72 @@ app.layout = html.Div([
             ], fluid=True)
         ]),
 
-        # TAB 3: SUMMARY
+        # --- UPDATE TAB 3: SUMMARY ---
         dbc.Tab(label="Summary", children=[
             dbc.Container([
                 html.H4("Performance Dashboard", className="mt-4"),
-                html.Div(id="summary-cards", className="d-flex gap-3 mb-4 flex-wrap"),
+                
+                # FIX: Add Controls for PnL Unit and Time Filter
                 dbc.Row([
+                    dbc.Col(dbc.RadioItems(
+                        id="pnl-unit-toggle",
+                        options=[{"label": "Cash ($)", "value": "cash"}, {"label": "Basis Points", "value": "bp"}],
+                        value="cash",
+                        inline=True
+                    ), width=4),
+                    dbc.Col(dbc.Select(
+                        id="time-filter",
+                        options=[
+                            {"label": "Last 1 Month", "value": "1M"},
+                            {"label": "Last 3 Months", "value": "3M"},
+                            {"label": "YTD", "value": "YTD"},
+                            {"label": "All Time", "value": "ALL"}
+                        ],
+                        value="YTD"
+                    ), width=4)
+                ], className="mb-3"),
+        
+                html.Div(id="summary-cards", className="d-flex gap-3 mb-4 flex-wrap"),
+        
+                # FIX: Add Graph Components
+                dbc.Row([
+                    dbc.Col(dcc.Graph(id='chart-cumulative-pnl'), width=6),
+                    dbc.Col(dcc.Graph(id='chart-attribution'), width=6)
+                ]),
+        
+                dbc.Row([
+                    # FIX: Add ID for stats table
                     dbc.Col([
                         html.H5("Time Horizon Stats"), 
-                        html.Div(id="time-stats-container")
+                        html.Div(id="stats-table-container") 
                     ], width=6),
                     dbc.Col([
                         html.H5("Risk Profile (Net vs Gross)"), 
                         html.Div(id="risk-profile-container")
                     ], width=6)
-                ])
+                ]),
+                
+                # FIX: Add this hidden div or visible div to handle the 'modify_trade' output
+                html.Div(id="summary-content", style={"display": "none"}) 
             ], fluid=True)
         ]),
         
         # TAB 4: HEALTH
         dbc.Tab(label="System Health", children=[
             dbc.Container([
-                html.H4("Regime & Signal Diagnostics", className="mt-4"),
-                html.Div(id="health-cards", className="d-flex gap-3 mb-4"),
-                html.H5("Filter Inputs (Last 10 Days)"),
-                dash_table.DataTable(
-                    id='tbl-signal-history', 
-                    style_table={'overflowX': 'auto'}, 
-                    style_cell={'backgroundColor': '#222', 'color': 'white'}
-                )
-            ], fluid=True)
-        ])
+              html.H4("Regime & Signal Diagnostics", className="mt-4"),
+              # FIX: Add Graph Component
+              dcc.Graph(id='chart-signal-health'),
+              
+              html.Div(id="health-cards", className="d-flex gap-3 mb-4"),
+              html.H5("Filter Inputs (Last 10 Days)"),
+              dash_table.DataTable(
+                  id='tbl-signal-history', 
+                  style_table={'overflowX': 'auto'}, 
+                  style_cell={'backgroundColor': '#222', 'color': 'white'}
+              )
+          ], fluid=True)
+       ])
     ])
 ])
 
