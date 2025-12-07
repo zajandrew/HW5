@@ -72,19 +72,25 @@ def assign_bucket(tenor):
             return name
     return "other"
 
+# In live_engine.py
+
 def _get_funding_rate_live(live_map):
     """Finds proxy for funding rate (shortest available tenor)."""
+    # Default to Model Anchor
     funding_rate = GLOBAL_FUNDING_ANCHOR if GLOBAL_FUNDING_ANCHOR > 0 else 4.0
     
     if live_map:
         valid_keys = [k for k in live_map.keys() if k in cr.TENOR_YEARS]
         if valid_keys:
-            # Find the ticker with the smallest tenor
             shortest_ticker = min(valid_keys, key=lambda k: cr.TENOR_YEARS[k])
             shortest_tenor = cr.TENOR_YEARS[shortest_ticker]
-            # Only use live map if it's a short-end rate (<= 1Y)
+            
             if shortest_tenor <= 1.0:
-                funding_rate = live_map[shortest_ticker]
+                live_val = live_map[shortest_ticker]
+                # --- FIX: Only use live if valid, otherwise keep anchor ---
+                if live_val > 0.0001:
+                    funding_rate = live_val
+                    
     return funding_rate
 
 def _get_z_at_tenor_dict(snapshot_dict, tenor, tol=None):
@@ -173,6 +179,8 @@ def get_live_z_scores(live_rates_map):
     z_map = {}
     
     for ticker, live_rate in live_rates_map.items():
+        if live_rate <= 0.00001: continue
+        
         tenor = cr.TENOR_YEARS.get(ticker)
         
         if tenor is None or tenor not in MODEL_SNAPSHOT:
