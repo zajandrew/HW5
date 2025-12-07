@@ -656,6 +656,19 @@ def update_blotter(n, click):
 
     return open_data, open_cols, style_cond, hist_data, hist_cols
 
+@app.callback(
+    Output('btn-close-trade', 'disabled'),
+    Output('btn-delete-trade', 'disabled'),
+    Input('tbl-open-positions', 'selected_rows')
+)
+def toggle_action_buttons(selected_rows):
+    # If no rows are selected (None or empty list), keep buttons disabled (True)
+    if not selected_rows:
+        return True, True
+    
+    # If a row IS selected, enable buttons (False)
+    return False, False
+
 # 6. Modify Trade
 @app.callback(
     Output('summary-content', 'children'), 
