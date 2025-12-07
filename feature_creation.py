@@ -267,12 +267,11 @@ def build_month(yymm: str) -> None:
     
     cache_name = f"{yymm}_summary_{decision_freq}.parquet"
     cache_path = path_enh / cache_name
-    if not cache_path.exists():
-        bucket_key = _decision_key(df_wide['ts'], decision_freq)
-        df_sampled = df_wide.sort_values("ts").groupby(bucket_key).head(1)
-        df_cache = _melt_long(df_sampled, tenormap)
-        df_cache.to_parquet(cache_path, index=False)
-        print(f"[{_now()}] [CACHE] Saved self-summary: {cache_name}")
+    bucket_key = _decision_key(df_wide['ts'], decision_freq)
+    df_sampled = df_wide.sort_values("ts").groupby(bucket_key).head(1)
+    df_cache = _melt_long(df_sampled, tenormap)
+    df_cache.to_parquet(cache_path, index=False)
+    print(f"[{_now()}] [CACHE] Saved self-summary: {cache_name}")
 
     buckets = (df_long["decision_ts"].dropna().unique().tolist())
     buckets.sort()
