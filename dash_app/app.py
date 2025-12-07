@@ -105,12 +105,25 @@ def get_drift_color(bps):
 def format_tenor(ticker, float_years):
     if float_years is None: return "N/A"
     y = float(float_years)
-    tol = 0.001
-    if abs(y - 1/12) < tol: return "1M"
-    if abs(y - 0.25) < tol: return "3M"
-    if abs(y - 0.5) < tol:  return "6M"
-    if abs(y - 1.0) < tol:  return "1Y"
-    if abs(y - round(y)) < tol: return f"{int(round(y))}Y"
+    
+    # 1. Handle "Close to Zero" (Overnight/Cash)
+    if y < 0.005: 
+        return "O/N"
+
+    # 2. Handle Sub-Year Tenors (The Fix)
+    # If less than 1.0 year (minus small tolerance), treat as Months
+    if y < (1.0 - 0.001):
+        months = y * 12.0
+        # Check if it is close to a whole month (e.g. 2.99 or 3.01 -> 3M)
+        if abs(months - round(months)) < 0.1:
+            return f"{int(round(months))}M"
+        # If it's a weird fractional month (e.g. 0.38 years), keep decimal
+    
+    # 3. Handle Whole Years
+    if abs(y - round(y)) < 0.001: 
+        return f"{int(round(y))}Y"
+        
+    # 4. Fallback for non-standard long tenors (e.g. 2.5Y)
     return f"{y:.1f}Y"
 
 def assign_bucket(tenor):
