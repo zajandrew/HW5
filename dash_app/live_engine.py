@@ -23,7 +23,8 @@ def load_midnight_model(yymm_str):
     global MODEL_SNAPSHOT, GLOBAL_FUNDING_ANCHOR
     
     try:
-        path = Path(cr.PATH_ENH) / f"{yymm_str}_enh.parquet"
+        suffix = cr.ENH_SUFFIX
+        path = Path(cr.PATH_ENH) / f"{yymm_str}_enh{suffix}.parquet"
         
         if not path.exists():
             print(f"[WARN] Model file not found: {path}")
