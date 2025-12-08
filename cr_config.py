@@ -77,6 +77,7 @@ Z_EXIT        = 0.75     # take profit when |z-spread| <= Z_EXIT
 Z_STOP        = 1.00     # stop if divergence since entry >= Z_STOP
 BPS_PNL_STOP = 0.00
 MAX_HOLD_DAYS = 10       # max holding period for a pair (days when DECISION_FREQ='D')
+OVERLAY_MIN_CHECK_DAYS = 5
 DRIFT_GATE_BPS = -0.5
 DRIFT_WEIGHT = 0.2
 
