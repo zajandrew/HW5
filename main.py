@@ -2,6 +2,216 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import seaborn as sns
+from pathlib import Path
+from math import sqrt
+
+# Import config
+import cr_config as cr
+
+# ==============================================================================
+# CONFIG & STYLE
+# ==============================================================================
+sns.set_theme(style="whitegrid", context="talk")
+plt.rcParams['figure.dpi'] = 120
+plt.rcParams['savefig.dpi'] = 300
+colors = {'pnl': '#2ecc71', 'dd': '#e74c3c', 'price': '#3498db', 'carry': '#f1c40f', 'roll': '#9b59b6'}
+
+def safe_divide(n, d, default=0.0):
+    return n / d if d != 0 else default
+
+# ==============================================================================
+# 1. DATA LOADING & PREP
+# ==============================================================================
+out_dir = Path(cr.PATH_OUT)
+suffix = getattr(cr, "OUT_SUFFIX", "")
+pos_path = out_dir / f"positions_ledger{suffix}.parquet"
+
+if not pos_path.exists():
+    raise FileNotFoundError(f"[ERROR] {pos_path} not found.")
+
+print(f"[LOAD] Reading {pos_path}...")
+df = pd.read_parquet(pos_path)
+
+# Filter Overlay only
+if "mode" in df.columns:
+    df = df[df["mode"] == "overlay"].copy()
+
+# Sort by Close Time (Critical for Equity Curve)
+df["close_ts"] = pd.to_datetime(df["close_ts"])
+df = df.sort_values("close_ts").reset_index(drop=True)
+
+# --- FIX: Create the Trade-Level Equity Curve Columns ---
+df["equity_bp"] = df["pnl_net_bp"].cumsum()  # <--- THIS WAS MISSING
+df["equity_cash"] = df["pnl_net_cash"].cumsum()
+
+# ==============================================================================
+# 2. METRICS ENGINE
+# ==============================================================================
+
+# --- A. Trade Statistics ---
+total_trades = len(df)
+win_trades = df[df["pnl_net_bp"] > 0]
+loss_trades = df[df["pnl_net_bp"] <= 0]
+
+win_rate = safe_divide(len(win_trades), total_trades)
+gross_win = win_trades["pnl_net_bp"].sum()
+gross_loss = abs(loss_trades["pnl_net_bp"].sum())
+profit_factor = safe_divide(gross_win, gross_loss)
+
+avg_trade_bp = df["pnl_net_bp"].mean()
+avg_win_bp = win_trades["pnl_net_bp"].mean()
+avg_loss_bp = loss_trades["pnl_net_bp"].mean()
+
+# Hold Times
+if "days_held_equiv" in df.columns:
+    avg_hold = df["days_held_equiv"].mean()
+else:
+    avg_hold = (df["close_ts"] - pd.to_datetime(df["open_ts"])).dt.days.mean()
+
+# --- B. Time-Series Statistics (Sharpe/Sortino) ---
+# We convert the discrete trade ledger into a Daily Equity Curve for proper risk stats
+daily_idx = pd.date_range(start=df["close_ts"].min(), end=df["close_ts"].max(), freq='D')
+daily_pnl = df.set_index("close_ts")["pnl_net_bp"].resample('D').sum().reindex(daily_idx, fill_value=0.0)
+
+# Annualization Factor (Assuming 252 trading days)
+ANN_FACTOR = 252
+
+mean_daily = daily_pnl.mean()
+std_daily = daily_pnl.std()
+downside_daily = daily_pnl[daily_pnl < 0].std()
+
+# Metrics
+sharpe = safe_divide(mean_daily * ANN_FACTOR, std_daily * sqrt(ANN_FACTOR))
+sortino = safe_divide(mean_daily * ANN_FACTOR, downside_daily * sqrt(ANN_FACTOR))
+
+# Drawdown Calculation (Time Series)
+cum_equity_daily = daily_pnl.cumsum()
+running_max = cum_equity_daily.cummax()
+dd_series = cum_equity_daily - running_max
+max_dd_bp = dd_series.min()
+calmar = safe_divide(cum_equity_daily.iloc[-1], abs(max_dd_bp))
+
+# --- C. Attribution (The Drift Check) ---
+total_price = df["pnl_price_bp"].sum()
+total_carry = df["pnl_carry_bp"].sum()
+total_roll = df["pnl_roll_bp"].sum()
+
+# ==============================================================================
+# 3. PRINT PROFESSIONAL TABLE
+# ==============================================================================
+print("\n" + "="*60)
+print(f"{'SYSTEMATIC OVERLAY PERFORMANCE REPORT':^60}")
+print("="*60)
+
+stats = [
+    ("Total Net PnL (bps)", f"{df['pnl_net_bp'].sum():,.1f}"),
+    ("Total Net Cash ($)", f"${df['pnl_net_cash'].sum():,.0f}"),
+    ("Total Trades", f"{total_trades}"),
+    ("Win Rate", f"{win_rate:.1%}"),
+    ("-" * 20, "-" * 20),
+    ("Profit Factor", f"{profit_factor:.2f}"),
+    ("Avg Trade (bps)", f"{avg_trade_bp:.2f}"),
+    ("Avg Win / Avg Loss", f"{abs(avg_win_bp/avg_loss_bp):.2f}"),
+    ("Avg Hold (Days)", f"{avg_hold:.1f}"),
+    ("-" * 20, "-" * 20),
+    ("Sharpe Ratio (Ann.)", f"{sharpe:.2f}"),
+    ("Sortino Ratio (Ann.)", f"{sortino:.2f}"),
+    ("Max Drawdown (bps)", f"{max_dd_bp:,.1f}"),
+    ("Return / DD (Calmar)", f"{abs(calmar):.2f}"),
+]
+
+col_width = 35
+for label, val in stats:
+    if "---" in label:
+        print(f"{label}   {val}")
+    else:
+        print(f"{label:<{col_width}} {val:>15}")
+print("="*60)
+print(f"ATTRIBUTION:\n Price: {total_price:,.0f} bps | Carry: {total_carry:,.0f} bps | Roll: {total_roll:,.0f} bps")
+print("="*60 + "\n")
+
+# ==============================================================================
+# 4. PLOTTING SUITE
+# ==============================================================================
+
+# --- FIGURE 1: EXECUTIVE DASHBOARD ---
+fig = plt.figure(figsize=(16, 10))
+gs = fig.add_gridspec(3, 2)
+
+# 1. Equity Curve (Main - Daily Resampled for Smoothness)
+ax1 = fig.add_subplot(gs[0, :])
+ax1.plot(cum_equity_daily.index, cum_equity_daily.values, color=colors['pnl'], lw=2, label='Net Equity (bps)')
+ax1.fill_between(cum_equity_daily.index, cum_equity_daily.values, 0, color=colors['pnl'], alpha=0.1)
+ax1.set_title("Realized Equity Curve (Net Bps)", fontweight='bold')
+ax1.set_ylabel("Cumulative Bps")
+ax1.legend(loc="upper left")
+ax1.margins(x=0)
+
+# 2. Drawdown (Underwater)
+ax2 = fig.add_subplot(gs[1, :], sharex=ax1)
+ax2.fill_between(dd_series.index, dd_series.values, 0, color=colors['dd'], alpha=0.3)
+ax2.plot(dd_series.index, dd_series.values, color=colors['dd'], lw=1)
+ax2.set_title("Drawdown Profile", fontsize=11)
+ax2.set_ylabel("Drawdown (bps)")
+ax2.grid(True, linestyle='--', alpha=0.5)
+
+# 3. Monthly Returns (Bar)
+ax3 = fig.add_subplot(gs[2, 0])
+monthly = df.set_index("close_ts")["pnl_net_bp"].resample('M').sum()
+norm = plt.Normalize(monthly.min(), monthly.max())
+clrs = ['#e74c3c' if x < 0 else '#2ecc71' for x in monthly.values]
+monthly.index = monthly.index.strftime('%Y-%m')
+monthly.plot(kind='bar', ax=ax3, color=clrs, width=0.8)
+ax3.set_title("Monthly Net PnL (bps)")
+ax3.set_xlabel("")
+ax3.tick_params(axis='x', rotation=45, labelsize=9)
+ax3.grid(axis='y', linestyle='--', alpha=0.5)
+
+# 4. PnL Distribution (Histogram)
+ax4 = fig.add_subplot(gs[2, 1])
+sns.histplot(df['pnl_net_bp'], kde=True, ax=ax4, color='#34495e', bins=30)
+ax4.axvline(0, color='black', linestyle='--')
+ax4.axvline(avg_trade_bp, color=colors['pnl'], linestyle='-', label=f'Mean: {avg_trade_bp:.1f}')
+ax4.set_title("Trade Distribution (bps)")
+ax4.legend()
+
+plt.tight_layout()
+plt.show()
+
+# --- FIGURE 2: THE "DRIFT" THESIS (Attribution) ---
+# Create cumulative series for components based on Trade Ledger
+# (df is already sorted by close_ts)
+cum_price = df["pnl_price_bp"].cumsum()
+cum_carry = df["pnl_carry_bp"].cumsum()
+cum_roll = df["pnl_roll_bp"].cumsum()
+cum_drift = cum_carry + cum_roll
+
+fig2, ax = plt.subplots(figsize=(14, 6))
+
+ax.plot(df["close_ts"], cum_price, label="Price PnL (Luck/Mean Rev)", color=colors['price'], lw=1.5, alpha=0.8)
+ax.plot(df["close_ts"], cum_drift, label="Drift PnL (Carry + Roll)", color=colors['carry'], lw=2.5)
+# FIX: Now "equity_bp" definitely exists
+ax.plot(df["close_ts"], df["equity_bp"], label="Total Net PnL", color='black', lw=2, linestyle='--')
+
+ax.set_title("PnL Attribution: Drift (Predictable) vs Price (Volatile)", fontsize=14, fontweight='bold')
+ax.set_ylabel("Cumulative Bps")
+ax.legend(fontsize=11)
+ax.grid(True, which='major', linestyle='-', alpha=0.6)
+ax.grid(True, which='minor', linestyle=':', alpha=0.3)
+ax.minorticks_on()
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import matplotlib.ticker as mtick
 import seaborn as sns
 from pathlib import Path
