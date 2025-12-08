@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import threading
 import time
+import numpy as np
 
 # --- Hook into Parent Directory ---
 current_dir = Path(__file__).resolve().parent
@@ -565,7 +566,8 @@ def update_blotter(n, click):
 
         entry_z = row['entry_z_spread']
         open_dt = pd.to_datetime(row['open_ts'])
-        days_held = (now_dt - open_dt).days
+        now_date = now_dt.date()
+        days_held = np.busday_count(open_dt - now_date)
         stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
 
         bg_color = "#222"
