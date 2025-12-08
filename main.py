@@ -271,8 +271,21 @@ ax_heat = fig2.add_subplot(gs2[1, 0])
 heat_data = daily_pnl.resample('M').sum()
 heat_df = pd.DataFrame({'year': heat_data.index.year, 'month': heat_data.index.month, 'pnl': heat_data.values})
 heat_piv = heat_df.pivot(index='year', columns='month', values='pnl')
-sns.heatmap(heat_piv, ax=ax_heat, cmap="RdYlGn", center=0, annot=True, fmt=".0f", cbar=False)
+
+# --- FIX START: Custom k-formatting for Cash ---
+if REPORT_MODE == "CASH":
+    # Create a DataFrame of strings like "15k", "-2k"
+    annot_labels = heat_piv.applymap(lambda x: f'{x/1000:.0f}k' if pd.notnull(x) else '')
+    fmt_param = ""  # Formatting is already done in the strings
+else:
+    # Standard behavior for Bps
+    annot_labels = True 
+    fmt_param = ".0f"
+# -----------------------------------------------
+
+sns.heatmap(heat_piv, ax=ax_heat, cmap="RdYlGn", center=0, annot=annot_labels, fmt=fmt_param, cbar=False)
 ax_heat.set_title(f"Monthly Returns Heatmap ({cfg['unit']})")
+
 
 # 4. Rolling Sharpe Ratio (6-Month Lookback)
 ax_roll = fig2.add_subplot(gs2[1, 1])
