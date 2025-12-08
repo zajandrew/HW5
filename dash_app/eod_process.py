@@ -231,7 +231,8 @@ def step_4_mark_positions(yymm):
         curr_z = get_z(t['tenor_pay']) - get_z(t['tenor_rec'])
         
         open_dt = pd.to_datetime(t['open_ts'])
-        days_held = (pd.Timestamp.now() - open_dt).days
+        now_date = now_dt.date()
+        days_held = np.busday_count(open_dt - now_date)
         
         entry_z = t['entry_z_spread']
         reason = None
