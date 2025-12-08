@@ -395,55 +395,82 @@ def get_valid_partners(active_ticker, direction, live_z_map, live_map):
 
 def calculate_live_pnl(row, live_map, now_dt):
     """
-    Calculates Price, Carry, and Rolldown PnL.
-    Uses sorted composite curve for robust interpolation.
+    Calculates Price, Carry, and Rolldown PnL using Fractional Time.
+    This enables 'Live' intraday accretion rather than waiting for EOD.
     """
+    # 1. Calculate Fractional Time (Act/360 basis)
     entry_dt = pd.to_datetime(row['open_ts'])
-    dt_days = max(0.0, (now_dt - entry_dt).days)
+    time_diff = now_dt - entry_dt
     
-    # Rates
-    entry_pay = row['entry_rate_pay']
-    entry_rec = row['entry_rate_rec']
-    curr_pay = live_map.get(row['ticker_pay'], entry_pay)
-    curr_rec = live_map.get(row['ticker_rec'], entry_rec)
+    # Use total seconds to get fractional days (e.g., 1.5 days instead of 1)
+    # This allows carry to accrue smoothly every second the app refreshes.
+    dt_days = max(0.0, time_diff.total_seconds() / 86400.0)
     
-    # Funding
+    # 2. Get Rates
+    entry_pay = float(row['entry_rate_pay'])
+    entry_rec = float(row['entry_rate_rec'])
+    
+    # Get current rates (fallback to entry rate if ticker missing from feed)
+    curr_pay = float(live_map.get(row['ticker_pay'], entry_pay))
+    curr_rec = float(live_map.get(row['ticker_rec'], entry_rec))
+    
+    # Get funding (Float Leg)
     funding_rate = _get_funding_rate_live(live_map)
 
-    dv01 = row['dv01'] 
+    dv01 = float(row['dv01'])
     
-    # Price PnL
-    prc_pay_bp = (curr_pay - entry_pay) * 100.0
-    prc_rec_bp = (entry_rec - curr_rec) * 100.0
+    # -------------------------------------------------------
+    # A. Price PnL (Mark-to-Market)
+    # -------------------------------------------------------
+    # Price moves instantly based on rate change. No time decay here.
+    # Pay Leg (Short): Rate Up -> Price Down (Gain for Short).
+    # Rec Leg (Long):  Rate Up -> Price Down (Loss for Long).
     
-    # Carry PnL
-    cry_pay_bp = (entry_pay - funding_rate) * 100.0 * (-1) * (dt_days / 360.0)
-    cry_rec_bp = (entry_rec - funding_rate) * 100.0 * (+1) * (dt_days / 360.0)
+    prc_pay_bp = (curr_pay - entry_pay) * 100.0  # (Current - Entry) is positive if rate rose. 
+    prc_rec_bp = (entry_rec - curr_rec) * 100.0  # (Entry - Current) is negative if rate rose.
     
-    # Rolldown PnL (Sorted Interpolation)
+    # -------------------------------------------------------
+    # B. Carry PnL (Accrual)
+    # -------------------------------------------------------
+    # Formula: (FixedRate - FloatRate) * Direction * Time
+    # Pay Leg (-1): Pays Fixed, Receives Float.
+    # Rec Leg (+1): Receives Fixed, Pays Float.
+    
+    cry_pay_bp = (entry_pay - funding_rate) * 100.0 * (-1.0) * (dt_days / 360.0)
+    cry_rec_bp = (entry_rec - funding_rate) * 100.0 * (+1.0) * (dt_days / 360.0)
+    
+    # -------------------------------------------------------
+    # C. Rolldown PnL (Curve Slide)
+    # -------------------------------------------------------
+    # We interpolate where the yield *would be* if we slid down the curve by dt_days.
     rol_pay_bp, rol_rec_bp = 0.0, 0.0
     
+    # Build curve for interpolation (Model + Live updates)
     curve_data = {t: r.get('rate', 0.0) for t, r in MODEL_SNAPSHOT.items()}
     for k, v in live_map.items():
         t = cr.TENOR_YEARS.get(k)
         if t: curve_data[t] = v
             
-    # CRITICAL FIX: Sort xp for np.interp
+    # CRITICAL: Sort keys for np.interp to work correctly
     xp = sorted(curve_data.keys())
     fp = [curve_data[t] for t in xp]
     
     if xp:
-        # Pay Leg (Short)
-        t_roll_pay = max(0.0, row['tenor_pay'] - (dt_days/360.0))
+        # Pay Leg (Short): If rolled yield < current yield, Price is higher. 
+        # Since we are Short, Higher Price = Loss.
+        t_roll_pay = max(0.0, float(row['tenor_pay']) - (dt_days/360.0))
         y_roll_pay = np.interp(t_roll_pay, xp, fp)
-        rol_pay_bp = (curr_pay - y_roll_pay) * 100.0 * (-1)
+        rol_pay_bp = (curr_pay - y_roll_pay) * 100.0 * (-1.0)
         
-        # Rec Leg (Long)
-        t_roll_rec = max(0.0, row['tenor_rec'] - (dt_days/360.0))
+        # Rec Leg (Long): If rolled yield < current yield, Price is higher.
+        # Since we are Long, Higher Price = Gain.
+        t_roll_rec = max(0.0, float(row['tenor_rec']) - (dt_days/360.0))
         y_roll_rec = np.interp(t_roll_rec, xp, fp)
-        rol_rec_bp = (curr_rec - y_roll_rec) * 100.0 * (+1)
+        rol_rec_bp = (curr_rec - y_roll_rec) * 100.0 * (+1.0)
 
-    # Totals
+    # -------------------------------------------------------
+    # D. Aggregation
+    # -------------------------------------------------------
     total_price_bp = prc_pay_bp + prc_rec_bp
     total_carry_bp = cry_pay_bp + cry_rec_bp
     total_roll_bp  = rol_pay_bp + rol_rec_bp
@@ -464,3 +491,4 @@ def calculate_live_pnl(row, live_map, now_dt):
     )
     
     return cash_tuple, bp_tuple
+
