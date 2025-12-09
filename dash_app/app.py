@@ -508,6 +508,13 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     DRIFT_WEIGHT = float(getattr(cr, "DRIFT_WEIGHT", 0.2))
     composite = z_spread + (DRIFT_WEIGHT * total_drift)
     
+    # 1. Get Cost in Basis Points (from Config)
+    cost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
+    # 2. Get DV01 (Size input is in 'k', so multiply by 1000)
+    trade_dv01 = float(size) * 1000.0
+    # 3. Calculate Cost in Cash
+    tcost_cash = cost_bp * trade_dv01
+
     trade = {
         'open_ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'status': 'OPEN',
@@ -515,13 +522,15 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
         'ticker_rec': t_rec,
         'tenor_pay': tenor_pay,
         'tenor_rec': tenor_rec,
-        'dv01': float(size) * 1000,
+        'dv01': trade_dv01,
         'entry_rate_pay': float(r_pay),
         'entry_rate_rec': float(r_rec),
         'entry_z_spread': z_spread,
         'model_z_score': model_z,
-        'entry_drift_bps': total_drift,   # NEW FIELD
-        'entry_composite_score': composite # NEW FIELD
+        'entry_drift_bps': total_drift,
+        'entry_composite_score': composite,
+        'tcost_cash': tcost_cash,
+        'tcost_bp': cost_bp
     }
     add_position(trade)
     return f"Trade Executed: Pay {t_pay} / Rec {t_rec}"
@@ -549,8 +558,15 @@ def update_blotter(n, click):
     open_data = []
     
     for _, row in open_df.iterrows():
-        (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(row, feed.live_map, now_dt)
+        # 1. Retrieve Costs
+        t_cost_cash = float(row.get('tcost_cash', 0.0))
         
+        # 2. Calculate Live PnL (Gross)
+        (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(row, feed.live_map, now_dt)
+
+        # 3. Calculate Net PnL
+        c_net = c_tot - t_cost_cash
+
         # Calculate Live Composite Score
         z_map = le.get_live_z_scores(feed.live_map)
         zp = z_map.get(row['ticker_pay'], {}).get('z_live', 0)
@@ -567,19 +583,26 @@ def update_blotter(n, click):
         entry_z = row['entry_z_spread']
         open_dt = pd.to_datetime(row['open_ts'])
         now_date = now_dt.date()
-        days_held = np.busday_count(open_dt - now_date)
-        stop_z_level = entry_z + (np.sign(entry_z) * Z_STOP) if entry_z != 0 else Z_STOP
-
+        
+        # Use simple try/except for robust business day count
+        try:
+            days_held = int(np.busday_count(open_dt.date(), now_date))
+        except:
+            days_held = 0
+            
         bg_color = "#222"
         db_reason = row.get('close_reason')
+        flag = "OPEN"
+
         if db_reason and db_reason not in [None, 'None', '']:
              if db_reason == 'max_hold': flag, bg_color = "MAX HOLD", "#B8860B"
              elif db_reason == 'stop_loss': flag, bg_color = "STOP LOSS (EOD)", "#8B0000"
              elif db_reason == 'reversion': flag, bg_color = "TAKE PROFIT (EOD)", "#006400"
              else: flag = f"CHECK: {db_reason}"
         else:
-             flag = "OPEN"
-             if abs(curr_z) < Z_EXIT: flag, bg_color = "TAKE PROFIT", "#006400"
+             # Live Flags (Soft Warning)
+             if days_held >= MAX_HOLD: flag, bg_color = "OVERDUE", "#B8860B"
+             elif abs(curr_z) < Z_EXIT: flag, bg_color = "TAKE PROFIT", "#006400"
              elif abs(curr_z - entry_z) > Z_STOP: flag, bg_color = "STOP LOSS", "#8B0000"
 
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
@@ -590,12 +613,13 @@ def update_blotter(n, click):
             'open_date': row['open_ts'].split(' ')[0], 
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            'entry_z': round(entry_z, 2),  # Added
+            'entry_z': round(entry_z, 2),
             'curr_z': round(curr_z, 2),
             'curr_drift': round(curr_drift, 2),
             'curr_comp': round(curr_comp, 2),
             'target_z': f"0.0 ± {Z_EXIT}",
-            'total_pnl': round(c_tot, 0),
+            'total_pnl': round(c_net, 0),        # Net PnL
+            'trade_cost': round(-t_cost_cash, 0), # Display Negative
             'price_pnl': round(c_prc, 0),
             'carry_pnl': round(c_cry, 0),
             'roll_pnl': round(c_rol, 0),
@@ -611,16 +635,18 @@ def update_blotter(n, click):
     for _, row in hist_df.iterrows():
         label_pay = format_tenor(row['ticker_pay'], row['tenor_pay'])
         label_rec = format_tenor(row['ticker_rec'], row['tenor_rec'])
+        t_cost_hist = float(row.get('tcost_cash', 0.0))
         
         hist_data.append({
-            'trade_id': row['trade_id'], # Added
-            'open_date': str(row['open_ts']).split(' ')[0], # Added
+            'trade_id': row['trade_id'],
+            'open_date': str(row['open_ts']).split(' ')[0],
             'close_ts': row['close_ts'],
             'pair': f"Pay {label_pay} / Rec {label_rec}",
             'dv01': f"{int(row['dv01']/1000)}k",
-            'entry_z': round(row.get('entry_z_spread', 0), 2), # Added
-            'exit_z': round(row.get('close_z_spread', 0), 2),  # Added (assuming column exists)
-            'total_pnl': f"${row['realized_pnl_cash']:,.0f}",
+            'entry_z': round(row.get('entry_z_spread', 0), 2),
+            'exit_z': round(row.get('close_z_spread', 0), 2),
+            'total_pnl': f"${row['realized_pnl_cash']:,.0f}", # Already Net in DB
+            'trade_cost': f"${-t_cost_hist:,.0f}",            # Display Negative
             'price_pnl': f"${row.get('realized_pnl_price', 0):,.0f}",
             'carry_pnl': f"${row.get('realized_pnl_carry', 0):,.0f}",
             'roll_pnl': f"${row.get('realized_pnl_roll', 0):,.0f}",
@@ -629,20 +655,20 @@ def update_blotter(n, click):
 
     # --- COLUMNS DEFINITIONS ---
     
-    # Updated Open Columns (reordered logically)
+    # Updated Open Columns (Added Trade Cost)
     open_cols_list = [
         'trade_id', 'open_date', 'pair', 'dv01', 
         'entry_z', 'curr_z', 'curr_drift', 'curr_comp', 'target_z', 
-        'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 
+        'total_pnl', 'trade_cost', 'price_pnl', 'carry_pnl', 'roll_pnl',
         'aging', 'status'
     ]
     open_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in open_cols_list]
     
-    # Updated History Columns
+    # Updated History Columns (Added Trade Cost)
     hist_cols_list = [
         'trade_id', 'open_date', 'close_ts', 'pair', 'dv01', 
         'entry_z', 'exit_z', 
-        'total_pnl', 'price_pnl', 'carry_pnl', 'roll_pnl', 
+        'total_pnl', 'trade_cost', 'price_pnl', 'carry_pnl', 'roll_pnl', 
         'reason'
     ]
     hist_cols = [{"name": i.replace('_', ' ').title(), "id": i} for i in hist_cols_list]
@@ -671,7 +697,7 @@ def toggle_action_buttons(selected_rows):
     # If a row IS selected, enable buttons (False)
     return False, False
 
-# 6. Modify Trade
+# 6. Modify Trade (Closing Logic)
 @app.callback(
     Output('summary-content', 'children'), 
     Input('btn-close-trade', 'n_clicks'),
@@ -702,12 +728,31 @@ def modify_trade(n_close, n_del, rows, data, reason):
         original_trade = matches.iloc[0]
         now_dt = datetime.now()
         
+        # 1. Retrieve Costs from DB (Stored at entry)
+        t_cost_cash = float(original_trade.get('tcost_cash', 0.0))
+        t_cost_bp = float(original_trade.get('tcost_bp', 0.0))
+        
+        # 2. Get Gross PnL from Engine
         (c_tot, c_prc, c_cry, c_rol), (b_tot, b_prc, b_cry, b_rol) = le.calculate_live_pnl(
             original_trade, feed.live_map, now_dt
         )
         
-        c_dict = {'total': c_tot, 'price': c_prc, 'carry': c_cry, 'roll': c_rol}
-        b_dict = {'total': b_tot, 'price': b_prc, 'carry': b_cry, 'roll': b_rol}
+        # 3. Netting (Total - Cost)
+        # We subtract cost from 'total' so the Realized PnL is Net.
+        # We keep components (Price, Carry, Roll) Gross for attribution analysis.
+        c_dict = {
+            'total': c_tot - t_cost_cash, 
+            'price': c_prc, 
+            'carry': c_cry, 
+            'roll': c_rol
+        }
+        
+        b_dict = {
+            'total': b_tot - t_cost_bp, 
+            'price': b_prc, 
+            'carry': b_cry, 
+            'roll': b_rol
+        }
         
         update_position_status(
             trade_id, "CLOSED", reason or "manual", 
@@ -716,7 +761,6 @@ def modify_trade(n_close, n_del, rows, data, reason):
         )
         
     return "Action Complete"
-
 # 7. EOD Trigger
 @app.callback(
     Output('btn-run-eod', 'children'),
