@@ -284,10 +284,10 @@ def calc_live_drift(tenor, direction, live_map):
     total_drift = (raw_carry + raw_roll) * direction
     return total_drift
 
-def get_valid_partners(active_ticker, direction, live_z_map, live_map):
+def get_valid_partners(active_ticker, direction, live_z_map, live_map, bypass_gates=False):
     """
-    Finds candidates based on RELATIVE NORMALIZED SCORE (Option B).
-    Matches portfolio_test.py 'Overlay' logic exactly.
+    Finds candidates.
+    bypass_gates=True: Returns candidates even if Z-Spread < Threshold, sorted by 'rationality'.
     """
     active_tenor = cr.TENOR_YEARS.get(active_ticker)
     if active_ticker not in live_z_map:
@@ -300,81 +300,67 @@ def get_valid_partners(active_ticker, direction, live_z_map, live_map):
     min_alt_tenor = getattr(cr, "ALT_LEG_TENOR_YEARS", 0.0)
     min_sep = getattr(cr, "MIN_SEP_YEARS", 0.5)
     
-    # Use "Option B" Thresholds
+    # Thresholds (Ignored if bypass_gates=True)
     DRIFT_GATE = float(getattr(cr, "DRIFT_GATE_BPS", -0.5))
     DRIFT_WEIGHT = float(getattr(cr, "DRIFT_WEIGHT", 2.0))
     Z_ENTRY = float(getattr(cr, "Z_ENTRY", 0.75))
     SHORT_EXTRA = float(getattr(cr, "SHORT_END_EXTRA_Z", 0.30))
     
-    # Direction Scalar:
-    # If input is 'PAY' (Short), side_s = -1.0
-    # If input is 'REC' (Long), side_s = +1.0
+    # Direction: If PAY -> We are selling. We want to sell RICH (High Z).
+    # We gain if we swap into something CHEAPER (Lower Z).
+    # Spread = Active_Z - Candidate_Z.
     dir_scalar = -1.0 if direction == 'PAY' else 1.0
 
-    # 1. Calculate Baseline Drift (The trade we are hedging/replacing)
-    # We use the SAME direction scalar, because we want to know 
-    # "Does candidate pay me MORE than the hedge leg?"
+    # Baseline Drift
     drift_exec = calc_live_drift(active_tenor, dir_scalar, live_map)
 
     for ticker, info in live_z_map.items():
         tenor = info['tenor']
         z_live = info['z_live']
         
-        # --- Constraints (Matching portfolio_test) ---
+        # --- HARD Constraints (Keep these to prevent nonsense) ---
         if tenor == active_tenor: continue
         if tenor < min_alt_tenor: continue
         
         dist = abs(tenor - active_tenor)
         if dist < min_sep: continue
         
-        # Bucket Check: Prevent crossing Short/Long buckets
+        # Bucket Check
         b_exec = assign_bucket(active_tenor)
         b_cand = assign_bucket(tenor)
-        
         if b_cand == "short" and b_exec == "long": continue
         if b_exec == "short" and b_cand == "long": continue
         
-        # --- 1. Z-Spread ---
-        # "disp" in portfolio_test. 
-        # If buying (REC), we want High Z (Cheap). disp = Z_Cand - Z_Exec
-        # If selling (PAY), we want Low Z (Rich). disp = Z_Exec - Z_Cand
+        # --- 1. Z-Spread Calculation ---
+        # The 'Alpha' of the trade. Positive = Mean Reverting.
         z_spread = (z_live - active_z) if dir_scalar > 0 else (active_z - z_live)
         
-        # Effective Entry Threshold (Assuming Standard Size since no DV01 input here)
-        z_threshold = Z_ENTRY
-        
-        # Short End Padding
-        if (b_cand == "short" or b_exec == "short"):
-            z_threshold += SHORT_EXTRA
-            
-        if z_spread < z_threshold: continue
+        # --- GATES ---
+        if not bypass_gates:
+            # 1. Z Threshold
+            z_threshold = Z_ENTRY
+            if (b_cand == "short" or b_exec == "short"):
+                z_threshold += SHORT_EXTRA
+            if z_spread < z_threshold: continue
 
-        # --- 2. Fly Gate ---
-        # Check Candidate (Leg 1 - New)
-        # Note: If we Rec Candidate, we are buying. Sign = +1.
-        if not fly_alignment_ok_live(tenor, 1.0, MODEL_SNAPSHOT, zdisp_for_pair=z_spread): continue
-        
-        # Check Execution (Leg 2 - Replaced)
-        # Note: We are replacing the hedge. If Hedge was Rec, we Rec Candidate.
-        # But 'fly_alignment_ok' asks: is this specific point compatible with our direction?
-        # If we are effectively "Selling" the execution leg (by not doing it), sign is -1.
-        if not fly_alignment_ok_live(active_tenor, -1.0, MODEL_SNAPSHOT, zdisp_for_pair=z_spread): continue
+            # 2. Fly Gates
+            if not fly_alignment_ok_live(tenor, 1.0, MODEL_SNAPSHOT, zdisp_for_pair=z_spread): continue
+            if not fly_alignment_ok_live(active_tenor, -1.0, MODEL_SNAPSHOT, zdisp_for_pair=z_spread): continue
 
-        # --- 3. Net Drift & Normalization (Option B) ---
+            # 3. Drift Gate
+            drift_alt = calc_live_drift(tenor, dir_scalar, live_map)
+            net_drift_bps = drift_alt - drift_exec
+            if net_drift_bps < DRIFT_GATE: continue
+        
+        # Recalculate Drift for Scoring (if skipped above)
         drift_alt = calc_live_drift(tenor, dir_scalar, live_map)
-        
-        # Net Advantage: How much better is Candidate than Exec?
         net_drift_bps = drift_alt - drift_exec
         
-        # Scaling (Per Year of Extension)
-        scaling_factor = dist # Matches portfolio_test logic strictly (dist_years)
-        if scaling_factor == 0: scaling_factor = 1.0 # Safety
-        
+        # Normalization
+        scaling_factor = dist if dist > 0 else 1.0
         norm_drift_bps = net_drift_bps / scaling_factor
         
-        # --- 4. Gate & Score ---
-        if net_drift_bps < DRIFT_GATE: continue
-        
+        # Score
         score = z_spread + (norm_drift_bps * DRIFT_WEIGHT)
 
         candidates.append({
@@ -386,7 +372,7 @@ def get_valid_partners(active_ticker, direction, live_z_map, live_map):
             'net_drift_bps': net_drift_bps,
             'norm_drift_bps': norm_drift_bps,
             'composite': score,
-            'is_gated': False # If we are here, it passed the gate
+            'is_gated': False
         })
         
     # Sort by COMPOSITE Score (High to Low)
