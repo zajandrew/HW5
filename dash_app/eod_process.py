@@ -206,15 +206,42 @@ def step_4_mark_positions(yymm):
         return
 
     df_enh = pd.read_parquet(enh_path)
-    last_ts = df_enh['ts'].max()
-    snapshot = df_enh[df_enh['ts'] == last_ts].set_index('tenor_yrs')
     
-    def get_z(tenor):
-        if tenor not in snapshot.index:
-             # try finding nearest
-             idx = snapshot.index.get_indexer([tenor], method='nearest')[0]
-             return snapshot.iloc[idx]['z_comb']
-        return snapshot.loc[tenor]['z_comb']
+    # --- 1. ROBUST SNAPSHOT LOADING (Fixes Fragmentation Bug) ---
+    # Round timestamps to nearest minute to handle write delays
+    df_enh['ts_group'] = df_enh['ts'].dt.floor('min')
+    
+    # Find the latest complete batch
+    last_batch_time = df_enh['ts_group'].max()
+    print(f"[EOD] Loading Snapshot Batch: {last_batch_time}")
+    
+    # Filter for that batch and deduplicate
+    snapshot_subset = df_enh[df_enh['ts_group'] == last_batch_time].copy()
+    snapshot_subset = snapshot_subset.sort_values('ts').drop_duplicates(subset=['tenor_yrs'], keep='last')
+    
+    # Create Dictionary Map for safe lookups (Round keys to avoid float mismatch)
+    snapshot_map = {round(row['tenor_yrs'], 4): row['z_comb'] for _, row in snapshot_subset.iterrows()}
+    # -------------------------------------------------------------
+    
+    def get_z_robust(target_tenor):
+        t_round = round(target_tenor, 4)
+        
+        # A. Exact Match
+        if t_round in snapshot_map:
+            return snapshot_map[t_round]
+            
+        # B. Nearest Neighbor with Strict Tolerance (e.g. 0.05 years)
+        # Prevents 5Y being used for 7Y if 7Y is missing.
+        if not snapshot_map: return None
+        
+        closest_t = min(snapshot_map.keys(), key=lambda k: abs(k - t_round))
+        dist = abs(closest_t - t_round)
+        
+        if dist > 0.05: 
+            print(f"   [WARN] No matching tenor for {target_tenor}Y. Nearest is {closest_t}Y (Dist: {dist:.4f}). Skipping.")
+            return None
+            
+        return snapshot_map[closest_t]
 
     conn = get_db_connection(DB_POSITIONS)
     trades = pd.read_sql("SELECT * FROM trades WHERE status='OPEN'", conn)
@@ -224,20 +251,35 @@ def step_4_mark_positions(yymm):
         conn.close()
         return
 
+    updates = []
+
     for _, t in trades.iterrows():
         trade_id = t['trade_id']
         
-        # Calculate Official Z-Spread
-        curr_z = get_z(t['tenor_pay']) - get_z(t['tenor_rec'])
+        # 1. Calculate Official Z-Spread using Robust Lookup
+        z_pay = get_z_robust(t['tenor_pay'])
+        z_rec = get_z_robust(t['tenor_rec'])
         
-        open_dt = pd.to_datetime(t['open_ts'])
-        now_date = now_dt.date()
-        days_held = np.busday_count(open_dt - now_date)
+        if z_pay is None or z_rec is None:
+            print(f" -> Trade {trade_id}: Skipped (Missing EOD Data).")
+            continue
+            
+        curr_z = z_pay - z_rec
+        
+        # 2. Robust Business Day Calculation (String Method)
+        raw_ts = str(t['open_ts'])
+        date_str_open = raw_ts[:10] if len(raw_ts) >= 10 else datetime.datetime.now().strftime('%Y-%m-%d')
+        date_str_now = datetime.datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            days_held = int(np.busday_count(date_str_open, date_str_now))
+        except ValueError:
+            days_held = 0
         
         entry_z = t['entry_z_spread']
         reason = None
         
-        # Rule Logic (Matches App & Backtest)
+        # 3. Rule Logic
         if abs(curr_z) < cr.Z_EXIT: 
             reason = 'reversion' # Take Profit
         elif abs(curr_z - entry_z) > cr.Z_STOP: 
@@ -246,9 +288,12 @@ def step_4_mark_positions(yymm):
             reason = 'max_hold'
             
         if reason:
-            print(f" -> Flagging Trade {trade_id} for {reason} (Z: {curr_z:.2f})")
-            # We flag it in the DB. The Blotter will see this tomorrow and highlight it.
-            conn.execute("UPDATE trades SET close_reason = ? WHERE trade_id = ?", (reason, trade_id))
+            print(f" -> Flagging Trade {trade_id} for {reason} (Z: {curr_z:.2f} | Days: {days_held})")
+            updates.append((reason, trade_id))
+    
+    # 4. Batch Execute Updates
+    for r, tid in updates:
+        conn.execute("UPDATE trades SET close_reason = ? WHERE trade_id = ?", (r, tid))
             
     conn.commit()
     conn.close()
