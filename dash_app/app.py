@@ -175,7 +175,17 @@ app.layout = html.Div([
         # TAB 1: TICKER SCANNER
         dbc.Tab(label="Ticker Scanner", children=[
             dbc.Container([
-                html.H5("Market Grid (Live Z-Scores & Drift)", className="mt-3"),
+                dbc.Row([
+                    dbc.Col(html.H5("Market Grid", className="mt-3"), width=9),
+                    dbc.Col(
+                        dbc.Switch(
+                            id="toggle-free-mode",
+                            label="Free Mode (View All)",
+                            value=False,
+                            className="mt-3 text-info fw-bold"
+                        ), width=3, className="text-end"
+                    )
+                ]),
                 html.Div(id="ticker-grid", className="d-flex flex-wrap gap-2"),
                 html.Div(id="scanner-msg", className="text-danger mt-2")
             ], fluid=True)
@@ -311,20 +321,27 @@ def auto_reload_model(n):
     Output('badge-regime', 'color'),
     Output('badge-shock', 'children'),
     Output('badge-shock', 'color'),
-    Input('fast-interval', 'n_intervals')
+    Input('fast-interval', 'n_intervals'),
+    Input('toggle-free-mode', 'value')
 )
-def update_grid(n):
+def update_grid(n, free_mode):
     state = get_system_state()
     shock_days = state[2] if state else 0
     regime = state[3] if state else "SAFE"
     
     is_shocked = (shock_days > 0)
     is_unstable = (regime != 'SAFE')
-    global_disable = is_shocked or is_unstable
+    
+    # Global Disable Logic:
+    # If standard mode: Disable if Shocked OR Unstable.
+    # If Free Mode: NEVER disable (View Only mode).
+    if free_mode:
+        global_disable = False
+    else:
+        global_disable = is_shocked or is_unstable
     
     z_map = le.get_live_z_scores(feed.live_map)
     if not z_map:
-        # Return a placeholder card saying "Waiting for Market Data..."
         placeholder = dbc.Card(dbc.CardBody("System Initializing / No Live Data"), className="m-2")
         return [placeholder], "REGIME: INIT", "secondary", "SHOCK: OFF", "secondary"
     
@@ -336,23 +353,36 @@ def update_grid(n):
         z_val = data['z_live']
         tenor_label = format_tenor(t, data['tenor'])
         
-        # Calculate Natural Drift (Rec direction +1) for display
+        # Calculate Natural Drift
         drift_bps = le.calc_live_drift(data['tenor'], 1.0, feed.live_map)
         
         z_color = get_z_color(z_val)
         drift_color = get_drift_color(drift_bps)
         
-        # Smart Disable Logic
+        # Check Candidates (Pass Free Mode Flag)
+        # If Free Mode is ON, this returns ALL candidates sorted by score.
+        partners_pay = le.get_valid_partners(t, 'PAY', z_map, feed.live_map, bypass_gates=free_mode)
+        partners_rec = le.get_valid_partners(t, 'REC', z_map, feed.live_map, bypass_gates=free_mode)
+        
         if global_disable:
             can_pay, can_rec = False, False
         else:
-            partners_pay = le.get_valid_partners(t, 'PAY', z_map, feed.live_map)
-            partners_rec = le.get_valid_partners(t, 'REC', z_map, feed.live_map)
             can_pay = len(partners_pay) > 0
             can_rec = len(partners_rec) > 0
         
-        pay_style = {'opacity': 0.5 if not can_pay else 1.0}
-        rec_style = {'opacity': 0.5 if not can_rec else 1.0}
+        # Visual Styles
+        # In Free Mode, buttons are Blue (Info) and Opacity 1.0 (Readable)
+        # In Live Mode, buttons are Green/Red and dimmed if unavailable.
+        if free_mode:
+            btn_pay_color = "info" if can_pay else "secondary"
+            btn_rec_color = "info" if can_rec else "secondary"
+            pay_style = {'opacity': 1.0}
+            rec_style = {'opacity': 1.0}
+        else:
+            btn_pay_color = "success" if can_pay else "secondary"
+            btn_rec_color = "danger" if can_rec else "secondary"
+            pay_style = {'opacity': 0.5 if not can_pay else 1.0}
+            rec_style = {'opacity': 0.5 if not can_rec else 1.0}
         
         if z_val == 0.0 and data['model_z'] != 0.0: z_color = "#444"
 
@@ -363,10 +393,10 @@ def update_grid(n):
                 html.P(f"Drift: {drift_bps:.2f}bp", className="text-center small mb-2", style={"color": drift_color}),
                 html.Div([
                     dbc.Button("PAY", id={'type': 'btn-pay', 'index': t}, 
-                               color="success" if can_pay else "secondary", 
+                               color=btn_pay_color, 
                                size="sm", className="me-1", disabled=not can_pay, style=pay_style), 
                     dbc.Button("REC", id={'type': 'btn-rec', 'index': t}, 
-                               color="danger" if can_rec else "secondary", 
+                               color=btn_rec_color, 
                                size="sm", disabled=not can_rec, style=rec_style)
                 ], className="d-flex justify-content-center")
             ])
@@ -384,31 +414,29 @@ def update_grid(n):
 @app.callback(
     Output("modal-trade", "is_open"),
     Output("modal-body-content", "children"),
+    Output("btn-submit-trade", "disabled"),
     Input({'type': 'btn-pay', 'index': dash.ALL}, 'n_clicks'),
     Input({'type': 'btn-rec', 'index': dash.ALL}, 'n_clicks'),
     Input("btn-cancel-trade", "n_clicks"),
     Input("btn-submit-trade", "n_clicks"),
     State("modal-trade", "is_open"),
+    State("toggle-free-mode", "value"),
     prevent_initial_call=True
 )
-def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
+def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open, free_mode):
     ctx = callback_context
-    if not ctx.triggered: return is_open
+    if not ctx.triggered: return is_open, dash.no_update, False
     
-    # Get the trigger property and value
-    triggered_prop = ctx.triggered[0]
-    trigger_id = triggered_prop['prop_id'].split('.')[0]
-    trigger_value = triggered_prop['value']
+    trigger_prop = ctx.triggered[0]
+    trigger_id = trigger_prop['prop_id'].split('.')[0]
+    trigger_val = trigger_prop['value']
 
-    # --- FIX: IGNORE INITIALIZATION EVENTS ---
-    # Dash fires dynamic components with n_clicks=0 or None on creation.
-    # We must explicitly ignore these to prevent the "Ghost Pop-up".
-    if trigger_value == 0 or trigger_value is None:
-        return is_open, dash.no_update
-    # ----------------------------------------
+    # Explicitly ignore initialization events (Ghost Click Fix)
+    if trigger_val == 0 or trigger_val is None:
+        return is_open, dash.no_update, False
 
     if "btn-cancel" in trigger_id or "btn-submit" in trigger_id:
-        return False, dash.no_update
+        return False, dash.no_update, False
         
     if "btn-pay" in trigger_id or "btn-rec" in trigger_id:
         import json
@@ -419,24 +447,34 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         intent = "PAY" if "btn-pay" in trigger_id else "REC"
         
         z_map = le.get_live_z_scores(feed.live_map)
-        # Pass live_map to get drift/composite
-        candidates = le.get_valid_partners(ticker_orig, intent, z_map, feed.live_map)
         
+        # 1. Get Candidates (Pass Free Mode Flag)
+        candidates = le.get_valid_partners(ticker_orig, intent, z_map, feed.live_map, bypass_gates=free_mode)
+        
+        # 2. Handle No Candidates (Robustness Fix)
         if not candidates:
-            return True, html.Div(f"No valid overlay candidates found for {label_orig}.")
+            # Even in Free Mode, if buckets don't align, you might get 0 candidates.
+            # We show a polite error message inside the modal instead of crashing.
+            err_msg = html.Div([
+                html.H5(f"Selection: {intent} {label_orig}"),
+                html.Hr(),
+                html.P("No valid candidates found.", className="text-danger fw-bold"),
+                html.Small("Try enabling 'Free Mode' or checking Data Feed.", className="text-muted")
+            ])
+            return True, err_msg, True # Open=True, Content=Err, Disabled=True
             
         current_rate = feed.live_map.get(ticker_orig, 0.0)
         
-        # Build options with Composite Score visibility
+        # Build Options
         options = []
         for c in candidates:
-            # Format: Ticker | Comp: X.X | Drift: X.Xbp | Z-Imp: X.X
             lbl = (f"{format_tenor(c['ticker'], c['tenor'])} "
                    f"| Comp: {c['composite']:.2f} "
                    f"| Drift: {c['drift_bps']:.2f}bp "
                    f"| Z: {c['z_live']:.2f}")
             
-            disabled = c.get('is_gated', False)
+            # In Free Mode, nothing is 'gated' per se, but if we pass it, we check.
+            disabled = c.get('is_gated', False) 
             options.append({'label': lbl, 'value': c['ticker'], 'disabled': disabled})
             
         best_ticker = candidates[0]['ticker']
@@ -449,7 +487,15 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
             leg1_label = "LEG 1: REC (Alternative)"
             leg2_label = f"LEG 2: PAY (Original {label_orig})"
         
+        # Header Alert for Free Mode
+        header_extras = []
+        if free_mode:
+            header_extras.append(
+                html.Div("FREE MODE ACTIVE - EXECUTION DISABLED", className="alert alert-info text-center fw-bold")
+            )
+
         content = html.Div([
+            *header_extras,
             html.H5(f"Original Req: {intent} Fixed {label_orig}"),
             html.P("Select candidate based on Composite Score (Z + Drift).", className="text-muted small"),
             html.Hr(),
@@ -467,8 +513,11 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
             dcc.Store(id="store-active-ticker", data=ticker_orig),
             dcc.Store(id="store-intent", data=intent)
         ])
-        return True, content
-    return is_open, dash.no_update
+        
+        # Return: Open Modal, Content, Disabled=True if Free Mode
+        return True, content, free_mode 
+        
+    return is_open, dash.no_update, False
 
 # 4. Submit Trade (SAVES COST TO DB)
 @app.callback(
