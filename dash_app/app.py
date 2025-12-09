@@ -470,7 +470,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
         return True, content
     return is_open, dash.no_update
 
-# 4. Submit Trade
+# 4. Submit Trade (SAVES COST TO DB)
 @app.callback(
     Output("scanner-msg", "children"),
     Input("btn-submit-trade", "n_clicks"),
@@ -485,6 +485,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open):
 def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     if not ticker_orig or not ticker_alt: return dash.no_update
     
+    # 1. Determine Direction
     if intent == "PAY":
         t_pay, t_rec = ticker_alt, ticker_orig
         r_pay, r_rec = r_alt, r_orig
@@ -496,11 +497,15 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
         
     tenor_pay = cr.TENOR_YEARS.get(t_pay)
     tenor_rec = cr.TENOR_YEARS.get(t_rec)
+    
+    # 2. Calculate Z & Drift Stats (For Record Keeping)
     z_map = le.get_live_z_scores(feed.live_map)
-    z_spread = z_map.get(t_pay, {}).get('z_live', 0) - z_map.get(t_rec, {}).get('z_live', 0)
+    z_pay = z_map.get(t_pay, {}).get('z_live', 0)
+    z_rec = z_map.get(t_rec, {}).get('z_live', 0)
+    z_spread = z_pay - z_rec
+    
     model_z = z_map.get(t_pay, {}).get('model_z', 0) - z_map.get(t_rec, {}).get('model_z', 0)
     
-    # Capture Entry Drift & Composite for Record Keeping
     drift_pay = le.calc_live_drift(tenor_pay, pay_dir, feed.live_map)
     drift_rec = le.calc_live_drift(tenor_rec, rec_dir, feed.live_map)
     total_drift = drift_pay + drift_rec
@@ -508,12 +513,11 @@ def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
     DRIFT_WEIGHT = float(getattr(cr, "DRIFT_WEIGHT", 0.2))
     composite = z_spread + (DRIFT_WEIGHT * total_drift)
     
-    # 1. Get Cost in Basis Points (from Config)
+    # --- 3. CALCULATE TRANSACTION COST (The Missing Piece) ---
     cost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
-    # 2. Get DV01 (Size input is in 'k', so multiply by 1000)
     trade_dv01 = float(size) * 1000.0
-    # 3. Calculate Cost in Cash
     tcost_cash = cost_bp * trade_dv01
+    # ---------------------------------------------------------
 
     trade = {
         'open_ts': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
