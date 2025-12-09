@@ -55,6 +55,9 @@ def init_dbs():
         realized_pnl_price REAL DEFAULT 0.0,
         realized_pnl_carry REAL DEFAULT 0.0,
         realized_pnl_roll REAL DEFAULT 0.0,
+
+        tcost_cash REAL DEFAULT 0.0,
+        tcost_bp REAL DEFAULT 0.0,
         
         realized_pnl_bp REAL DEFAULT 0.0,
         realized_pnl_price_bp REAL DEFAULT 0.0,
