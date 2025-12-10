@@ -415,6 +415,52 @@ def run_month(
             if exit_flag is None:
                 if pos.age_decisions >= MAX_HOLD_DECISIONS:
                     exit_flag = "max_hold"
+            
+            STALE_ENABLE = getattr(cr, "STALE_ENABLE", False)
+            if STALE_ENABLE and exit_flag is None:
+                
+                STALE_START = float(getattr(cr, "STALE_START_DAYS", 3.0))
+                MIN_VELOCITY = float(getattr(cr, "STALE_MIN_VELOCITY_Z", 0.015))
+                
+                # 1. Check Grace Period
+                days_held = pos.age_decisions / max(1, decisions_per_day)
+                
+                if days_held >= STALE_START:
+                    # 2. Calculate Price Velocity (Z-score improvement per day)
+                    # (Entry - Current) -> Positive if converting towards mean
+                    # Note: Need to handle direction correctly.
+                    # If we bought (positive skew), we want Z to drop. 
+                    # If we sold (negative skew), we want Z to rise.
+                    # Simplified: (Entry_Z - Current_Z) * dir_sign gives improvement magnitude
+                    z_improvement = (pos.entry_zspread - zsp) * pos.dir_sign
+                    vel_price = z_improvement / days_held
+                    
+                    # 3. Calculate Carry Velocity (Z-units per day)
+                    # We need the 'scale' from the current snapshot to normalize Bps -> Z
+                    # We grab the 'scale' from the tenor_i row (approximate is fine)
+                    curr_scale = 0.0005 # Default 5bps fallback
+                    try:
+                        row_i = snap_last[snap_last["tenor_yrs"] == pos.tenor_i]
+                        if not row_i.empty and "scale" in row_i.columns:
+                            curr_scale = float(row_i["scale"].iloc[0])
+                    except: pass
+                    
+                    # Realized Daily Drift (Rate %)
+                    # (Carry_BP + Roll_BP) is in Bps. Divide by 10,000 to get Rate %.
+                    total_drift_bps_cumulative = (pos.pnl_carry_bp + pos.pnl_roll_bp)
+                    daily_drift_bps = total_drift_bps_cumulative / days_held
+                    daily_drift_rate = daily_drift_bps / 10000.0
+                    
+                    # Normalize: How many Sigmas is this carry worth?
+                    # If Scale=5bps (0.0005) and Drift=1bp (0.0001) -> 0.2 Z/day
+                    vel_carry = daily_drift_rate / max(1e-6, curr_scale)
+                    
+                    # 4. Total Velocity
+                    vel_total = vel_price + vel_carry
+                    
+                    # 5. The Decision
+                    if vel_total < MIN_VELOCITY:
+                        exit_flag = "stalemate"
 
             if exit_flag is not None:
                 pos.closed = True
