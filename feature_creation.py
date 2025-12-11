@@ -109,7 +109,6 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 # -----------------------
 # Spline & PCA Math
 # -----------------------
-from scipy.interpolate import UnivariateSpline
 
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
@@ -191,37 +190,59 @@ def _pca_apply_block(df_block: pd.DataFrame, pca_model: dict) -> pd.Series:
 # Per-bucket processor
 # -----------------------
 def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n_comps, yymm):
-    # Bucket is already downsampled to HEAD(1), so this is efficient
+    # [Setup code remains the same...]
     out = df_bucket.sort_values("ts").groupby("tenor_yrs", as_index=False).head(1).reset_index(drop=True)
 
-    # 1) Spline Z + SCALE 
-    z_spline, scale_val = _spline_fit_safe(out)
+    # 1. Run Spline (Keep for the Signal, but ignore its Scale)
+    z_spline, spline_scale = _spline_fit_safe(out) # Ignore the spline scale return
     out["z_spline"] = z_spline
-    out["scale"] = scale_val 
+    
+    # Initialize Scale with a default
+    if np.isnan(spline_scale): spline_scale = 0.05
+    out["scale"] = spline_scale 
 
-    # 2) PCA Z
+    # 2. Run PCA (And extract the TRUE Scale)
     out["z_pca"] = np.nan
     if pca_enable:
         cols_now = sorted(out["tenor_yrs"].unique().tolist())
         if len(cols_now) >= pca_n_comps:
+            # ... [Load History / Fit Model logic remains the same] ...
             t_end = out["ts"].min() 
             t_start = t_end - pd.Timedelta(days=float(lookback_days))
-            
-            # History is Open prices. Target is Open price. Consistency achieved.
-            panel = df_history[(df_history["ts"]>=t_start) & (df_history["ts"]<t_end) & 
-                               (df_history["tenor_yrs"].isin(cols_now))]
-            
+            panel = df_history[(df_history["ts"]>=t_start) & (df_history["ts"]<t_end) & (df_history["tenor_yrs"].isin(cols_now))]
             model = _pca_fit_panel(panel, cols_now, pca_n_comps)
+            
             if model:
+                # --- NEW LOGIC: Calculate Scale from PCA Residuals ---
+                cols = model["cols"]
+                mu = np.asarray(model["mean"])
+                comps = np.asarray(model["components"])
+                
+                # Get current rates vector
+                snap = out.set_index("tenor_yrs")["rate"].reindex(cols)
+                if not snap.isnull().any():
+                    x = snap.values.astype(float)
+                    # Reconstruct: Rate -> Factors -> Rate
+                    weights = comps @ (x - mu)
+                    recon = (comps.T @ weights) + mu
+                    
+                    # Residual = Market - PCA_Fair_Value
+                    resid_pca = x - recon
+                    
+                    # Calculate Scale (Robust MAD)
+                    med = np.median(resid_pca)
+                    mad = np.median(np.abs(resid_pca - med))
+                    pca_scale = (1.4826 * mad) if mad > 0 else resid_pca.std(ddof=1)
+                    
+                    # Apply this scale to the bucket
+                    if np.isfinite(pca_scale) and pca_scale > 1e-6:
+                        out["scale"] = pca_scale
+                
+                # Calculate z_pca as usual
                 out["z_pca"] = _pca_apply_block(out, model)
 
-    # 3) Combine Robustly
-    # If z_spline is NaN (<2Y), this falls back to z_pca.
-    # If z_pca is NaN (rare), this falls back to z_spline.
-    # If both exist, it averages them (0.5 / 0.5).
+    # 3. Combine
     out["z_comb"] = out[["z_spline", "z_pca"]].mean(axis=1)
-    
-    # If everything is NaN (rare), fill with 0
     out["z_comb"] = out["z_comb"].fillna(0.0)
     
     return out
