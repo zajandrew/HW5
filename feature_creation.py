@@ -109,6 +109,8 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 # -----------------------
 # Spline & PCA Math
 # -----------------------
+from scipy.interpolate import UnivariateSpline
+
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
@@ -117,20 +119,19 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     s_all = snap_long[["tenor_yrs", "rate"]].dropna()
     s_fit = s_all[s_all["tenor_yrs"] >= 2.0].copy()
 
-    # Need enough points for a cubic spline (k=3 requires > 3 points)
     if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
 
-    # 2. Sort is mandatory for Splines
     s_fit = s_fit.sort_values("tenor_yrs")
     x = s_fit["tenor_yrs"].values.astype(float)
     y = s_fit["rate"].values.astype(float)
     
     try:
-        # 3. Fit Smoothing Spline
-        # k=3 (Cubic)
-        # s=None (Default smoothing) - usually finds a good balance.
-        # If scale is still too high, we can lower 's' to make it more flexible.
-        spl = UnivariateSpline(x, y, k=3, s=None)
+        # 3. Fit TIGHT Smoothing Spline
+        # s depends on the number of points (m). 
+        # A good rule of thumb for "tight fit" is s ~ m * (target_error^2)
+        # For 1bp error with ~15 points: 15 * (0.0001^2) is tiny.
+        # Setting s=1e-4 forces the spline to respect the data points closely.
+        spl = UnivariateSpline(x, y, k=3, s=1e-4)
         fit = spl(x)
         resid = y - fit
         
@@ -139,14 +140,12 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         mad = np.median(np.abs(resid - med))
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
         
-        # Sanity check: If the fit is TOO perfect (scale ~ 0), we floor it.
-        # This prevents infinite Z-scores.
-        if scale < 1e-4: scale = 1e-4 # Floor at 0.01 bps
+        # Floor scale at 1bp to prevent infinite Z-scores on perfect days
+        if scale < 1e-4: scale = 1e-4
         
         # 5. Z-Scores
         z = (resid - resid.mean()) / scale
         
-        # Map back
         m = {ten: val for ten, val in zip(x, z)}
         out.loc[s_fit.index] = s_fit["tenor_yrs"].map(m).values
         
