@@ -108,28 +108,57 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 # Spline & PCA Math
 # -----------------------
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
-    s = snap_long[["tenor_yrs", "rate"]].dropna()
-    out = pd.Series(index=snap_long.index, dtype=float)
+    # Initialize output with NaNs
+    out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
-    if s.shape[0] < 5: return out, DEFAULT_SCALE
+    
+    # 1. Filter: Only fit the Swap Curve (>= 2Y)
+    # Exclude Money Markets (< 2Y) which distort the Cubic fit and blow up Scale
+    s_all = snap_long[["tenor_yrs", "rate"]].dropna()
+    s_fit = s_all[s_all["tenor_yrs"] >= 2.0].copy()
 
-    x = s["tenor_yrs"].values.astype(float)
-    y = s["rate"].values.astype(float)
+    # Need at least 5 points to fit a cubic + calculate meaningful scale stats
+    if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
+
+    # 2. Sort by tenor (Critical for consistent arrays)
+    s_fit = s_fit.sort_values("tenor_yrs")
+    
+    x = s_fit["tenor_yrs"].values.astype(float)
+    y = s_fit["rate"].values.astype(float)
+    
+    # deg=3 is standard for yield curve fitting
     deg = 3 if len(x) >= 4 else min(2, len(x)-1)
     
     try:
+        # Fit Polynomial
         coef = np.polyfit(x, y, deg=deg)
         fit = np.polyval(coef, x)
         resid = y - fit
+        
+        # Calculate Scale from the Swap Curve residuals only
+        # Use MAD (Robust) to ignore outliers
         med = np.median(resid)
         mad = np.median(np.abs(resid - med))
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
-        if not np.isfinite(scale) or scale == 0: return out, DEFAULT_SCALE
+        
+        # Safety check on scale
+        if not np.isfinite(scale) or scale <= 1e-6: scale = DEFAULT_SCALE
+        
+        # Calculate Z-scores ONLY for the fitted range (>= 2Y)
         z = (resid - resid.mean()) / scale
+        
+        # Map back to original index using the tenor as key
+        # (This handles the case where input index might not be sorted)
         m = {ten: val for ten, val in zip(x, z)}
-        out.loc[s.index] = s["tenor_yrs"].map(m).values
+        
+        # Only rows >= 2Y get a z_spline value. Others stay NaN.
+        out.loc[s_fit.index] = s_fit["tenor_yrs"].map(m).values
+        
         return out, scale
-    except: return out, DEFAULT_SCALE
+
+    except Exception as e: 
+        # On math failure, return NaNs and default scale
+        return out, DEFAULT_SCALE
 
 def _pca_fit_panel(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps: int):
     if panel_long.empty: return None
@@ -192,11 +221,15 @@ def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n
             if model:
                 out["z_pca"] = _pca_apply_block(out, model)
 
-    # 3) Combine
-    if out["z_pca"].notna().any():
-        out["z_comb"] = 0.5*out["z_spline"] + 0.5*out["z_pca"]
-    else:
-        out["z_comb"] = out["z_spline"]
+    # 3) Combine Robustly
+    # If z_spline is NaN (<2Y), this falls back to z_pca.
+    # If z_pca is NaN (rare), this falls back to z_spline.
+    # If both exist, it averages them (0.5 / 0.5).
+    out["z_comb"] = out[["z_spline", "z_pca"]].mean(axis=1)
+    
+    # If everything is NaN (rare), fill with 0
+    out["z_comb"] = out["z_comb"].fillna(0.0)
+    
     return out
 
 # -----------------------
