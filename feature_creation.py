@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+import QuantLib as ql
+from scipy.interpolate import UnivariateSpline
 
 # Use module-level config access everywhere
 import cr_config as cr
@@ -108,56 +110,49 @@ def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
 # Spline & PCA Math
 # -----------------------
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
-    # Initialize output with NaNs
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
     
-    # 1. Filter: Only fit the Swap Curve (>= 2Y)
-    # Exclude Money Markets (< 2Y) which distort the Cubic fit and blow up Scale
+    # 1. Filter: Swap Curve (>= 2Y)
     s_all = snap_long[["tenor_yrs", "rate"]].dropna()
     s_fit = s_all[s_all["tenor_yrs"] >= 2.0].copy()
 
-    # Need at least 5 points to fit a cubic + calculate meaningful scale stats
+    # Need enough points for a cubic spline (k=3 requires > 3 points)
     if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
 
-    # 2. Sort by tenor (Critical for consistent arrays)
+    # 2. Sort is mandatory for Splines
     s_fit = s_fit.sort_values("tenor_yrs")
-    
     x = s_fit["tenor_yrs"].values.astype(float)
     y = s_fit["rate"].values.astype(float)
     
-    # deg=3 is standard for yield curve fitting
-    deg = 3 if len(x) >= 4 else min(2, len(x)-1)
-    
     try:
-        # Fit Polynomial
-        coef = np.polyfit(x, y, deg=deg)
-        fit = np.polyval(coef, x)
+        # 3. Fit Smoothing Spline
+        # k=3 (Cubic)
+        # s=None (Default smoothing) - usually finds a good balance.
+        # If scale is still too high, we can lower 's' to make it more flexible.
+        spl = UnivariateSpline(x, y, k=3, s=None)
+        fit = spl(x)
         resid = y - fit
         
-        # Calculate Scale from the Swap Curve residuals only
-        # Use MAD (Robust) to ignore outliers
+        # 4. Calculate Scale (Robust MAD)
         med = np.median(resid)
         mad = np.median(np.abs(resid - med))
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
         
-        # Safety check on scale
-        if not np.isfinite(scale) or scale <= 1e-6: scale = DEFAULT_SCALE
+        # Sanity check: If the fit is TOO perfect (scale ~ 0), we floor it.
+        # This prevents infinite Z-scores.
+        if scale < 1e-4: scale = 1e-4 # Floor at 0.01 bps
         
-        # Calculate Z-scores ONLY for the fitted range (>= 2Y)
+        # 5. Z-Scores
         z = (resid - resid.mean()) / scale
         
-        # Map back to original index using the tenor as key
-        # (This handles the case where input index might not be sorted)
+        # Map back
         m = {ten: val for ten, val in zip(x, z)}
-        
-        # Only rows >= 2Y get a z_spline value. Others stay NaN.
         out.loc[s_fit.index] = s_fit["tenor_yrs"].map(m).values
         
         return out, scale
 
-    except Exception as e: 
-        # On math failure, return NaNs and default scale
+    except Exception:
         return out, DEFAULT_SCALE
 
 def _pca_fit_panel(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps: int):
