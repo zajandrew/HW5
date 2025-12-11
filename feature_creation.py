@@ -43,19 +43,40 @@ def _get_ql_calendar():
 
 def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     if df_wide.empty: return df_wide
-    cal = _get_ql_calendar()
+    
+    # 1. Standard Weekday Filter first (fastest)
     ts = pd.to_datetime(df_wide["ts"])
-    if cal: df_wide = df_wide[ts.dt.weekday < 5]
-    else: df_wide = df_wide[ts.dt.weekday < 5]
+    df_wide = df_wide[ts.dt.weekday < 5].copy()
+    if df_wide.empty: return df_wide
 
+    # 2. QuantLib Holiday Filter (The Missing Piece)
+    cal = _get_ql_calendar()
+    if cal:
+        import QuantLib as ql
+        # Get unique dates to minimize expensive QL calls
+        unique_dates = df_wide["ts"].dt.date.unique()
+        
+        # Identify valid business days
+        # Note: ql.Date takes (Day, Month, Year)
+        valid_dates = set()
+        for d in unique_dates:
+            ql_date = ql.Date(d.day, d.month, d.year)
+            if cal.isBusinessDay(ql_date):
+                valid_dates.add(d)
+        
+        # Filter dataframe
+        df_wide = df_wide[df_wide["ts"].dt.date.isin(valid_dates)]
+
+    # 3. Time of Day Filter
     tz_local = getattr(cr, "CAL_TZ", "America/New_York")
     start_str, end_str = getattr(cr, "TRADING_HOURS", ("07:00", "17:00"))
 
-    df_wide = df_wide.copy()
     df_wide["ts_local"] = df_wide["ts"].dt.tz_localize("UTC").dt.tz_convert(tz_local)
     tmp = df_wide.set_index("ts_local").sort_index().between_time(start_str, end_str)
     tmp["ts"] = tmp.index.tz_convert("UTC").tz_localize(None)
+    
     return tmp.reset_index(drop=True).drop(columns=["ts_local"], errors="ignore")
+
 
 # -----------------------
 # Cleaning & reshaping
