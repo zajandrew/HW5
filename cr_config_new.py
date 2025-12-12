@@ -113,3 +113,8 @@ OVERLAY_SWITCH_COST_BP = 0.10   # 0.10 bp × DV01 per round-trip switch
 STALE_ENABLE = True
 STALE_START_DAYS = 5.0
 STALE_MIN_VELOCITY_Z = 0.015
+
+# ========= Naive Risk (Curve Balance) =========
+RISK_NAIVE_ENABLE = True
+RISK_NAIVE_PIVOT  = 5.0      # Tenors <= 5.0 are "Front", > 5.0 are "Back"
+RISK_NAIVE_LIMIT  = 80_000   # Max Absolute Net DV01 allowed on either side
