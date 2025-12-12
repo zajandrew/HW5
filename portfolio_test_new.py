@@ -8,7 +8,7 @@ import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
 # All config access via module namespace
-import cr_config as cr
+import cr_config_new as cr
 from hybrid_filter import RegimeThresholds
 
 # ------------------------
@@ -83,11 +83,16 @@ def calc_trade_drift(tenor, direction, snap_last):
     # We roll down 1 day (1/360)
     day_fraction = 1.0 / 360.0
     t_roll = max(0.0, tenor - day_fraction)
+
+    valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
+    xp = valid_curve["tenor_yrs"].values
+    fp = valid_curve["rate"].values
+
+    sort_idx = np.argsort(xp)
+    xp_sorted = xp[sort_idx]
+    fp_sorted = fp[sort_idx]
     
-    xp = snap_last["tenor_yrs"].values
-    fp = snap_last["rate"].values
-    
-    rate_rolled = np.interp(t_roll, xp, fp)
+    rate_rolled = np.interp(t_roll, xp_sorted, fp_sorted)
     
     # 3. Calculate Components 
     raw_carry_bps = (rate_fixed - rate_float) * 100.0 * day_fraction
@@ -145,6 +150,9 @@ class PairPos:
         self.open_ts = open_ts
         self.tenor_i = _to_float(cheap_row["tenor_yrs"])
         self.tenor_j = _to_float(rich_row["tenor_yrs"])
+        self.max_days_i = self.tenor_i * getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73)
+        self.max_days_j = self.tenor_j * getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73)
+        self.max_days_pair = min(self.max_days_i, self.max_days_j)
         self.tenor_i_orig, self.tenor_j_orig = self.tenor_i, self.tenor_j
         
         def_rate_i = _to_float(cheap_row["rate"])
@@ -245,9 +253,10 @@ class PairPos:
         days_total = 0.0
         if decision_ts:
             days_total = max(0.0, (decision_ts.normalize() - self.open_ts.normalize()).days)
-        
-        xp = snap_last["tenor_yrs"].values
-        fp = snap_last["rate"].values
+
+        valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
+        xp = valid_curve["tenor_yrs"].values
+        fp = valid_curve["rate"].values
         sort_idx = np.argsort(xp)
         xp_sorted = xp[sort_idx]
         fp_sorted = fp[sort_idx]
@@ -311,10 +320,6 @@ def run_month(
     hedges: Optional[pd.DataFrame] = None,
     regime_mask: Optional[pd.Series] = None
 ):
-    import math
-    try: np
-    except NameError: import numpy as np
-
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
     enh_path = _enhanced_in_path(yymm)
@@ -413,7 +418,7 @@ def run_month(
                         exit_flag = "stop"
 
             if exit_flag is None:
-                if pos.age_decisions >= MAX_HOLD_DECISIONS:
+                if pos.age_decisions >= MAX_HOLD_DECISIONS or pos.age_decisions >= pos.max_days_pair:
                     exit_flag = "max_hold"
             
             STALE_ENABLE = getattr(cr, "STALE_ENABLE", False)
@@ -489,6 +494,7 @@ def run_month(
                 closed_rows.append({
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, 
                     "exit_reason": pos.exit_reason,
+                    "mode": "overlay", # Analytics script uses this filter
                     "tenor_i": pos.tenor_i, "tenor_j": pos.tenor_j,
                     "w_i": pos.w_i, "w_j": pos.w_j,
                     "entry_rate_i": pos.entry_rate_i, "entry_rate_j": pos.entry_rate_j,
@@ -496,10 +502,24 @@ def run_month(
                     "close_rate_j": getattr(pos, "last_rate_j", np.nan),
                     "scale_dv01": pos.scale_dv01,
                     "entry_zspread": pos.entry_zspread,
+                    
+                    # Net PnL
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, 
                     "pnl_net_cash": pos.pnl_cash - tcost_cash,
+                    
+                    # T-Costs
                     "tcost_bp": tcost_bp,
                     "tcost_cash": tcost_cash,
+
+                    # Attribution Breakdown (Required for Analytics Charts)
+                    "pnl_price_bp": pos.pnl_price_bp,
+                    "pnl_carry_bp": pos.pnl_carry_bp,
+                    "pnl_roll_bp": pos.pnl_roll_bp,
+                    "pnl_price_cash": pos.pnl_price_cash,
+                    "pnl_carry_cash": pos.pnl_carry_cash,
+                    "pnl_roll_cash": pos.pnl_roll_cash,
+
+                    # Stats
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "trade_id": pos.meta.get("trade_id"),
                     "side": pos.meta.get("side"),
@@ -574,8 +594,6 @@ def run_month(
                 if alt_bucket == "short" or exec_bucket == "short":
                     thresh += SHORT_END_EXTRA_Z
                 
-                if disp < thresh: continue
-                
                 # 5. Drift Logic (Restored)
                 drift_alt = calc_trade_drift(alt_tenor, side_s, snap_srt)
                 net_drift_bps = drift_alt - drift_exec 
@@ -590,7 +608,7 @@ def run_month(
                 
                 # Score = Z-Spread + Weighted Normalized Drift
                 score = disp + (norm_drift_bps * DRIFT_W)
-                
+                if score < thresh: continue
                 if score > best_score:
                     best_score = score
                     best_c_row = alt
