@@ -11,7 +11,7 @@ import QuantLib as ql
 from scipy.interpolate import UnivariateSpline
 
 # Use module-level config access everywhere
-import cr_config as cr
+import cr_config_new as cr
 
 # -----------------------
 # Small utilities
