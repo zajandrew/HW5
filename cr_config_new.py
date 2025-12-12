@@ -118,3 +118,8 @@ STALE_MIN_VELOCITY_Z = 0.015
 RISK_NAIVE_ENABLE = True
 RISK_NAIVE_PIVOT  = 5.0      # Tenors <= 5.0 are "Front", > 5.0 are "Back"
 RISK_NAIVE_LIMIT  = 80_000   # Max Absolute Net DV01 allowed on either side
+
+# ========= Butterfly Router (Curvature Bonus) =========
+FLY_ENABLE     = True
+FLY_WEIGHT     = 0.15   # Bonus weight (e.g., 0.15 sigmas per unit of Fly Z)
+FLY_MIN_DIST   = 1.5    # Wings must be at least 1.5y away (avoids noisy 9s/10s/11s)
