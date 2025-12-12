@@ -24,7 +24,6 @@ import numpy as np
 import cr_config as cr
 import portfolio_test as pt 
 import hybrid_filter as hf
-from hybrid_filter import ShockConfig, RegimeThresholds
 
 # ==============================================================================
 # 1. CONFIGURATION
@@ -34,42 +33,36 @@ from hybrid_filter import ShockConfig, RegimeThresholds
 N_JOBS = max(1, os.cpu_count() - 2)
 
 # Tournament Survival Rates (Percentages)
-R1_TOP_PCT = 0.20         
-R2_TOP_PCT = 0.25         
+R1_TOP_PCT = 0.20          
+R2_TOP_PCT = 0.25          
 
 # --- STATISTICAL SIGNIFICANCE GATE ---
 # Require a minimum number of trades to consider the result valid.
-MIN_TRADES_REQUIRED = 500  
+MIN_TRADES_REQUIRED = 500   
 
 OUT_DIR = Path(cr.PATH_OUT)
 R1_FILE = OUT_DIR / "mc_checkpoint_r1.parquet"
 R2_FILE = OUT_DIR / "mc_checkpoint_r2.parquet"
 R3_FILE = OUT_DIR / "mc_checkpoint_r3.parquet"
 
-# LOCKED FILTERS (Turned OFF for Stage 1)
-LOCKED_FILTERS = {
-    "MIN_SIGNAL_HEALTH_Z": -99.0,
-    "MAX_TRENDINESS_ABS": 99.0,
-    "MAX_Z_XS_MEAN_ABS_Z": 99.0,
-    "SHOCK_RAW_PNL_Z_THRESH": -99.0,
-    "SHOCK_RESID_Z_THRESH": -99.0,
-    "SHOCK_PNL_WINDOW": 10, 
-    "SHOCK_BLOCK_LENGTH": 0,
-}
-
-# UPDATED PARAMETER SPACE (From your Image)
+# --- PHASE 1: THE ENGINE (Static Baseline) ---
+# Goal: Find best static Z-scores and Weights before tuning dynamic regimes.
+# DYN_THRESH_ENABLE is forced False here.
 PARAM_SPACE = {
-    "Z_ENTRY": [1.7, 1.8, 1.9, 2.0],
+    # Core Thresholds
+    "Z_ENTRY":      [1.75, 2.00, 2.25],
+    "Z_EXIT":       [0.50, 0.75, 1.00],
+    "Z_STOP":       [1.50, 2.50, 3.50], 
     
-    "Z_EXIT":  [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+    # Weights (The "Silver Bullet" & "Butterfly Router")
+    "DRIFT_WEIGHT": [0.0, 0.2, 0.4],    # 0.2 means 1bp drift = 0.2 sigma bonus
+    "FLY_WEIGHT":   [0.0, 0.15, 0.30],  # 0.15 means 1 sigma Fly = 0.15 sigma bonus
     
-    "Z_STOP":  [2.3, 2.4, 2.5, 3.0],
+    # The Drift Filter
+    "DRIFT_GATE_BPS": [-100.0, -5.0, 0.0],
     
-    "MAX_HOLD_DAYS": [5, 7, 10],
-
-    "DRIFT_GATE_BPS": [-0.15, -0.05, -0.01, 0.02, 0.05],
-
-    "DRIFT_WEIGHT": [0.0, 2.0, 5.0, 10.0, 20.0]
+    # Limits
+    "MAX_HOLD_DAYS": [10], # Keep fixed to reduce grid size initially
 }
 
 # ==============================================================================
@@ -100,19 +93,26 @@ def load_global_data():
 # ==============================================================================
 
 def _apply_config(params: Dict[str, Any]):
+    # 1. Apply Grid Params
     for k, v in params.items():
         setattr(cr, k, v)
-    for k, v in LOCKED_FILTERS.items():
-        setattr(cr, k, v)
         
+    # 2. Force Phase 1 Settings (Static Engine)
+    # We disable the dynamic transmission to find the best baseline car.
+    setattr(cr, "DYN_THRESH_ENABLE", False) 
+    setattr(cr, "SENS_TRENDINESS", 0.0)
+    setattr(cr, "SENS_HEALTH", 0.0)
+    
+    # 3. Ensure other new features are ON
+    setattr(cr, "STALE_ENABLE", True)
+    setattr(cr, "RISK_NAIVE_ENABLE", True)
+    setattr(cr, "FLY_ENABLE", True) 
+        
+    # 4. Derived Safety Logic
     if "MAX_HOLD_DAYS" in params:
-        hold_days = params["MAX_HOLD_DAYS"]
-        safety_factor = getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0)
-        dynamic_min = hold_days / safety_factor
-        limit_exec = max(0.085, dynamic_min)
-        limit_alt = max(0.083, dynamic_min)
-        setattr(cr, "EXEC_LEG_TENOR_YEARS", limit_exec)
-        setattr(cr, "ALT_LEG_TENOR_YEARS", limit_alt)
+        # Note: MAX_HOLD_DAYS is mostly a legacy concept now given the 20% safety rule,
+        # but we keep this logic if we want to enforce stricter execution limits.
+        pass
 
 def _worker_task(task_tuple):
     """Executes backtest and calculates robust t-Stat."""
@@ -134,21 +134,15 @@ def _worker_task(task_tuple):
     if train_hedges.empty:
         return {**params, "daily_t_stat": -99.0, "n_trades": 0, "avg_daily_bp": 0.0}
 
-    regime_mask = hf.regime_mask_from_signals(
-        signals, thresholds=RegimeThresholds(min_signal_health_z=-99.0)
-    )
-    shock_config = ShockConfig(raw_pnl_z_thresh=-99.0, resid_z_thresh=-99.0)
-
     try:
+        # Pass signals dataframe directly for Dynamic Logic
         pos, _, _ = pt.run_all(
             all_months,
-            mode="overlay",
-            hedge_df=train_hedges,
-            regime_mask=regime_mask,
-            hybrid_signals=signals,
-            shock_cfg=shock_config,
+            decision_freq="D",
             carry=True,
-            force_close_end=True
+            force_close_end=True,
+            hedge_df=train_hedges,
+            regime_signals=signals # Updated Argument
         )
         
         if pos.empty:
@@ -174,13 +168,11 @@ def _worker_task(task_tuple):
                     daily_t_stat = -99.0
                     avg_daily = daily_vals.mean() if len(daily_vals) > 0 else 0.0
                 else:
-                    # Winsorize Left Tail (5%)
-                    floor_val = np.percentile(daily_vals, 5)
-                    clipped_vals = np.clip(daily_vals, a_min=floor_val, a_max=None)
-                    
-                    mu = clipped_vals.mean()
-                    sigma = clipped_vals.std(ddof=1)
-                    n_days = len(clipped_vals)
+                    # [FIX] NO WINSORIZATION
+                    # We want to capture the full tail risk.
+                    mu = daily_vals.mean()
+                    sigma = daily_vals.std(ddof=1)
+                    n_days = len(daily_vals)
                     
                     if sigma < 1e-9:
                         daily_t_stat = 0.0
@@ -189,7 +181,8 @@ def _worker_task(task_tuple):
                     
                     avg_daily = mu
 
-    except Exception:
+    except Exception as e:
+        # print(f"Worker Error: {e}") # Uncomment to debug
         daily_t_stat = -99.0
         count = 0
         avg_daily = 0.0
@@ -207,7 +200,6 @@ def _worker_task(task_tuple):
 def generate_grid_params() -> List[Dict[str, Any]]:
     """
     Generates EVERY valid combination (Deterministic Grid).
-    Skips combinations that violate logic constraints to save time.
     """
     keys = list(PARAM_SPACE.keys())
     values = list(PARAM_SPACE.values())
@@ -224,8 +216,8 @@ def generate_grid_params() -> List[Dict[str, Any]]:
         if item["Z_ENTRY"] - item["Z_EXIT"] < 0.5:
             continue
             
-        # 2. Stop Distance: Stop must be > Entry by at least 0.5 sigma
-        if item["Z_STOP"] - item["Z_ENTRY"] < 0.5:
+        # 2. Stop Distance: Stop must be >= 1.0 (Safety)
+        if item["Z_STOP"] < 0.5:
             continue
             
         valid_dicts.append(item)
@@ -269,7 +261,6 @@ def run_tournament():
     else:
         print(f"\n>>> [ROUND 1] GENERATING: Full Grid Search on Tape 0...")
         
-        # SWITCHED TO GRID GENERATOR
         candidates = generate_grid_params() 
         
         r1_results = []
