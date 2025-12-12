@@ -50,35 +50,26 @@ def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     ts = pd.to_datetime(df_wide["ts"])
     df_wide = df_wide[ts.dt.weekday < 5].copy()
     if df_wide.empty: return df_wide
-
-    # 2. QuantLib Holiday Filter (The Missing Piece)
+        
     cal = _get_ql_calendar()
     if cal:
-        import QuantLib as ql
-        # Get unique dates to minimize expensive QL calls
         unique_dates = df_wide["ts"].dt.date.unique()
-        
-        # Identify valid business days
-        # Note: ql.Date takes (Day, Month, Year)
         valid_dates = set()
         for d in unique_dates:
             ql_date = ql.Date(d.day, d.month, d.year)
             if cal.isBusinessDay(ql_date):
                 valid_dates.add(d)
         
-        # Filter dataframe
         df_wide = df_wide[df_wide["ts"].dt.date.isin(valid_dates)]
 
-    # 3. Time of Day Filter
     tz_local = getattr(cr, "CAL_TZ", "America/New_York")
-    start_str, end_str = getattr(cr, "TRADING_HOURS", ("07:00", "17:00"))
+    start_str, end_str = getattr(cr, "TRADING_HOURS", ("08:00", "17:00"))
 
     df_wide["ts_local"] = df_wide["ts"].dt.tz_localize("UTC").dt.tz_convert(tz_local)
     tmp = df_wide.set_index("ts_local").sort_index().between_time(start_str, end_str)
     tmp["ts"] = tmp.index.tz_convert("UTC").tz_localize(None)
     
     return tmp.reset_index(drop=True).drop(columns=["ts_local"], errors="ignore")
-
 
 # -----------------------
 # Cleaning & reshaping
@@ -104,7 +95,7 @@ def _melt_long(df_wide: pd.DataFrame, tenormap: Dict[str, float]) -> pd.DataFram
     return long.dropna(subset=["ts", "tenor_yrs", "rate"])
 
 def _decision_key(ts: pd.Series, freq: str) -> pd.Series:
-    return ts.dt.floor("D") if freq == "D" else ts.dt.floor("H")
+    return ts.dt.floor("d") if freq == "D" else ts.dt.floor("h")
 
 # -----------------------
 # Spline & PCA Math
@@ -130,7 +121,7 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         # A good rule of thumb for "tight fit" is s ~ m * (target_error^2)
         # For 1bp error with ~15 points: 15 * (0.0001^2) is tiny.
         # Setting s=1e-4 forces the spline to respect the data points closely.
-        spl = UnivariateSpline(x, y, k=3, s=1e-4)
+        spl = UnivariateSpline(x, y, k=3, s=1e-2)
         fit = spl(x)
         resid = y - fit
         
@@ -140,7 +131,7 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
         
         # Floor scale at 1bp to prevent infinite Z-scores on perfect days
-        if scale < 1e-4: scale = 1e-4
+        if scale < 1e-4: scale = 0.01
         
         # 5. Z-Scores
         z = (resid - resid.mean()) / scale
@@ -196,12 +187,9 @@ def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n
     # 1. Run Spline (Keep for the Signal, but ignore its Scale)
     z_spline, spline_scale = _spline_fit_safe(out) # Ignore the spline scale return
     out["z_spline"] = z_spline
-    
-    # Initialize Scale with a default
-    if np.isnan(spline_scale): spline_scale = 0.05
-    out["scale"] = spline_scale 
 
     # 2. Run PCA (And extract the TRUE Scale)
+    pca_scale = np.nan
     out["z_pca"] = np.nan
     if pca_enable:
         cols_now = sorted(out["tenor_yrs"].unique().tolist())
@@ -233,15 +221,22 @@ def _process_bucket(dts, df_bucket, df_history, lookback_days, pca_enable, pca_n
                     med = np.median(resid_pca)
                     mad = np.median(np.abs(resid_pca - med))
                     pca_scale = (1.4826 * mad) if mad > 0 else resid_pca.std(ddof=1)
-                    
-                    # Apply this scale to the bucket
-                    if np.isfinite(pca_scale) and pca_scale > 1e-6:
-                        out["scale"] = pca_scale
                 
                 # Calculate z_pca as usual
                 out["z_pca"] = _pca_apply_block(out, model)
 
     # 3. Combine
+    raw_scale = 0.01
+
+    if np.isfinite(pca_scale) and pca_scale > 1e-6 and np.isfinite(spline_scale) and spline_scale > 1e-6:
+        raw_scale = (spline_scale + pca_scale) / 2.0
+    elif np.isfinite(spline_scale) and spline_scale > 1e-6:
+        raw_scale = spline_scale
+    elif np.isfinite(pca_scale) and pca_scale > 1e-6:
+        raw_scale = pca_scale
+
+    out["scale"] = raw_scale
+    
     out["z_comb"] = out[["z_spline", "z_pca"]].mean(axis=1)
     out["z_comb"] = out["z_comb"].fillna(0.0)
     
@@ -391,8 +386,11 @@ def build_month(yymm: str) -> None:
     out_name = f"{yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
     out_path = path_enh / out_name
     out.to_parquet(out_path, index=False)
+
+    zr = pd.to_numeric(out['z_comb'], errors='coerce')
+    z_valid_pct = float(np.isfinite(zr).mean() * 100) if not out.empty else 0.0
     
-    print(f"[DONE] {yymm} rows:{len(out):,} -> {out_path}")
+    print(f"[DONE] {yymm} rows:{len(out):,} z_valid%:{z_valid_pct:.2f} -> {out_path})
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
