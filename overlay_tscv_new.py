@@ -49,20 +49,24 @@ R3_FILE = OUT_DIR / "mc_checkpoint_r3.parquet"
 # Goal: Find best static Z-scores and Weights before tuning dynamic regimes.
 # DYN_THRESH_ENABLE is forced False here.
 PARAM_SPACE = {
-    # Core Thresholds
+    # --- Core Thresholds ---
     "Z_ENTRY":      [1.75, 2.00, 2.25],
     "Z_EXIT":       [0.50, 0.75, 1.00],
     "Z_STOP":       [1.50, 2.50, 3.50], 
     
-    # Weights (The "Silver Bullet" & "Butterfly Router")
-    "DRIFT_WEIGHT": [0.0, 0.2, 0.4],    # 0.2 means 1bp drift = 0.2 sigma bonus
-    "FLY_WEIGHT":   [0.0, 0.15, 0.30],  # 0.15 means 1 sigma Fly = 0.15 sigma bonus
-    
-    # The Drift Filter
+    # --- Weights ---
+    "DRIFT_WEIGHT": [0.0, 0.2, 0.4],
+    "FLY_WEIGHT":   [0.0, 0.15, 0.30],
     "DRIFT_GATE_BPS": [-100.0, -5.0, 0.0],
     
-    # Limits
-    "MAX_HOLD_DAYS": [10], # Keep fixed to reduce grid size initially
+    # --- Stalemate Logic (The Garbage Collector) ---
+    "STALE_START_DAYS":     [3.0, 5.0, 7.0],
+    "STALE_MIN_VELOCITY_Z": [0.01, 0.02, 0.03], 
+    # Interpretation: 0.01 = 1.0 sigma gain per 100 days (very loose)
+    #                 0.03 = 3.0 sigma gain per 100 days (strict)
+    
+    # --- Limits ---
+    "MAX_HOLD_DAYS": [10], 
 }
 
 # ==============================================================================
