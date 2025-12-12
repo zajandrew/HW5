@@ -8,8 +8,8 @@ import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
 # All config access via module namespace
-import cr_config_new as cr
-from hybrid_filter import RegimeThresholds
+import cr_config as cr
+# from hybrid_filter import RegimeThresholds # Not strictly needed if logic is inline, but good for ref
 
 # ------------------------
 # Utilities / conventions
@@ -48,7 +48,6 @@ def _get_funding_rate(snap_last: pd.DataFrame) -> float:
     """Finds proxy for funding rate (shortest available tenor)."""
     try:
         if snap_last.empty: return 0.0
-        # Sort by tenor to find the shortest (e.g., 1M or 0.083y)
         sorted_snap = snap_last.sort_values("tenor_yrs")
         return float(sorted_snap.iloc[0]["rate"])
     except:
@@ -60,27 +59,73 @@ def _get_z_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float | None:
     s = snap_last[["tenor_yrs", "z_comb"]].dropna()
     if s.empty: return None
     
-    # Find nearest tenor in snapshot
     s = s.assign(_dist=(s["tenor_yrs"] - t).abs())
     row = s.loc[s["_dist"].idxmin()]
     
-    # If nearest is too far (e.g. > 0.05y), return None
     if row["_dist"] > 0.05: return None
     return float(row["z_comb"])
 
+def _get_rate_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float:
+    """Robustly find rate for a tenor (nearest neighbor match)."""
+    # 1. Try exact match
+    exact = snap_last.loc[snap_last["tenor_yrs"] == tenor, "rate"]
+    if not exact.empty:
+        return float(exact.iloc[0])
+    
+    # 2. Fuzzy match
+    s = snap_last[["tenor_yrs", "rate"]].dropna()
+    if s.empty: return np.nan
+    
+    dist = (s["tenor_yrs"] - tenor).abs()
+    idx_min = dist.idxmin()
+    if dist[idx_min] < 0.005: # Strict tolerance
+        return float(s.loc[idx_min, "rate"])
+    
+    return np.nan
+
+def _calc_local_fly_z(snap_last, center_tenor, min_dist=1.5):
+    """
+    Calculates the Z-score of the 'Fly' (Curvature).
+    Positive Fly Z = Center is Cheap vs Wings (Humped).
+    """
+    valid = snap_last[["tenor_yrs", "rate", "scale"]].dropna().sort_values("tenor_yrs")
+    if valid.empty: return 0.0
+    
+    # 1. Find Center
+    center_row = valid[np.isclose(valid["tenor_yrs"], center_tenor, atol=0.01)]
+    if center_row.empty: return 0.0
+    c_rate = float(center_row["rate"].iloc[0])
+    
+    # 2. Find Left Wing
+    left_candidates = valid[valid["tenor_yrs"] <= (center_tenor - min_dist)]
+    if left_candidates.empty: return 0.0
+    l_row = left_candidates.iloc[-1]
+    l_rate = float(l_row["rate"])
+    
+    # 3. Find Right Wing
+    right_candidates = valid[valid["tenor_yrs"] >= (center_tenor + min_dist)]
+    if right_candidates.empty: return 0.0
+    r_row = right_candidates.iloc[0]
+    r_rate = float(r_row["rate"])
+    
+    # 4. Calculate Fly Rate
+    fly_rate = (2 * c_rate) - (l_rate + r_rate)
+    
+    # 5. Normalize
+    scale = float(center_row["scale"].iloc[0]) if "scale" in center_row.columns else 0.01
+    z_fly = fly_rate / max(1e-6, scale)
+    return z_fly
+
 def calc_trade_drift(tenor, direction, snap_last):
     """
-    Estimates Daily Drift (Carry + Rolldown) in Basis Points of Price (BP) per unit of DV01.
+    Estimates Daily Drift (Carry + Rolldown) in Basis Points of Price (BP).
     """
-    # 1. Get Data
     row = snap_last.loc[snap_last["tenor_yrs"] == tenor]
     if row.empty: return -999.0
     
-    rate_fixed = float(row["rate"])
+    rate_fixed = float(row["rate"].iloc[0])
     rate_float = _get_funding_rate(snap_last) 
     
-    # 2. Rolldown Setup (Linear Interpolation for speed)
-    # We roll down 1 day (1/360)
     day_fraction = 1.0 / 360.0
     t_roll = max(0.0, tenor - day_fraction)
 
@@ -94,13 +139,11 @@ def calc_trade_drift(tenor, direction, snap_last):
     
     rate_rolled = np.interp(t_roll, xp_sorted, fp_sorted)
     
-    # 3. Calculate Components 
+    # Rates are %, so (4.25 - 4.00) = 0.25 -> * 100 -> 25 bps
     raw_carry_bps = (rate_fixed - rate_float) * 100.0 * day_fraction
     raw_roll_bps = (rate_fixed - rate_rolled) * 100.0
     
-    # 4. Apply Direction (+1 Receiver, -1 Payer)
     total_drift_bps = (raw_carry_bps + raw_roll_bps) * direction
-    
     return total_drift_bps
 
 # ------------------------
@@ -116,7 +159,6 @@ def _map_instrument_to_tenor(instr: str) -> Optional[float]:
 def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
     if raw_df is None or raw_df.empty: return pd.DataFrame()
     df = raw_df.copy()
-    # Ensure UTC conversion is robust
     df["trade_ts"] = pd.to_datetime(df["tradetimeUTC"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
     
     decision_freq = str(decision_freq).upper()
@@ -147,6 +189,7 @@ class PairPos:
     def __init__(self, open_ts, cheap_row, rich_row, w_i, w_j, decisions_per_day, *, 
                  scale_dv01=1.0, meta=None, dir_sign=None, 
                  entry_rate_i=None, entry_rate_j=None,
+                 # --- NEW METADATA ---
                  fly_bonus=0.0, regime_mult=1.0, 
                  z_entry_base=0.0, z_entry_final=0.0):
         
@@ -154,7 +197,7 @@ class PairPos:
         self.tenor_i = _to_float(cheap_row["tenor_yrs"])
         self.tenor_j = _to_float(rich_row["tenor_yrs"])
         
-        # Safety Cap: Max hold is 20% of the shortest leg (approx 73 * Tenor)
+        # Safety Cap (20% Rule)
         safety_factor = float(getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0))
         self.max_days_i = self.tenor_i * safety_factor
         self.max_days_j = self.tenor_j * safety_factor
@@ -183,7 +226,7 @@ class PairPos:
         self.scale_dv01 = float(scale_dv01)
         self.meta = meta or {}
         
-        # --- Store New Analytics ---
+        # Store metadata
         self.fly_bonus = fly_bonus
         self.regime_mult = regime_mult
         self.z_entry_base = z_entry_base
@@ -195,7 +238,7 @@ class PairPos:
         self.dv01_i_curr, self.dv01_j_curr = self.dv01_i_entry, self.dv01_j_entry
         self.rem_tenor_i, self.rem_tenor_j = self.tenor_i_orig, self.tenor_j_orig
         
-        # Notional Calculation (No Safety)
+        # Notional (Unit check: DV01 is risk, Tenor is time. Notional = Risk/Time)
         self.not_i_entry = self.dv01_i_entry / max(1e-6, self.tenor_i)
         self.not_j_entry = self.dv01_j_entry / max(1e-6, self.tenor_j)
         
@@ -230,7 +273,6 @@ class PairPos:
     def mark(self, snap_last: pd.DataFrame, decision_ts: Optional[pd.Timestamp] = None):
         if decision_ts: self._update_risk_decay(decision_ts)
 
-        # Robust Rate Lookup
         ri = _get_rate_at_tenor(snap_last, self.tenor_i)
         rj = _get_rate_at_tenor(snap_last, self.tenor_j)
         r_float = _get_funding_rate(snap_last)
@@ -238,7 +280,6 @@ class PairPos:
         ri_valid = np.isfinite(ri)
         rj_valid = np.isfinite(rj)
         
-        # Fallback to last known if missing
         if ri_valid: self.last_rate_i = ri
         else: ri = getattr(self, "last_rate_i", self.entry_rate_i)
         
@@ -247,14 +288,14 @@ class PairPos:
 
         # Price PnL
         if ri_valid: pnl_price_i = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
-        else: pnl_price_i = self.pnl_price_cash # No change if missing
+        else: pnl_price_i = self.pnl_price_cash
         
         if rj_valid: pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
-        else: pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
-            
+        else: pnl_price_j = self.pnl_price_cash # Conservative logic if missing
+
         self.pnl_price_cash = pnl_price_i + pnl_price_j
 
-        # Carry PnL (Notional)
+        # Carry PnL
         if decision_ts and self.last_mark_ts:
             dt_days = max(0.0, (decision_ts.normalize() - self.last_mark_ts.normalize()).days)
             if dt_days > 0:
@@ -263,7 +304,7 @@ class PairPos:
                 self.pnl_carry_cash += (inc_carry_i + inc_carry_j)
             self.last_mark_ts = decision_ts
 
-        # Roll PnL (Robust Interpolation)
+        # Roll PnL
         days_total = 0.0
         if decision_ts:
             days_total = max(0.0, (decision_ts.normalize() - self.open_ts.normalize()).days)
@@ -317,72 +358,6 @@ class PairPos:
         return zsp
 
 # ------------------------
-# Filenames & I/O
-# ------------------------
-def _enhanced_in_path(yymm: str) -> Path:
-    suffix = getattr(cr, "ENH_SUFFIX", "")
-    name = cr.enh_fname(yymm) if hasattr(cr, "enh_fname") else f"{yymm}_enh{suffix}.parquet" if suffix else f"{yymm}_enh.parquet"
-    return Path(getattr(cr, "PATH_ENH", ".")) / name
-
-# Helper to calc current exposure
-def _get_current_risk_profile(positions):
-    left_net, right_net = 0.0, 0.0
-    for p in positions:
-        # Check Leg I
-        if p.tenor_i <= RISK_NAIVE_PIVOT: left_net += p.dv01_i_curr * np.sign(p.w_i)
-        else: right_net += p.dv01_i_curr * np.sign(p.w_i)
-        
-        # Check Leg J
-        if p.tenor_j <= RISK_NAIVE_PIVOT: left_net += p.dv01_j_curr * np.sign(p.w_j)
-        else: right_net += p.dv01_j_curr * np.sign(p.w_j)
-    return left_net, right_net
-
-def _calc_local_fly_z(snap_last, center_tenor, min_dist=1.5):
-    """
-    Calculates the Z-score of the 'Fly' (Curvature) at a specific tenor.
-    Fly = 2*Center - (Left + Right).
-    Positive Fly Z = Center is Cheap vs Wings (Humped).
-    Negative Fly Z = Center is Rich vs Wings (Dipped).
-    """
-    # 1. Filter valid curve points
-    valid = snap_last[["tenor_yrs", "rate"]].dropna().sort_values("tenor_yrs")
-    if valid.empty: return 0.0
-    
-    # 2. Find Center Rate
-    # Use exact or very close match
-    center_row = valid[np.isclose(valid["tenor_yrs"], center_tenor, atol=0.01)]
-    if center_row.empty: return 0.0
-    c_rate = float(center_row["rate"].iloc[0])
-    
-    # 3. Find Left Wing (Closest point at least min_dist away)
-    left_candidates = valid[valid["tenor_yrs"] <= (center_tenor - min_dist)]
-    if left_candidates.empty: return 0.0
-    # Take the one closest to the center (last one)
-    l_row = left_candidates.iloc[-1]
-    l_rate = float(l_row["rate"])
-    
-    # 4. Find Right Wing
-    right_candidates = valid[valid["tenor_yrs"] >= (center_tenor + min_dist)]
-    if right_candidates.empty: return 0.0
-    # Take the one closest to the center (first one)
-    r_row = right_candidates.iloc[0]
-    r_rate = float(r_row["rate"])
-    
-    # 5. Calculate Fly Rate (2*C - L - R)
-    # Note: If curve is linear, Fly is approx 0.
-    fly_rate = (2 * c_rate) - (l_rate + r_rate)
-    
-    # 6. Normalize by Scale (Volatility)
-    # We use the scale associated with the center bucket
-    scale = 0.01 # Default floor
-    if "scale" in center_row.columns:
-        scale = float(center_row["scale"].iloc[0])
-    
-    # Standardize
-    z_fly = fly_rate / max(1e-6, scale)
-    return z_fly
-    
-# ------------------------
 # RUN MONTH
 # ------------------------
 def run_month(
@@ -392,7 +367,7 @@ def run_month(
     open_positions: Optional[List[PairPos]] | None = None,
     carry_in: bool = True,
     hedges: Optional[pd.DataFrame] = None,
-    regime_signals: Optional[pd.DataFrame] = None, # Renamed from regime_mask
+    regime_signals: Optional[pd.DataFrame] = None
 ):
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
 
@@ -437,7 +412,6 @@ def run_month(
     # --- REGIME PREP ---
     sig_lookup = None
     if regime_signals is not None and not regime_signals.empty:
-        # Index for fast daily lookup
         sig_lookup = regime_signals.set_index("decision_ts").sort_index()
     
     DYN_THRESH_ENABLE = getattr(cr, "DYN_THRESH_ENABLE", False)
@@ -463,7 +437,7 @@ def run_month(
         if snap_last.empty: continue
 
         # ============================================================
-        # 0) CALCULATE DYNAMIC THRESHOLDS (The Transmission)
+        # 0) CALCULATE DYNAMIC THRESHOLDS
         # ============================================================
         z_entry_curr = Z_ENTRY_BASE
         z_exit_curr  = Z_EXIT_BASE
@@ -472,26 +446,20 @@ def run_month(
         
         if DYN_THRESH_ENABLE and sig_lookup is not None:
             if dts in sig_lookup.index:
-                # Handle possible duplicate indices by taking first
                 row = sig_lookup.loc[dts]
                 if isinstance(row, pd.DataFrame): row = row.iloc[0]
                 
                 trend_z  = float(row["trendiness_abs"]) if "trendiness_abs" in row else 0.0
                 health_z = float(row["signal_health_z"]) if "signal_health_z" in row else 0.0
                 
-                # Multiplier Logic:
-                # Trend (Bad) -> Positive Weight -> Multiplier > 1 -> Harder Entry
-                # Health (Good) -> Negative Weight -> Multiplier < 1 -> Easier Entry
                 sens_trend = float(getattr(cr, "SENS_TRENDINESS", 0.0))
                 sens_health = float(getattr(cr, "SENS_HEALTH", 0.0))
                 
                 raw_mult = 1.0 + (trend_z * sens_trend) + (health_z * sens_health)
-                regime_mult = max(0.5, min(raw_mult, 3.0)) # Clamp safety
+                regime_mult = max(0.5, min(raw_mult, 3.0)) 
                 
                 z_entry_curr *= regime_mult
-                # Apply same mult to stops (High Vol -> Wide Stop)
                 z_stop_curr  *= regime_mult
-                # Exit target usually stays relative to entry, or scales similarly
                 z_exit_curr  *= regime_mult
 
         # ============================================================
@@ -514,11 +482,11 @@ def run_month(
                     sign_curr = np.sign(curr_dir)
                     same_side = (sign_entry != 0) and (sign_entry == sign_curr)
                     
-                    # Profit Take: Use DYNAMIC z_exit_curr
+                    # Profit Take (Dynamic)
                     if same_side and (abs(curr_dir) <= abs(entry_dir)) and (abs(curr_dir) <= z_exit_curr):
                         exit_flag = "reversion"
                     
-                    # Stop Loss: Use DYNAMIC z_stop_curr
+                    # Stop Loss (Dynamic)
                     dz_dir = curr_dir - entry_dir
                     if same_side and (abs(curr_dir) >= abs(entry_dir)) and (abs(dz_dir) >= z_stop_curr):
                         exit_flag = "stop"
@@ -535,8 +503,7 @@ def run_month(
                     z_improvement = (pos.entry_zspread - zsp) * pos.dir_sign
                     vel_price = z_improvement / days_held
                     
-                    # Carry Velocity (Scaled to Z)
-                    # Average Scale of Pair
+                    # Carry Velocity
                     scale_i, scale_j = 0.0005, 0.0005
                     try:
                         row_i = snap_last[snap_last["tenor_yrs"] == pos.tenor_i]
@@ -546,9 +513,9 @@ def run_month(
                     except: pass
                     pair_scale = (scale_i + scale_j) / 2.0
                     
-                    # Realized Daily Drift %
+                    # Realized Daily Drift (Fixed Unit Conversion: Bps / 100.0)
                     total_drift_bps = (pos.pnl_carry_bp + pos.pnl_roll_bp)
-                    daily_drift_rate = (total_drift_bps / days_held) / 100.0
+                    daily_drift_rate = (total_drift_bps / days_held) / 100.0 
                     
                     vel_carry = daily_drift_rate / max(1e-6, pair_scale)
                     
@@ -595,22 +562,19 @@ def run_month(
                     "scale_dv01": pos.scale_dv01,
                     "entry_zspread": pos.entry_zspread,
                     
-                    # PnL
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, 
                     "pnl_net_cash": pos.pnl_cash - tcost_cash,
                     "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
                     
-                    # Attribution
                     "pnl_price_bp": pos.pnl_price_bp, "pnl_carry_bp": pos.pnl_carry_bp,
                     "pnl_roll_bp": pos.pnl_roll_bp, "pnl_price_cash": pos.pnl_price_cash,
                     "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
                     
-                    # Analytics
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "trade_id": pos.meta.get("trade_id"),
                     "side": pos.meta.get("side"),
                     
-                    # NEW METRICS
+                    # METADATA
                     "z_entry_base": pos.z_entry_base,
                     "z_entry_final": pos.z_entry_final,
                     "regime_mult": pos.regime_mult,
@@ -657,7 +621,7 @@ def run_month(
             exec_tenor = float(exec_row["tenor_yrs"])
             exec_bucket = assign_bucket(exec_tenor)
 
-            # Pre-calc Execution Leg Risk Impact (Fixed for all alternates)
+            # Pre-calc Execution Leg Risk Impact
             exec_is_left = (exec_tenor <= RISK_PIVOT)
             delta_j = trade_dv01 * -side_s
 
@@ -670,16 +634,13 @@ def run_month(
                 fly_z_exec = _calc_local_fly_z(snap_srt, exec_tenor, 
                                                min_dist=float(getattr(cr, "FLY_MIN_DIST", 1.5)))
                 
-                # Logic: If Hedge Direction (-side_s) matches Fly Z, it's good (keep it).
-                # If opposite (Product is negative), it's bad (switch).
-                # Bonus = -1 * Hedge_Dir * Fly_Z * Weight
+                # Bonus if hedge is bad (Fly says Switch)
                 hedge_dir = -side_s
                 fly_alignment = hedge_dir * fly_z_exec
                 fly_bonus_base = -1.0 * fly_alignment * float(getattr(cr, "FLY_WEIGHT", 0.15))
 
             drift_exec = calc_trade_drift(exec_tenor, side_s, snap_srt)
 
-            # Search Alternates
             for _, alt in snap_srt.iterrows():
                 alt_tenor = float(alt["tenor_yrs"])
                 
@@ -737,7 +698,7 @@ def run_month(
                     best_score = score
                     best_c_row = alt
 
-            # Execute Best
+            # Execute
             if best_c_row is not None:
                 rate_i, rate_j = None, None
                 ti, tj = tenor_to_ticker(float(best_c_row["tenor_yrs"])), tenor_to_ticker(t_trade)
@@ -751,11 +712,11 @@ def run_month(
                               scale_dv01=float(h["dv01"]), 
                               meta={"trade_id": h.get("trade_id"), "side": h.get("side")},
                               entry_rate_i=rate_i, entry_rate_j=rate_j,
-                              # --- PASS METADATA ---
+                              # Metadata
                               fly_bonus=fly_bonus_base,
                               regime_mult=regime_mult,
                               z_entry_base=Z_ENTRY_BASE,
-                              z_entry_final=z_entry_curr) # The threshold used to pass
+                              z_entry_final=z_entry_curr) 
                 open_positions.append(pos)
                 ledger_rows.append({"decision_ts": dts, "event": "open"})
 
@@ -779,7 +740,7 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, hed
             start, end = pd.Timestamp(y, m, 1), (pd.Timestamp(y, m, 1) + MonthEnd(1) + pd.Timedelta(days=1))
             h_mon = clean_hedges[(clean_hedges["decision_ts"] >= start) & (clean_hedges["decision_ts"] < end)].copy()
             
-        p, l, b, open_pos = run_month(yymm, decision_freq=decision_freq, open_positions=open_pos, carry_in=carry, hedges=h_mon, regime_mask=regime_mask)
+        p, l, b, open_pos = run_month(yymm, decision_freq=decision_freq, open_positions=open_pos, carry_in=carry, hedges=h_mon, regime_signals=regime_signals)
         if not p.empty: all_pos.append(p.assign(yymm=yymm))
         if not l.empty: all_led.append(l.assign(yymm=yymm))
         if not b.empty: all_by.append(b.assign(yymm=yymm))
@@ -823,12 +784,13 @@ if __name__ == "__main__":
         print("[ERROR] No trades.pkl found. Strategy mode is deprecated. Overlay requires trades.")
         sys.exit(1)
 
-    print(f"[INIT] Hybrid Filters (Regime Only)...")
+    print(f"[INIT] Hybrid Filters (Signals)...")
     signals = hf.get_or_build_hybrid_signals()
-    regime_mask = hf.regime_mask_from_signals(signals)
+    # Note: We no longer rely on the boolean mask for blocking. 
+    # We pass the full signals df to enable dynamic thresholds.
 
     print(f"[EXEC] Running Overlay on {len(months)} months.")
-    pos, led, by = run_all(months, carry=True, force_close_end=True, hedge_df=trades, regime_mask=regime_mask)
+    pos, led, by = run_all(months, carry=True, force_close_end=True, hedge_df=trades, regime_signals=signals)
 
     out_dir = Path(cr.PATH_OUT)
     suffix = getattr(cr, "OUT_SUFFIX", "")
