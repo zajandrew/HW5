@@ -79,6 +79,19 @@ MAX_HOLD_DAYS = 60       # max holding period for a pair (days when DECISION_FRE
 DRIFT_GATE_BPS = 0.0
 DRIFT_WEIGHT = 0.0
 
+# ========= Dynamic Thresholds (The "Transmission") =========
+# Enables regime-based scaling of Z_ENTRY, Z_EXIT, Z_STOP
+DYN_THRESH_ENABLE = True
+
+# Sensitivity Weights:
+# Multiplier = 1.0 + (Trend_Z * SENS_TRENDINESS) + (Health_Z * SENS_HEALTH)
+# 
+# SENS_TRENDINESS > 0: High Trend (Bad) -> Multiplier > 1 -> Harder Entry (Safety)
+# SENS_HEALTH < 0: High Health (Good) -> Multiplier < 1 -> Easier Entry (Aggression)
+
+SENS_TRENDINESS   = 0.0   # Start at 0.0 for Phase 1 (Baseline) optimization
+SENS_HEALTH       = 0.0   # Start at 0.0 for Phase 1 (Baseline) optimization
+
 # ========= Safety: The "20% Rule" =========
 # We enforce that Tenor >= 5x Holding Period to ensure linear decay assumptions hold.
 # 73.0 comes from 365 / 5.
@@ -87,12 +100,6 @@ MIN_TENOR_SAFETY_FACTOR = 73.0
 # Apply this to the execution thresholds
 EXEC_LEG_TENOR_YEARS = 0.085
 ALT_LEG_TENOR_YEARS  = 0.083
-
-# ========= Regime Filter Settings (Curve Environment) =========
-# These control the "Regime Mask" (exogenous filter)
-MIN_SIGNAL_HEALTH_Z     = -0.5   # Require composite health >= this (higher is better)
-MAX_TRENDINESS_ABS      = 2.0    # Require absolute trendiness <= this
-MAX_Z_XS_MEAN_ABS_Z     = 2.0    # Require cross-sectional mean Z-score <= this
 
 # ========= Risk & selection =========
 BUCKETS = {
