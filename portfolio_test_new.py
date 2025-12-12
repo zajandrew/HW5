@@ -308,6 +308,19 @@ def _enhanced_in_path(yymm: str) -> Path:
     name = cr.enh_fname(yymm) if hasattr(cr, "enh_fname") else f"{yymm}_enh{suffix}.parquet" if suffix else f"{yymm}_enh.parquet"
     return Path(getattr(cr, "PATH_ENH", ".")) / name
 
+# Helper to calc current exposure
+def _get_current_risk_profile(positions):
+    left_net, right_net = 0.0, 0.0
+    for p in positions:
+        # Check Leg I
+        if p.tenor_i <= RISK_NAIVE_PIVOT: left_net += p.dv01_i_curr * np.sign(p.w_i)
+        else: right_net += p.dv01_i_curr * np.sign(p.w_i)
+        
+        # Check Leg J
+        if p.tenor_j <= RISK_NAIVE_PIVOT: left_net += p.dv01_j_curr * np.sign(p.w_j)
+        else: right_net += p.dv01_j_curr * np.sign(p.w_j)
+    return left_net, right_net
+
 # ------------------------
 # RUN MONTH
 # ------------------------
@@ -542,6 +555,10 @@ def run_month(
         # ============================================================
         # 3) SCAN HEDGES (OVERLAY LOGIC)
         # ============================================================
+        RISK_NAIVE_ENABLE = getattr(cr, "RISK_NAIVE_ENABLE", False)
+        RISK_NAIVE_PIVOT  = float(getattr(cr, "RISK_NAIVE_PIVOT", 5.0))
+        RISK_NAIVE_LIMIT  = float(getattr(cr, "RISK_NAIVE_LIMIT", 80_000))
+        
         if hedges.empty: continue
         h_here = hedges[hedges["decision_ts"] == dts]
         if h_here.empty: continue
@@ -552,22 +569,39 @@ def run_month(
             t_trade = float(h["tenor_yrs"])
             if t_trade < EXEC_LEG_THRESHOLD: continue
 
-            # Determine direction: 
-            # If Client Pays -> We Rec -> Side +1. We replace Rec T with Rec Alt.
-            # Spread = (Alt - Exec) if Rec, (Exec - Alt) if Pay.
             side_s = 1.0 if str(h["side"]).upper() == "CRCV" else -1.0
+            trade_dv01 = float(h["dv01"])
             
             exec_z = _get_z_at_tenor(snap_srt, t_trade)
             if exec_z is None: continue
             
-            # Find exact row for execution leg
             exec_row = snap_srt.iloc[(snap_srt["tenor_yrs"] - t_trade).abs().idxmin()]
             exec_tenor = float(exec_row["tenor_yrs"])
-            exec_bucket = assign_bucket(exec_tenor)
+            exec_bucket_name = assign_bucket(exec_tenor)
+
+            # --- NAIVE RISK STATE (Pre-Calculation) ---
+            RISK_NAIVE_ENABLE = getattr(cr, "RISK_NAIVE_ENABLE", False)
+            curr_left, curr_right = 0.0, 0.0
+            
+            if RISK_NAIVE_ENABLE:
+                RISK_PIVOT = float(getattr(cr, "RISK_NAIVE_PIVOT", 5.0))
+                RISK_LIMIT = float(getattr(cr, "RISK_NAIVE_LIMIT", 80_000))
+                
+                # 1. Tally Current Book (Pairs)
+                for p in open_positions:
+                    # Leg I
+                    if p.tenor_i <= RISK_PIVOT: curr_left += p.dv01_i_curr * np.sign(p.w_i)
+                    else: curr_right += p.dv01_i_curr * np.sign(p.w_i)
+                    # Leg J
+                    if p.tenor_j <= RISK_PIVOT: curr_left += p.dv01_j_curr * np.sign(p.w_j)
+                    else: curr_right += p.dv01_j_curr * np.sign(p.w_j)
+                
+                # 2. Pre-calc Execution Leg Impact (Fixed for all alternates)
+                # Leg J is the Execution Leg (Hedge). Direction is -side_s.
+                exec_is_left = (exec_tenor <= RISK_PIVOT)
+                delta_j = trade_dv01 * -side_s
 
             best_c_row, best_score = None, -999.0
-
-            # --- Drift Baseline ---
             drift_exec = calc_trade_drift(exec_tenor, side_s, snap_srt)
 
             # Scan Curve for Alternate
@@ -610,6 +644,25 @@ def run_month(
                 score = disp + (norm_drift_bps * DRIFT_W)
                 if score < thresh: continue
                 if score > best_score:
+
+                    if RISK_NAIVE_ENABLE:
+
+                        alt_is_left = (alt_tenor <= RISK_PIVOT)
+                        delta_i = trade_dv01 * side_s
+                        
+                        proj_left = curr_left
+                        proj_right = curr_right
+                        
+                        if exec_is_left: proj_left += delta_j
+                        else: proj_right += delta_j
+                            
+                        if alt_is_left: proj_left += delta_i
+                        else: proj_right += delta_i
+                        
+                        # Gate
+                        if abs(proj_left) > RISK_LIMIT or abs(proj_right) > RISK_LIMIT:
+                            continue
+                    
                     best_score = score
                     best_c_row = alt
 
