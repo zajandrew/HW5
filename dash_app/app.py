@@ -517,7 +517,7 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open, free_mode):
         # Return: Open Modal, Content, Disabled=True if Free Mode
         return True, content, free_mode 
         
-    return is_open, dash.no_update, False
+    return is_open, dash.no_update, dash.no_update
 
 # 4. Submit Trade (SAVES COST TO DB)
 @app.callback(
@@ -529,9 +529,13 @@ def toggle_modal(n_pay, n_rec, n_cancel, n_submit, is_open, free_mode):
     State("trade-size", "value"),
     State("rate-override-1", "value"),
     State("rate-override-2", "value"),
+    State("toggle-free-mode", "value"),
     prevent_initial_call=True
 )
-def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig):
+def submit_trade(n, ticker_orig, intent, ticker_alt, size, r_alt, r_orig, free_mode):
+    if free_mode:
+      return "Execution Blocked: Free Mode is Active."
+    
     if not ticker_orig or not ticker_alt: return dash.no_update
     
     # 1. Determine Direction
