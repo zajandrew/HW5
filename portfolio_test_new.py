@@ -321,6 +321,51 @@ def _get_current_risk_profile(positions):
         else: right_net += p.dv01_j_curr * np.sign(p.w_j)
     return left_net, right_net
 
+def _calc_local_fly_z(snap_last, center_tenor, min_dist=1.5):
+    """
+    Calculates the Z-score of the 'Fly' (Curvature) at a specific tenor.
+    Fly = 2*Center - (Left + Right).
+    Positive Fly Z = Center is Cheap vs Wings (Humped).
+    Negative Fly Z = Center is Rich vs Wings (Dipped).
+    """
+    # 1. Filter valid curve points
+    valid = snap_last[["tenor_yrs", "rate"]].dropna().sort_values("tenor_yrs")
+    if valid.empty: return 0.0
+    
+    # 2. Find Center Rate
+    # Use exact or very close match
+    center_row = valid[np.isclose(valid["tenor_yrs"], center_tenor, atol=0.01)]
+    if center_row.empty: return 0.0
+    c_rate = float(center_row["rate"].iloc[0])
+    
+    # 3. Find Left Wing (Closest point at least min_dist away)
+    left_candidates = valid[valid["tenor_yrs"] <= (center_tenor - min_dist)]
+    if left_candidates.empty: return 0.0
+    # Take the one closest to the center (last one)
+    l_row = left_candidates.iloc[-1]
+    l_rate = float(l_row["rate"])
+    
+    # 4. Find Right Wing
+    right_candidates = valid[valid["tenor_yrs"] >= (center_tenor + min_dist)]
+    if right_candidates.empty: return 0.0
+    # Take the one closest to the center (first one)
+    r_row = right_candidates.iloc[0]
+    r_rate = float(r_row["rate"])
+    
+    # 5. Calculate Fly Rate (2*C - L - R)
+    # Note: If curve is linear, Fly is approx 0.
+    fly_rate = (2 * c_rate) - (l_rate + r_rate)
+    
+    # 6. Normalize by Scale (Volatility)
+    # We use the scale associated with the center bucket
+    scale = 0.01 # Default floor
+    if "scale" in center_row.columns:
+        scale = float(center_row["scale"].iloc[0])
+    
+    # Standardize
+    z_fly = fly_rate / max(1e-6, scale)
+    return z_fly
+    
 # ------------------------
 # RUN MONTH
 # ------------------------
@@ -602,6 +647,31 @@ def run_month(
                 delta_j = trade_dv01 * -side_s
 
             best_c_row, best_score = None, -999.0
+
+            # --- BUTTERFLY ROUTER PRE-CALC ---
+            # Calculate the Curvature Status of the trade we are trying to AVOID (The Hedge).
+            # If we are PAYING 10Y, and 10Y is Cheap on the Fly, we desperately want to switch.
+            # If 10Y is Rich on the Fly, we arguably shouldn't switch.
+            fly_bonus_base = 0.0
+            FLY_ENABLE = getattr(cr, "FLY_ENABLE", False)
+            
+            if FLY_ENABLE:
+                fly_z_exec = _calc_local_fly_z(snap_srt, exec_tenor, 
+                                               min_dist=float(getattr(cr, "FLY_MIN_DIST", 1.5)))
+                
+                # Logic:
+                # - Exec Leg Direction (Hedge) is (-side_s).
+                # - If we Pay (-1) and Fly is Cheap (+Z), Product is Negative. Bad trade. Switch!
+                # - If we Pay (-1) and Fly is Rich (-Z), Product is Positive. Good trade. Stay.
+                # - We want to BOOST the switch score if the hedge trade is bad.
+                # - Score Boost = -1 * (Hedge_Dir * Fly_Z)
+                
+                hedge_dir = -side_s
+                fly_alignment = hedge_dir * fly_z_exec
+                
+                # If alignment is negative (Bad Hedge), we add a positive bonus to the switch score.
+                fly_bonus_base = -1.0 * fly_alignment * float(getattr(cr, "FLY_WEIGHT", 0.15))
+            
             drift_exec = calc_trade_drift(exec_tenor, side_s, snap_srt)
 
             # Scan Curve for Alternate
@@ -641,7 +711,7 @@ def run_month(
                 norm_drift_bps = net_drift_bps / dist_years 
                 
                 # Score = Z-Spread + Weighted Normalized Drift
-                score = disp + (norm_drift_bps * DRIFT_W)
+                score = disp + (norm_drift_bps * DRIFT_W) + fly_bonus_base
                 if score < thresh: continue
                 if score > best_score:
 
