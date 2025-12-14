@@ -121,14 +121,20 @@ def run_robust_analysis():
             print(f"  [SKIP] Not enough unique values to bin {factor}.")
             continue
             
-        stats = df.groupby("bin", observed=False).agg(
+            stats = df.groupby("bin", observed=False).agg(
             Count=("pnl_net_bp", "count"),
+            
+            # The Bottom Line
             Win_Rate=("pnl_net_bp", lambda x: (x > 0).mean()),
-            Avg_PnL_BP=("pnl_net_bp", "mean"),
-            # Consistency: What % of individual tapes showed Positive Avg PnL in this bin?
-            # This is a powerful metric for robustness.
+            Avg_Total_BP=("pnl_net_bp", "mean"),
+            
+            # The Diagnostic Split (CRITICAL)
+            Avg_Price_BP=("pnl_price_bp", "mean"),  # <-- The Mean Reversion Score
+            Avg_Carry_BP=("pnl_carry_bp", "mean"),  # <-- The Buffer
+            
             Tape_Consistency=("pnl_net_bp", lambda x: _check_consistency(df.loc[x.index]))
         )
+
         
         # Calculate Spread (Q4 - Q1)
         if len(stats) == 4:
