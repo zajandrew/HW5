@@ -50,23 +50,23 @@ R3_FILE = OUT_DIR / "mc_checkpoint_r3.parquet"
 # DYN_THRESH_ENABLE is forced False here.
 PARAM_SPACE = {
     # --- Core Thresholds ---
-    "Z_ENTRY":      [1.75, 2.00, 2.25],
-    "Z_EXIT":       [0.50, 0.75, 1.00],
-    "Z_STOP":       [1.50, 2.50, 3.50], 
+    "Z_ENTRY":      [1.50, 1.75, 2.00, 2.25],
+    "Z_EXIT":       [0.25, 0.50, 0.75, 1.00],
+    "Z_STOP":       [0.50, 1.50, 2.50, 3.50], 
     
     # --- Weights ---
     "DRIFT_WEIGHT": [0.0, 0.2, 0.4],
     "FLY_WEIGHT":   [0.0, 0.15, 0.30],
-    "DRIFT_GATE_BPS": [-100.0, -5.0, 0.0],
+    "DRIFT_GATE_BPS": [-100.0, -0.05, 0.0],
     
     # --- Stalemate Logic (The Garbage Collector) ---
-    "STALE_START_DAYS":     [3.0, 5.0, 7.0],
+    "STALE_START_DAYS":     [5.0],
     "STALE_MIN_VELOCITY_Z": [0.01, 0.02, 0.03], 
     # Interpretation: 0.01 = 1.0 sigma gain per 100 days (very loose)
     #                 0.03 = 3.0 sigma gain per 100 days (strict)
     
     # --- Limits ---
-    "MAX_HOLD_DAYS": [10], 
+    "MAX_HOLD_DAYS": [30], 
 }
 
 # ==============================================================================
@@ -109,7 +109,7 @@ def _apply_config(params: Dict[str, Any]):
     
     # 3. Ensure other new features are ON
     setattr(cr, "STALE_ENABLE", True)
-    setattr(cr, "RISK_NAIVE_ENABLE", True)
+    setattr(cr, "RISK_NAIVE_ENABLE", False)
     setattr(cr, "FLY_ENABLE", True) 
         
     # 4. Derived Safety Logic
@@ -119,7 +119,6 @@ def _apply_config(params: Dict[str, Any]):
         pass
 
 def _worker_task(task_tuple):
-    """Executes backtest and calculates robust t-Stat."""
     params, tape_source = task_tuple
     _apply_config(params)
     
@@ -132,6 +131,7 @@ def _worker_task(task_tuple):
     else:
         hedges = tape_source
 
+    # Train Period
     cutoff_dt = pd.Timestamp("2025-01-01")
     train_hedges = hedges[hedges["tradetimeUTC"] < cutoff_dt].copy()
     
@@ -139,14 +139,14 @@ def _worker_task(task_tuple):
         return {**params, "daily_t_stat": -99.0, "n_trades": 0, "avg_daily_bp": 0.0}
 
     try:
-        # Pass signals dataframe directly for Dynamic Logic
+        # Pass signals dataframe (required for logic, even if DYN is off)
         pos, _, _ = pt.run_all(
             all_months,
             decision_freq="D",
             carry=True,
-            force_close_end=True,
+            force_close_end=False,
             hedge_df=train_hedges,
-            regime_signals=signals # Updated Argument
+            regime_signals=signals 
         )
         
         if pos.empty:
@@ -156,11 +156,8 @@ def _worker_task(task_tuple):
         else:
             count = len(pos)
             
-            # --- THE GATE: MINIMUM TRADES ---
             if count < MIN_TRADES_REQUIRED:
-                daily_t_stat = -99.0 # Disqualified
-                
-                # Log stats anyway for debugging
+                daily_t_stat = -99.0 
                 pos["day"] = pos["close_ts"].dt.floor("D")
                 avg_daily = pos.groupby("day")["pnl_net_bp"].sum().mean()
             else:
@@ -170,23 +167,38 @@ def _worker_task(task_tuple):
                 
                 if len(daily_vals) < 10:
                     daily_t_stat = -99.0
-                    avg_daily = daily_vals.mean() if len(daily_vals) > 0 else 0.0
+                    avg_daily = daily_vals.mean()
                 else:
-                    # [FIX] NO WINSORIZATION
-                    # We want to capture the full tail risk.
-                    mu = daily_vals.mean()
-                    sigma = daily_vals.std(ddof=1)
-                    n_days = len(daily_vals)
+                    # --- 1. MILD WINSORIZATION (1%) ---
+                    # Filters data errors, keeps real crashes.
+                    lower_bound = np.percentile(daily_vals, 1)
+                    upper_bound = np.percentile(daily_vals, 99)
+                    clipped_vals = np.clip(daily_vals, lower_bound, upper_bound)
                     
-                    if sigma < 1e-9:
-                        daily_t_stat = 0.0
+                    mu = clipped_vals.mean()
+                    
+                    # --- 2. DOWNSIDE DEVIATION (SORTINO RISK) ---
+                    neg_rets = clipped_vals[clipped_vals < 0]
+                    if len(neg_rets) == 0:
+                        downside_dev = 1e-9 
                     else:
-                        daily_t_stat = (mu / sigma) * np.sqrt(n_days)
+                        downside_dev = np.sqrt(np.mean(neg_rets**2))
                     
+                    # --- 3. SORTINO CALCULATION ---
+                    if downside_dev > 1e-9:
+                        sortino = (mu / downside_dev) * np.sqrt(len(daily_vals))
+                    else:
+                        sortino = 0.0
+                    
+                    # --- 4. BLOWUP GATE (HARD STOP) ---
+                    # If any single day lost > 75bps (after clipping), disqualify.
+                    if daily_vals.min() < -75.0:
+                        sortino = -99.0
+                        
+                    daily_t_stat = sortino
                     avg_daily = mu
 
-    except Exception as e:
-        # print(f"Worker Error: {e}") # Uncomment to debug
+    except Exception:
         daily_t_stat = -99.0
         count = 0
         avg_daily = 0.0
@@ -217,11 +229,11 @@ def generate_grid_params() -> List[Dict[str, Any]]:
         # --- LOGIC CONSTRAINTS (The Filter) ---
         
         # 1. Profit Width: Entry must be > Exit by at least 0.5 sigma
-        if item["Z_ENTRY"] - item["Z_EXIT"] < 0.5:
+        if item["Z_ENTRY"] - item["Z_EXIT"] <= 0.5:
             continue
             
         # 2. Stop Distance: Stop must be >= 1.0 (Safety)
-        if item["Z_STOP"] < 0.5:
+        if item["Z_STOP"] <= 0.5:
             continue
             
         valid_dicts.append(item)
