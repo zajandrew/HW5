@@ -1,3 +1,16 @@
+"""
+analysis_regime_robust.py
+
+The "Wind Tunnel" for your Strategy Engine.
+Diagnoses which Regime Factors (Trend, Vol, Health) cause the strategy to crash.
+
+Methodology:
+1. Runs the 'Sacrificial' Backtest across ALL synthetic tapes (10+ histories).
+2. Aggregates thousands of trades into a Super-Ledger.
+3. Bins trades by Regime Factor Quartiles (Q1=Low, Q4=High).
+4. Analyzes PRICE PNL primarily to identify "Falling Knife" regimes without Carry bias.
+"""
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -8,24 +21,32 @@ import hybrid_filter as hf
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
+# Factors to test from hybrid_signals
 REGIME_FACTORS = [
-    "scale_mean",           # Noise Level
-    "scale_roll_z",         # Volatility Spike?
+    "scale_mean",           # Noise Level / Volatility
+    "scale_roll_z",         # Volatility Spike (Shock)
     "signal_health_z",      # Mean Reversion Quality (High = Good)
-    "trendiness_abs",       # Directional Trend Strength (High = Bad)
-    "z_xs_std",             # Cross-Sectional Dispersion
+    "trendiness_abs",       # Directional Trend Strength (High = Bad?)
+    "z_xs_std",             # Cross-Sectional Dispersion (Opportunity Set)
     "z_xs_slope_roll_z"     # Curve Slope Momentum
 ]
 
 QUARTILE_LABELS = ["Q1_Low", "Q2_MidLow", "Q3_MidHigh", "Q4_High"]
 
+# ==============================================================================
+# CORE LOGIC
+# ==============================================================================
+
 def run_robust_analysis():
-    print(f"\n[INIT] Starting ROBUST Regime Meta-Analysis...")
-    print(f"[INFO] Using Engine Settings from 'cr_config.py' (Make sure Phase 1 winners are set!)")
+    print(f"\n" + "="*80)
+    print(f"{'ROBUST REGIME DIAGNOSTIC (PRICE-FOCUSED)':^80}")
+    print(f"="*80)
+    print(f"[INFO] Using Engine Settings from 'cr_config.py'")
+    print(f"[NOTE] Ensure Z_ENTRY/Z_STOP are LOOSE to catch 'Falling Knives' for analysis.\n")
 
     # 1. Load Regime Signals
     signals = hf.get_or_build_hybrid_signals()
-    # Ensure correct timestamp format for merging
+    # Ensure correct timestamp format for merging (Naive)
     signals["decision_ts"] = pd.to_datetime(signals["decision_ts"], utc=True).dt.tz_convert(None)
     
     # 2. Find All Synthetic Tapes
@@ -34,19 +55,17 @@ def run_robust_analysis():
         print("[ERROR] No 'synth_trades_*.pkl' files found. Run synthetic generator first.")
         return
     
-    print(f"[INFO] Found {len(tape_files)} synthetic tapes. Generating Super-Ledger...")
+    print(f"[INIT] Found {len(tape_files)} synthetic tapes. Generating Super-Ledger...")
 
     # 3. Generate Trades for Every Tape (The Super-Ledger)
     all_trades = []
-    
-    # We need the list of months from the enhanced files to run the backtest
     enh_path = Path(cr.PATH_ENH)
     suffix = getattr(cr, "ENH_SUFFIX", "")
     months = [f.stem[:4] for f in enh_path.glob(f"*{suffix}.parquet") if f.stem[:4].isdigit()]
     months = sorted(list(set(months)))
 
     for i, tape_path in enumerate(tape_files):
-        print(f"  > Processing Tape {i+1}/{len(tape_files)}: {tape_path.name} ... ", end="", flush=True)
+        print(f"  > Processing Tape {i+1:02d}/{len(tape_files)}: {tape_path.name:<25} ... ", end="", flush=True)
         
         try:
             # Load Tape
@@ -55,8 +74,7 @@ def run_robust_analysis():
             hedges["tradetimeUTC"] = pd.to_datetime(hedges["tradetimeUTC"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
             
             # Run Engine (Phase 1 Settings)
-            # We pass the signals so the engine CAN use them if Dynamic is ON, 
-            # but usually we run this with DYN_THRESH_ENABLE = False to find the baseline flaws.
+            # Pass signals so dynamic logic *could* run if enabled, but usually disabled for diagnostics.
             pos, _, _ = pt.run_all(
                 months, 
                 decision_freq="D", 
@@ -67,7 +85,6 @@ def run_robust_analysis():
             )
             
             if not pos.empty:
-                # Tag the source tape for reference
                 pos["source_tape"] = tape_path.name
                 all_trades.append(pos)
                 print(f"OK ({len(pos)} trades)")
@@ -83,11 +100,12 @@ def run_robust_analysis():
 
     # 4. Aggregate
     super_ledger = pd.concat(all_trades, ignore_index=True)
-    print(f"\n[LOAD] Super-Ledger created with {len(super_ledger)} total trades.")
-
+    
     # Filter for Overlay only
     if "mode" in super_ledger.columns:
         super_ledger = super_ledger[super_ledger["mode"] == "overlay"].copy()
+        
+    print(f"\n[LOAD] Super-Ledger created with {len(super_ledger)} total trades.")
 
     # 5. Merge with Signals
     # Map Trade Open Time -> Decision Time
@@ -105,14 +123,12 @@ def run_robust_analysis():
     # 6. Factor Analysis
     valid_factors = [f for f in REGIME_FACTORS if f in df.columns]
     
-    print("\n" + "="*70)
-    print(f"{'ROBUST FACTOR ANALYSIS (Aggregated Across Tapes)':^70}")
-    print("="*70)
-    
     summary_data = []
 
     for factor in valid_factors:
-        print(f"\n>>> ANALYZING: {factor}")
+        print(f"\n" + "-"*80)
+        print(f"FACTOR ANALYSIS: {factor}")
+        print("-"*80)
         
         try:
             # Binning across the entire Super-Ledger
@@ -121,52 +137,71 @@ def run_robust_analysis():
             print(f"  [SKIP] Not enough unique values to bin {factor}.")
             continue
             
-            stats = df.groupby("bin", observed=False).agg(
+        # Detailed Aggregation
+        # We focus on PRICE PnL to isolate the Mean Reversion signal from the Carry noise.
+        stats = df.groupby("bin", observed=False).agg(
             Count=("pnl_net_bp", "count"),
             
-            # The Bottom Line
-            Win_Rate=("pnl_net_bp", lambda x: (x > 0).mean()),
-            Avg_Total_BP=("pnl_net_bp", "mean"),
+            # --- The Truth (Price) ---
+            Price_Mean=("pnl_price_bp", "mean"),
+            Price_Med=("pnl_price_bp", "median"),
+            Price_WinRate=("pnl_price_bp", lambda x: (x > 0).mean()),
             
-            # The Diagnostic Split (CRITICAL)
-            Avg_Price_BP=("pnl_price_bp", "mean"),  # <-- The Mean Reversion Score
-            Avg_Carry_BP=("pnl_carry_bp", "mean"),  # <-- The Buffer
+            # --- The Buffer (Carry/Roll) ---
+            Carry_Mean=("pnl_carry_bp", "mean"),
+            Roll_Mean=("pnl_roll_bp", "mean"),
             
-            Tape_Consistency=("pnl_net_bp", lambda x: _check_consistency(df.loc[x.index]))
+            # --- The Bottom Line (Total) ---
+            Total_Mean=("pnl_net_bp", "mean"),
+            Total_WinRate=("pnl_net_bp", lambda x: (x > 0).mean()),
+            
+            # --- Robustness ---
+            # Consistency: What % of tapes agreed with the Price Direction of this bin?
+            Tape_Agree=("pnl_price_bp", lambda x: _check_consistency(df.loc[x.index]))
         )
-
         
-        # Calculate Spread (Q4 - Q1)
+        # Calculate Spread (Q4 - Q1) for Price PnL
         if len(stats) == 4:
-            q1_perf = stats.loc["Q1_Low", "Avg_PnL_BP"]
-            q4_perf = stats.loc["Q4_High", "Avg_PnL_BP"]
-            spread = q4_perf - q1_perf
+            q1_price = stats.loc["Q1_Low", "Price_Mean"]
+            q4_price = stats.loc["Q4_High", "Price_Mean"]
+            price_spread = q4_price - q1_price
+            
             summary_data.append({
                 "Factor": factor, 
-                "Q4-Q1_Spread_BP": spread,
-                "Q1_WinRate": stats.loc["Q1_Low", "Win_Rate"],
-                "Q4_WinRate": stats.loc["Q4_High", "Win_Rate"]
+                "Price_Spread_Q4-Q1": price_spread,
+                "Q1_Price_PnL": q1_price,
+                "Q4_Price_PnL": q4_price,
+                "Q4_Price_WinRate": stats.loc["Q4_High", "Price_WinRate"],
+                "Total_PnL_Spread": stats.loc["Q4_High", "Total_Mean"] - stats.loc["Q1_Low", "Total_Mean"]
             })
         
-        print(stats.round(4).to_string())
-        print("-" * 70)
+        # Format for display
+        pd.options.display.float_format = '{:,.2f}'.format
+        print(stats.to_string())
 
-    # 7. Summary
+    # 7. Impact Summary
     if summary_data:
-        summary_df = pd.DataFrame(summary_data).sort_values("Q4-Q1_Spread_BP", ascending=False)
-        print("\n" + "="*70)
-        print(f"{'IMPACT SUMMARY':^70}")
-        print("="*70)
-        print(summary_df.to_string(index=False))
-        print("\n[GUIDE]")
-        print(" * Positive Spread: Q4 is Better -> Offensive Weight (SENS < 0).")
-        print(" * Negative Spread: Q4 is Worse -> Defensive Weight (SENS > 0).")
-        print(" * Tape_Consistency: Fraction of tapes (0.0-1.0) that agreed with the bin's profitability.")
+        summary_df = pd.DataFrame(summary_data).sort_values("Price_Spread_Q4-Q1", ascending=True)
+        
+        print(f"\n" + "="*80)
+        print(f"{'IMPACT SUMMARY (Ranked by PRICE PnL Damage)':^80}")
+        print(f"="*80)
+        print("INTERPRETATION:")
+        print(" * LARGE NEGATIVE SPREAD: Q4 (High Value) Kills Price PnL. -> Defensive Weight (SENS > 0).")
+        print(" * LARGE POSITIVE SPREAD: Q4 (High Value) Boosts Price PnL. -> Offensive Weight (SENS < 0).")
+        print("-" * 80)
+        
+        cols = ["Factor", "Price_Spread_Q4-Q1", "Q1_Price_PnL", "Q4_Price_PnL", "Q4_Price_WinRate"]
+        print(summary_df[cols].to_string(index=False))
 
 def _check_consistency(sub_df):
-    """Returns the fraction of unique tapes that had >0 PnL in this subset."""
+    """
+    Returns the fraction of unique tapes that had >0 Price PnL in this subset.
+    This prevents 'One Lucky Tape' from skewing the stats.
+    """
     if sub_df.empty: return 0.0
-    tape_performance = sub_df.groupby("source_tape")["pnl_net_bp"].mean()
+    # Group by Source Tape and calc mean Price PnL for this bin
+    tape_performance = sub_df.groupby("source_tape")["pnl_price_bp"].mean()
     positive_tapes = (tape_performance > 0).sum()
     total_tapes = len(tape_performance)
     return positive_tapes / total_tapes if total_tapes > 0 else 0.0
