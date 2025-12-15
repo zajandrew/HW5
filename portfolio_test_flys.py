@@ -32,7 +32,6 @@ def _get_z_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float | None:
     if s.empty: return None
     s = s.assign(_dist=(s["tenor_yrs"] - t).abs())
     row = s.loc[s["_dist"].idxmin()]
-    # Strict tolerance for anchor (must be effectively exact)
     if row["_dist"] > 0.05: return None 
     return float(row["z_comb"])
 
@@ -44,14 +43,11 @@ def _map_instrument_to_tenor(instr: str) -> Optional[float]:
     return float(tenor) if tenor is not None else None
 
 def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
-    """Robust Hedge Tape Loader."""
     if raw_df is None or raw_df.empty: 
         print("[WARN] Hedge tape is empty.")
         return pd.DataFrame()
     
     df = raw_df.copy()
-    
-    # 1. Map Time
     if "tradetimeUTC" in df.columns:
         df["trade_ts"] = pd.to_datetime(df["tradetimeUTC"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
     elif "ts" in df.columns:
@@ -64,16 +60,13 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
     elif decision_freq == "H": df["decision_ts"] = df["trade_ts"].dt.floor("h")
     else: raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
-    # 2. Map Side
     if "side" in df.columns:
         df["side"] = df["side"].astype(str).str.upper()
-        # CPAY = Client Pays (or Desk Pays). CRCV = Client Receives (or Desk Receives).
         df = df[df["side"].isin(["CPAY", "CRCV"])]
     else:
         print("[ERROR] Hedge tape missing 'side'.")
         return pd.DataFrame()
 
-    # 3. Map Tenor
     if "instrument" in df.columns:
         df["tenor_yrs"] = df["instrument"].map(_map_instrument_to_tenor)
     else:
@@ -82,7 +75,6 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
     
     df = df[np.isfinite(df["tenor_yrs"])]
     
-    # 4. Map DV01
     if "EqVolDelta" in df.columns:
         df["dv01"] = pd.to_numeric(df["EqVolDelta"], errors="coerce").abs()
     elif "dv01" in df.columns:
@@ -107,10 +99,6 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
 # ------------------------
 
 class FlyPos:
-    """
-    Butterfly Object: Fixed to Hedge Tape Logic.
-    Structure: Belly (Anchor) + Left Wing + Right Wing.
-    """
     def __init__(self, open_ts, belly_row, left_row, right_row, decisions_per_day, *, 
                  scale_dv01=10_000.0, meta=None, 
                  z_score_current=0.0, z_score_trend=0.0,
@@ -128,27 +116,23 @@ class FlyPos:
         self.t_right = float(right_row["tenor_yrs"])
         self.t_belly_orig, self.t_left_orig, self.t_right_orig = self.t_belly, self.t_left, self.t_right
         
-        # --- Safety Cap (20% Rule) ---
-        safety_factor = float(getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0))
-        self.max_days_fly = min(self.t_belly, self.t_left, self.t_right) * safety_factor
+        # --- Weights & Direction ---
+        # direction_multiplier (dm): +1.0 (Rec Belly), -1.0 (Pay Belly)
+        self.dm = direction_multiplier
         
-        # --- Weights ---
-        # direction_multiplier (dm): 
-        #   +1.0 = Rec Belly / Pay Wings (Long Butterfly)
-        #   -1.0 = Pay Belly / Rec Wings (Short Butterfly)
+        self.w_belly = 1.0 * self.dm
+        self.w_left  = -0.5 * self.dm
+        self.w_right = -0.5 * self.dm
         
-        # Belly gets 100% of the DV01 (Anchor)
-        self.w_belly = 1.0 * direction_multiplier
-        
-        # Wings split the hedge 50/50 to be cash/duration neutral against the belly
-        # If Belly is +1 (Long), Wings must be -0.5 (Short).
-        self.w_left  = -0.5 * direction_multiplier
-        self.w_right = -0.5 * direction_multiplier
-        
+        # Explicit Direction for Audit (+1 = Rec, -1 = Pay)
+        self.dir_belly = 1 if self.w_belly > 0 else -1
+        self.dir_left  = 1 if self.w_left > 0 else -1
+        self.dir_right = 1 if self.w_right > 0 else -1
+
         # --- Risk Init ---
-        self.dv01_belly_entry = self.scale_dv01 * self.w_belly
-        self.dv01_left_entry  = self.scale_dv01 * self.w_left
-        self.dv01_right_entry = self.scale_dv01 * self.w_right
+        self.dv01_belly_entry = self.scale_dv01 * abs(self.w_belly)
+        self.dv01_left_entry  = self.scale_dv01 * abs(self.w_left)
+        self.dv01_right_entry = self.scale_dv01 * abs(self.w_right)
         
         self.dv01_belly_curr = self.dv01_belly_entry
         self.dv01_left_curr  = self.dv01_left_entry
@@ -158,6 +142,11 @@ class FlyPos:
         self.r_entry_belly = float(belly_row["rate"])
         self.r_entry_left  = float(left_row["rate"])
         self.r_entry_right = float(right_row["rate"])
+        
+        # Current/Exit Rates (Initialized to Entry)
+        self.r_curr_belly = self.r_entry_belly
+        self.r_curr_left  = self.r_entry_left
+        self.r_curr_right = self.r_entry_right
         
         # --- Stats ---
         self.entry_z = z_score_current
@@ -204,17 +193,26 @@ class FlyPos:
     def mark(self, snap_last, xp, fp, r_float, decision_ts=None):
         if decision_ts: self._update_risk_decay(decision_ts)
         
-        # Use Cubic Spline for smooth wing pricing
         cs = CubicSpline(xp, fp)
         
-        curr_belly = float(cs(self.t_belly))
-        curr_left  = float(cs(self.t_left))
-        curr_right = float(cs(self.t_right))
+        # Update Current Rates
+        self.r_curr_belly = float(cs(self.t_belly))
+        self.r_curr_left  = float(cs(self.t_left))
+        self.r_curr_right = float(cs(self.t_right))
         
-        # 1. Price PnL: (EntryRate - CurrRate) * DV01 * 100
-        pnl_belly = (self.r_entry_belly - curr_belly) * 100.0 * self.dv01_belly_curr
-        pnl_left  = (self.r_entry_left - curr_left)   * 100.0 * self.dv01_left_curr
-        pnl_right = (self.r_entry_right - curr_right) * 100.0 * self.dv01_right_curr
+        # 1. Price PnL: (Entry - Curr) * Dir * DV01 * 100
+        # Wait, standard format:
+        # Pay Fixed (Short, Dir=-1): PnL = (Curr - Entry) * DV01
+        # Rec Fixed (Long,  Dir=+1): PnL = (Entry - Curr) * DV01
+        # Let's align with typical "Long Bond" logic:
+        # If Yield Falls, Long Wins. (Entry - Curr).
+        # If Dir = +1 (Rec), we want Yield to Fall. (Entry - Curr). Correct.
+        # If Dir = -1 (Pay), we want Yield to Rise. (Entry - Curr) is negative if rise. 
+        # But we need positive PnL. So (Entry - Curr) * -1 = (Curr - Entry). Correct.
+        
+        pnl_belly = (self.r_entry_belly - self.r_curr_belly) * 100.0 * self.dv01_belly_curr * self.dir_belly
+        pnl_left  = (self.r_entry_left - self.r_curr_left)   * 100.0 * self.dv01_left_curr  * self.dir_left
+        pnl_right = (self.r_entry_right - self.r_curr_right) * 100.0 * self.dv01_right_curr * self.dir_right
         
         self.pnl_price_cash = pnl_belly + pnl_left + pnl_right
         
@@ -222,21 +220,15 @@ class FlyPos:
         if decision_ts and self.last_mark_ts:
             dt_days = (decision_ts - self.last_mark_ts).days
             if dt_days > 0:
-                # Carry: (Yield - Funding)
-                # Simplified: Yield * DV01 is effectively the carry accrual per bp
-                # Standard approx: Rate * Notional * Time. 
-                # Here we use Rate * DV01 * 100 * Time? No.
-                # Standard DV01 based Carry approx:
-                # Carry ~= Rate * (DV01 / Tenor * 10000) * (Time) ... messy.
-                # Let's stick to user's previous drift approximation style if possible, 
-                # or simple Yield * DV01 approximation.
+                # Carry: Yield * DV01 approx
+                inc_b = self.r_curr_belly * self.dv01_belly_curr # Magnitude
+                inc_l = self.r_curr_left  * self.dv01_left_curr
+                inc_r = self.r_curr_right * self.dv01_right_curr
                 
-                # Using simple "Yield Income": Rate * DV01 * 100 * Time
-                # Note: This is an approximation. 
-                yld_b = self.r_entry_belly * self.dv01_belly_curr
-                yld_l = self.r_entry_left  * self.dv01_left_curr
-                yld_r = self.r_entry_right * self.dv01_right_curr
-                self.pnl_carry_cash += (yld_b + yld_l + yld_r) * 100.0 * (dt_days/360.0)
+                # If Rec (+1), we Earn Carry. If Pay (-1), we Pay Carry.
+                # Note: This ignores Funding (r_float) difference for simplicity, 
+                # but aligns with "Earn the Yield".
+                self.pnl_carry_cash += (inc_b*self.dir_belly + inc_l*self.dir_left + inc_r*self.dir_right) * 100.0 * (dt_days/360.0)
                 
                 # Roll Down
                 t_roll = 1.0/360.0
@@ -244,11 +236,17 @@ class FlyPos:
                 roll_left  = float(cs(self.t_left  - t_roll))
                 roll_right = float(cs(self.t_right - t_roll))
                 
-                gain_belly = (curr_belly - roll_belly) * 100.0 * self.dv01_belly_curr
-                gain_left  = (curr_left - roll_left)   * 100.0 * self.dv01_left_curr
-                gain_right = (curr_right - roll_right) * 100.0 * self.dv01_right_curr
+                # If Rec (+1), we want curve to slope up (Forward < Spot?). No.
+                # If Rec (+1), we profit if rolled yield is lower than current yield (Roll down the curve).
+                # Gain = (Curr - Roll) * DV01 * Dir?
+                # Example: Spot 5.0%, Roll 4.9%. Diff 0.1%. Price Up. Long wins.
+                # (5.0 - 4.9) = 0.1 (Pos). * Dir(+1) = Pos. Correct.
                 
-                self.pnl_roll_cash += (gain_belly + gain_left + gain_right) * dt_days 
+                g_b = (self.r_curr_belly - roll_belly) * 100.0 * self.dv01_belly_curr * self.dir_belly
+                g_l = (self.r_curr_left  - roll_left)  * 100.0 * self.dv01_left_curr  * self.dir_left
+                g_r = (self.r_curr_right - roll_right) * 100.0 * self.dv01_right_curr * self.dir_right
+                
+                self.pnl_roll_cash += (g_b + g_l + g_r) * dt_days 
                 
             self.last_mark_ts = decision_ts
 
@@ -281,14 +279,10 @@ def run_month(
     z_history: Optional[Dict] = None 
 ):
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
-
     enh_path = _enhanced_in_path(yymm)
-    if not enh_path.exists():
-        raise FileNotFoundError(f"Missing enhanced file {enh_path}")
-
+    if not enh_path.exists(): raise FileNotFoundError(f"Missing {enh_path}")
     df = pd.read_parquet(enh_path)
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), (open_positions or []), z_history
+    if df.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), (open_positions or []), z_history
 
     # --- PARAMS ---
     Z_ENTRY_BASE = float(getattr(cr, "Z_ENTRY", 0.75))
@@ -299,36 +293,31 @@ def run_month(
     FLY_WING_MIN, FLY_WING_MAX = getattr(cr, "FLY_WING_WIDTH_RANGE", (2.0, 7.0))
     TREND_WINDOW = int(getattr(cr, "Z_TREND_WINDOW", 20))
     
+    # --- SURGICAL FIX: ABSOLUTE MINIMUM TENOR (6 Months) ---
+    MIN_TENOR_FLOOR = 0.5 
+
     # --- REGIME ---
     sig_lookup = None
     if regime_signals is not None and not regime_signals.empty:
         sig_lookup = regime_signals.drop_duplicates("decision_ts").set_index("decision_ts").sort_index()
-    
     DYN_THRESH_ENABLE = getattr(cr, "DYN_THRESH_ENABLE", False)
 
     open_positions = (open_positions or []) if carry_in else []
-
     if hedges is not None and not hedges.empty:
         valid_decisions = df["decision_ts"].dropna().unique()
         hedges = hedges[hedges["decision_ts"].isin(valid_decisions)].copy()
-    else:
-        hedges = pd.DataFrame()
+    else: hedges = pd.DataFrame()
 
     ledger_rows: list[dict] = []
     closed_rows: list[dict] = []
-
     if z_history is None: z_history = {} 
 
     for dts, snap in df.groupby("decision_ts", sort=True):
         snap_last = (
-            snap.sort_values("ts")
-                .groupby("tenor_yrs", as_index=False)
-                .tail(1)
-                .reset_index(drop=True)
+            snap.sort_values("ts").groupby("tenor_yrs", as_index=False).tail(1).reset_index(drop=True)
         )
         if snap_last.empty: continue
 
-        # Optimized Curve for Pricing
         valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
         xp_sorted = valid_curve["tenor_yrs"].values.astype(float)
         fp_sorted = valid_curve["rate"].values.astype(float)
@@ -337,13 +326,11 @@ def run_month(
         fp_sorted = fp_sorted[sort_idx]
         r_float = fp_sorted[0] if len(fp_sorted) > 0 else 0.0
 
-        # Update History
         current_z_map = dict(zip(snap_last["tenor_yrs"], snap_last["z_comb"]))
         for t, z_val in current_z_map.items():
             if t not in z_history: z_history[t] = deque(maxlen=TREND_WINDOW)
             z_history[t].append(z_val)
 
-        # Dynamic Transmission
         z_entry_curr = Z_ENTRY_BASE
         z_exit_curr  = Z_EXIT_BASE
         z_stop_curr  = Z_STOP_BASE
@@ -372,40 +359,20 @@ def run_month(
             zsp = pos.mark(snap_last, xp_sorted, fp_sorted, r_float, decision_ts=dts)
             exit_flag = None
             
-            # --- EXIT LOGIC (Based on PnL & Z-Reversion) ---
             if hasattr(pos, 'last_z_val'):
                 curr_z = pos.last_z_val
-                
-                # Z-Score Exit Logic:
-                # If we are Short Belly (-1), we win if Z drops (Reverts). 
-                # Profit Take: |Z| < 0.40 (Reverted to Mean).
-                if abs(curr_z) <= z_exit_curr: 
-                    exit_flag = "reversion"
-                
-                # Stop Loss Logic:
-                # If we are Short Belly (-1), entry was likely High Z (+2.0). 
-                # Loss if Z rises further (+2.0 -> +3.0).
-                # Bad Move = Current Z - Entry Z (if Entry > 0)
+                if abs(curr_z) <= z_exit_curr: exit_flag = "reversion"
                 entry_z = pos.entry_z
-                bad_move = 0.0
-                
-                if entry_z > 0: # We entered Short Belly
-                    bad_move = curr_z - entry_z # Rising is bad
-                else: # We entered Long Belly (Rich)
-                    bad_move = entry_z - curr_z # Falling is bad
-                    
-                if bad_move >= z_stop_curr: 
-                    exit_flag = "stop"
+                bad_move = (curr_z - entry_z) if entry_z > 0 else (entry_z - curr_z)
+                if bad_move >= z_stop_curr: exit_flag = "stop"
 
-            # Stalemate Logic
             STALE_ENABLE = getattr(cr, "STALE_ENABLE", False)
             if STALE_ENABLE and exit_flag is None:
                 STALE_START = float(getattr(cr, "STALE_START_DAYS", 3.0))
                 days_held = pos.age_decisions / max(1, decisions_per_day)
-                if days_held >= STALE_START:
-                    if pos.pnl_bp < -10.0: exit_flag = "stalemate_loss" 
+                if days_held >= STALE_START and pos.pnl_bp < -10.0: 
+                    exit_flag = "stalemate_loss" 
 
-            # Time Cap
             if exit_flag is None:
                 limit = getattr(pos, 'max_days_fly', 60)
                 if pos.age_decisions >= (limit * decisions_per_day): exit_flag = "safety_cap"
@@ -415,11 +382,16 @@ def run_month(
                 pos.close_ts = dts
                 pos.exit_reason = exit_flag
 
+            # --- ENHANCED MARK LEDGER ---
             row = {
                 "decision_ts": dts, "event": "mark", "mode": "fly",
                 "tenor_i": pos.t_belly, 
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
                 "pnl_price_bp": pos.pnl_price_bp, "pnl_carry_bp": pos.pnl_carry_bp,
+                # Tie-Out Rates
+                "rate_belly": pos.r_curr_belly,
+                "rate_left":  pos.r_curr_left,
+                "rate_right": pos.r_curr_right,
                 "closed": pos.closed
             }
             ledger_rows.append(row)
@@ -427,6 +399,7 @@ def run_month(
             if pos.closed:
                 tcost_bp = SWITCH_COST_BP
                 tcost_cash = tcost_bp * pos.scale_dv01
+                # --- ENHANCED CLOSED LEDGER ---
                 cl_row = {
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, 
                     "exit_reason": pos.exit_reason, "mode": "fly",
@@ -435,8 +408,14 @@ def run_month(
                     "days_held": pos.age_decisions / decisions_per_day,
                     "trade_id": pos.meta.get("trade_id", -1),
                     "scale_dv01": pos.scale_dv01,
+                    # Tenors
                     "tenor_i": pos.t_belly, "tenor_left": pos.t_left, "tenor_right": pos.t_right,
-                    "side": pos.side_desc
+                    "side": pos.side_desc,
+                    # Tie-Out Data
+                    "dir_belly": pos.dir_belly, "dir_left": pos.dir_left, "dir_right": pos.dir_right,
+                    "rate_belly_entry": pos.r_entry_belly, "rate_belly_exit": pos.r_curr_belly,
+                    "rate_left_entry":  pos.r_entry_left,  "rate_left_exit":  pos.r_curr_left,
+                    "rate_right_entry": pos.r_entry_right, "rate_right_exit": pos.r_curr_right,
                 }
                 closed_rows.append(cl_row)
             else:
@@ -444,7 +423,7 @@ def run_month(
         open_positions = still_open
         
         # ----------------------------------------
-        # 2. SCAN FOR NEW TRADES (HEDGE TAPE ONLY)
+        # 2. SCAN FOR NEW TRADES
         # ----------------------------------------
         if hedges.empty: continue
         h_here = hedges[hedges["decision_ts"] == dts]
@@ -460,14 +439,13 @@ def run_month(
             hedge_dv01 = float(h["dv01"])
             
             if hedge_dv01 < 100: continue
+            
+            # --- SURGICAL FIX: ANCHOR TENOR CHECK ---
+            if t_hedge < MIN_TENOR_FLOOR: continue
 
-            # --- DIRECTION FLIP (OPPOSITE OF TAPE) ---
-            # Tape CPAY (Pay Fixed) -> We REC (Receive Fixed / Long) -> needed_dir = +1.0
-            # Tape CRCV (Rec Fixed) -> We PAY (Pay Fixed / Short)   -> needed_dir = -1.0
+            # Direction Logic
             needed_dir = 1.0 if hedge_side == "CPAY" else -1.0
             
-            # --- ANCHOR ---
-            # Strict Exact Match
             belly_rows = curve.iloc[(curve["tenor_yrs"] - t_hedge).abs().argsort()[:1]]
             if belly_rows.empty: continue
             belly = belly_rows.iloc[0]
@@ -475,27 +453,20 @@ def run_month(
             if abs(t_belly - t_hedge) > 0.05: continue 
             
             z_curr = float(belly["z_comb"])
-            
-            # --- ALPHA CHECK (Don't Sell Bottom / Don't Buy Top) ---
-            # If PAY (-1.0): Don't enter if Z > 2.0 (Cheap/Bottom)
             if needed_dir == -1.0 and z_curr > 2.0: continue
-            # If REC (+1.0): Don't enter if Z < -2.0 (Rich/Top)
             if needed_dir == 1.0 and z_curr < -2.0: continue
             
-            # --- WING OPTIMIZATION ---
             valid_wings = False
             cand_left, cand_right, cand_comp_z = None, None, 0.0
-            
-            # Optimization Goal: Maximize edge aligned with needed direction.
-            # If PAY (-1.0), we want Z to be Low (Rich). Minimize Z.
-            # If REC (+1.0), we want Z to be High (Cheap). Maximize Z.
-            # Combined: Maximize (needed_dir * z_fly)
             
             for j in range(0, len(curve)):
                 left = curve.iloc[j]
                 t_left = float(left["tenor_yrs"])
-                if t_left >= t_belly: break 
                 
+                # --- SURGICAL FIX: LEFT WING CHECK ---
+                if t_left < MIN_TENOR_FLOOR: continue
+                
+                if t_left >= t_belly: break 
                 width_l = t_belly - t_left
                 if width_l > FLY_WING_MAX: continue
                 if width_l < FLY_WING_MIN: continue
@@ -503,18 +474,19 @@ def run_month(
                 for k in range(j+1, len(curve)):
                     right = curve.iloc[k]
                     t_right = float(right["tenor_yrs"])
-                    if t_right <= t_belly: continue
                     
+                    # --- SURGICAL FIX: RIGHT WING CHECK ---
+                    if t_right < MIN_TENOR_FLOOR: continue
+
+                    if t_right <= t_belly: continue
                     width_r = t_right - t_belly
                     if width_r > FLY_WING_MAX: break
                     if width_r < FLY_WING_MIN: continue
                     
                     z_l = float(left["z_comb"])
                     z_r = float(right["z_comb"])
-                    # Fly Z = Belly - 0.5(L+R)
                     z_fly = z_curr - 0.5*(z_l + z_r)
                     
-                    # Score
                     struct_score = needed_dir * z_fly
                     
                     if not valid_wings or struct_score > (needed_dir * cand_comp_z):
@@ -524,16 +496,8 @@ def run_month(
             
             if not valid_wings: continue
             
-            # --- TREND CHECK ---
-            # Only enter if trend isn't aggressively fighting us
             z_hist = z_history.get(t_belly, [])
             z_slow = np.mean(z_hist) if len(z_hist) > 5 else z_curr
-            
-            # If Paying (-1), we want Falling Z. If Z is Rising fast, wait?
-            # Implemented simple Momentum filter:
-            mom = z_curr - z_slow
-            # If needed_dir * mom < -0.5 (Moving against us strongly), Skip?
-            # For now, we trust the Alpha Check and structural Carry.
             
             pos = FlyPos(dts, belly, cand_left, cand_right, decisions_per_day,
                          scale_dv01=hedge_dv01,
@@ -546,7 +510,6 @@ def run_month(
             ledger_rows.append({
                 "decision_ts": dts, "event": "open", "mode": "fly", 
                 "tenor_i": t_belly, 
-                "tenor_left": float(cand_left["tenor_yrs"]), "tenor_right": float(cand_right["tenor_yrs"]),
                 "scale_dv01": hedge_dv01, 
                 "side": pos.side_desc
             })
@@ -554,7 +517,6 @@ def run_month(
     return pd.DataFrame(closed_rows), pd.DataFrame(ledger_rows), pd.DataFrame(), open_positions, z_history
 
 def _enhanced_in_path(yymm):
-    # Helper to resolve path based on config
     base = Path(getattr(cr, "PATH_ENH", "."))
     freq = getattr(cr, "RUN_TAG", "D").lower()
     return base / f"{yymm}_enh_{freq}.parquet"
@@ -563,8 +525,7 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, hed
     decision_freq = (decision_freq or cr.DECISION_FREQ).upper()
     
     clean_hedges = None
-    if hedge_df is None: 
-        raise ValueError("Strategy requires hedge_df input.")
+    if hedge_df is None: raise ValueError("Strategy requires hedge_df input.")
     clean_hedges = prepare_hedge_tape(hedge_df, decision_freq)
         
     all_pos, all_led, all_by = [], [], []
@@ -595,11 +556,15 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, hed
             tcost_bp = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
             tcost_cash = tcost_bp * pos.scale_dv01
             row = {
-                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc",
-                "mode": "fly", "pnl_net_bp": pos.pnl_bp - tcost_bp, 
-                "pnl_net_cash": pos.pnl_cash - tcost_cash, "tcost_bp": tcost_bp,
+                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc", "mode": "fly",
+                "pnl_net_bp": pos.pnl_bp - tcost_bp, "pnl_net_cash": pos.pnl_cash - tcost_cash, "tcost_bp": tcost_bp,
                 "scale_dv01": pos.scale_dv01,
-                "tenor_i": pos.t_belly, "tenor_left": pos.t_left, "tenor_right": pos.t_right
+                "tenor_i": pos.t_belly, "tenor_left": pos.t_left, "tenor_right": pos.t_right,
+                # Tie-Out Data
+                "dir_belly": pos.dir_belly, "dir_left": pos.dir_left, "dir_right": pos.dir_right,
+                "rate_belly_entry": pos.r_entry_belly, "rate_belly_exit": pos.r_curr_belly,
+                "rate_left_entry":  pos.r_entry_left,  "rate_left_exit":  pos.r_curr_left,
+                "rate_right_entry": pos.r_entry_right, "rate_right_exit": pos.r_curr_right,
             }
             closed_rows.append(row)
         if closed_rows:
@@ -615,16 +580,12 @@ if __name__ == "__main__":
         print("Usage: python portfolio_test.py 2304 [2305 ...]")
         sys.exit(1)
     months = sys.argv[1:]
-    
     trades_path = Path(f"{getattr(cr, 'TRADE_TYPES', 'trades')}.pkl")
     trades = pd.read_pickle(trades_path) if trades_path.exists() else None
-    
     print(f"[INIT] Hybrid Filters...")
     signals = hf.get_or_build_hybrid_signals()
-    
     print(f"[EXEC] Running FLY ENGINE on {len(months)} months...")
     pos, led, by = run_all(months, carry=True, force_close_end=True, hedge_df=trades, regime_signals=signals)
-    
     out_dir = Path(cr.PATH_OUT)
     if not pos.empty: pos.to_parquet(out_dir / f"positions_ledger.parquet")
     if not led.empty: led.to_parquet(out_dir / f"marks_ledger.parquet")
