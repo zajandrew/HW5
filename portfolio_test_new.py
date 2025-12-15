@@ -9,7 +9,6 @@ from pandas.tseries.offsets import MonthEnd
 
 # All config access via module namespace
 import cr_config as cr
-# from hybrid_filter import RegimeThresholds # Not strictly needed if logic is inline, but good for ref
 
 # ------------------------
 # Utilities / conventions
@@ -44,15 +43,6 @@ def tenor_to_ticker(tenor_yrs, tol=1e-6):
         except: continue
     return best_k if best_d <= tol else None
 
-def _get_funding_rate(snap_last: pd.DataFrame) -> float:
-    """Finds proxy for funding rate (shortest available tenor)."""
-    try:
-        if snap_last.empty: return 0.0
-        sorted_snap = snap_last.sort_values("tenor_yrs")
-        return float(sorted_snap.iloc[0]["rate"])
-    except:
-        return 0.0
-
 def _get_z_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float | None:
     """Simple helper to get Z-score at a specific tenor."""
     t = float(tenor)
@@ -64,24 +54,6 @@ def _get_z_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float | None:
     
     if row["_dist"] > 0.05: return None
     return float(row["z_comb"])
-
-def _get_rate_at_tenor(snap_last: pd.DataFrame, tenor: float) -> float:
-    """Robustly find rate for a tenor (nearest neighbor match)."""
-    # 1. Try exact match
-    exact = snap_last.loc[snap_last["tenor_yrs"] == tenor, "rate"]
-    if not exact.empty:
-        return float(exact.iloc[0])
-    
-    # 2. Fuzzy match
-    s = snap_last[["tenor_yrs", "rate"]].dropna()
-    if s.empty: return np.nan
-    
-    dist = (s["tenor_yrs"] - tenor).abs()
-    idx_min = dist.idxmin()
-    if dist[idx_min] < 0.005: # Strict tolerance
-        return float(s.loc[idx_min, "rate"])
-    
-    return np.nan
 
 def _calc_local_fly_z(snap_last, center_tenor, min_dist=1.5):
     """
@@ -116,34 +88,32 @@ def _calc_local_fly_z(snap_last, center_tenor, min_dist=1.5):
     z_fly = fly_rate / max(1e-6, scale)
     return z_fly
 
-def calc_trade_drift(tenor, direction, snap_last):
+def calc_trade_drift(tenor, direction, rate_fixed, rate_float, xp_sorted, fp_sorted):
     """
-    Estimates Daily Drift (Carry + Rolldown) in Basis Points of Price (BP).
+    Fast estimation of Daily Drift using pre-sorted arrays (Optimization).
+    Args:
+        rate_fixed: The specific rate of the tenor being traded.
+        rate_float: The funding rate (pre-calculated).
+        xp_sorted: Pre-sorted tenor arrays.
+        fp_sorted: Pre-sorted rate arrays.
     """
-    row = snap_last.loc[snap_last["tenor_yrs"] == tenor]
-    if row.empty: return -999.0
-    
-    rate_fixed = float(row["rate"].iloc[0])
-    rate_float = _get_funding_rate(snap_last) 
-    
+    # 1. Rolldown Setup
     day_fraction = 1.0 / 360.0
     t_roll = max(0.0, tenor - day_fraction)
-
-    valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
-    xp = valid_curve["tenor_yrs"].values
-    fp = valid_curve["rate"].values
-
-    sort_idx = np.argsort(xp)
-    xp_sorted = xp[sort_idx]
-    fp_sorted = fp[sort_idx]
     
+    # Fast interpolation using pre-sorted arrays
     rate_rolled = np.interp(t_roll, xp_sorted, fp_sorted)
     
-    # Rates are %, so (4.25 - 4.00) = 0.25 -> * 100 -> 25 bps
+    # 2. Calculate Components 
+    # Carry PnL = (Fixed - Float) * 100 * (1/360)
     raw_carry_bps = (rate_fixed - rate_float) * 100.0 * day_fraction
+    
+    # Roll PnL = (Current - Rolled) * 100
     raw_roll_bps = (rate_fixed - rate_rolled) * 100.0
     
+    # 3. Apply Direction
     total_drift_bps = (raw_carry_bps + raw_roll_bps) * direction
+    
     return total_drift_bps
 
 # ------------------------
@@ -189,7 +159,7 @@ class PairPos:
     def __init__(self, open_ts, cheap_row, rich_row, w_i, w_j, decisions_per_day, *, 
                  scale_dv01=1.0, meta=None, dir_sign=None, 
                  entry_rate_i=None, entry_rate_j=None,
-                 # --- NEW METADATA ---
+                 # --- METADATA ---
                  fly_bonus=0.0, regime_mult=1.0, 
                  z_entry_base=0.0, z_entry_final=0.0):
         
@@ -239,6 +209,7 @@ class PairPos:
         self.rem_tenor_i, self.rem_tenor_j = self.tenor_i_orig, self.tenor_j_orig
         
         # Notional (Unit check: DV01 is risk, Tenor is time. Notional = Risk/Time)
+        # Used for Carry calc
         self.not_i_entry = self.dv01_i_entry / max(1e-6, self.tenor_i)
         self.not_j_entry = self.dv01_j_entry / max(1e-6, self.tenor_j)
         
@@ -259,6 +230,7 @@ class PairPos:
         self.last_zspread, self.last_z_dir, self.conv_pnl_proxy = self.entry_zspread, self.entry_z_dir, 0.0
 
     def _update_risk_decay(self, decision_ts):
+        """Linearly decay DV01 based on Act/360 time passed."""
         if not isinstance(decision_ts, pd.Timestamp): return
         days = max(0, (decision_ts.normalize() - self.open_ts.normalize()).days)
         yr_pass = days / 360.0
@@ -270,32 +242,25 @@ class PairPos:
         self.dv01_i_curr = self.dv01_i_entry * fi
         self.dv01_j_curr = self.dv01_j_entry * fj
 
-    def mark(self, snap_last: pd.DataFrame, decision_ts: Optional[pd.Timestamp] = None):
+    def mark(self, snap_last: pd.DataFrame, xp_sorted: np.ndarray, fp_sorted: np.ndarray, r_float: float, decision_ts: Optional[pd.Timestamp] = None):
+        """
+        Optimized Mark: Uses pre-calculated curve vectors (xp, fp) and funding rate (r_float).
+        """
         if decision_ts: self._update_risk_decay(decision_ts)
 
-        ri = _get_rate_at_tenor(snap_last, self.tenor_i)
-        rj = _get_rate_at_tenor(snap_last, self.tenor_j)
-        r_float = _get_funding_rate(snap_last)
+        # 1. Get Rates (Optimized: Linear Interp from pre-sorted curve)
+        # Replaces slow DataFrame lookups with fast numpy interpolation
+        ri = np.interp(self.tenor_i, xp_sorted, fp_sorted)
+        rj = np.interp(self.tenor_j, xp_sorted, fp_sorted)
         
-        ri_valid = np.isfinite(ri)
-        rj_valid = np.isfinite(rj)
-        
-        if ri_valid: self.last_rate_i = ri
-        else: ri = getattr(self, "last_rate_i", self.entry_rate_i)
-        
-        if rj_valid: self.last_rate_j = rj
-        else: rj = getattr(self, "last_rate_j", self.entry_rate_j)
+        self.last_rate_i, self.last_rate_j = ri, rj
 
-        # Price PnL
-        if ri_valid: pnl_price_i = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
-        else: pnl_price_i = self.pnl_price_cash
-        
-        if rj_valid: pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
-        else: pnl_price_j = self.pnl_price_cash # Conservative logic if missing
-
+        # 2. Price PnL
+        pnl_price_i = (self.entry_rate_i - ri) * 100.0 * self.dv01_i_curr
+        pnl_price_j = (self.entry_rate_j - rj) * 100.0 * self.dv01_j_curr
         self.pnl_price_cash = pnl_price_i + pnl_price_j
 
-        # Carry PnL
+        # 3. Carry PnL (Incremental)
         if decision_ts and self.last_mark_ts:
             dt_days = max(0.0, (decision_ts.normalize() - self.last_mark_ts.normalize()).days)
             if dt_days > 0:
@@ -304,31 +269,25 @@ class PairPos:
                 self.pnl_carry_cash += (inc_carry_i + inc_carry_j)
             self.last_mark_ts = decision_ts
 
-        # Roll PnL
+        # 4. Roll-Down PnL (Fast Interpolation)
         days_total = 0.0
         if decision_ts:
             days_total = max(0.0, (decision_ts.normalize() - self.open_ts.normalize()).days)
 
-        valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
-        if valid_curve.shape[0] > 1:
-            xp = valid_curve["tenor_yrs"].values.astype(float)
-            fp = valid_curve["rate"].values.astype(float)
-            sort_idx = np.argsort(xp)
-            xp_sorted, fp_sorted = xp[sort_idx], fp[sort_idx]
-            
+        if len(xp_sorted) > 1:
             t_roll_i = max(0.0, self.tenor_i_orig - (days_total/360.0))
             y_roll_i = np.interp(t_roll_i, xp_sorted, fp_sorted)
-            gain_i = (ri - y_roll_i) * 100.0 * self.dv01_i_curr if ri_valid else 0.0
+            gain_i = (ri - y_roll_i) * 100.0 * self.dv01_i_curr
             
             t_roll_j = max(0.0, self.tenor_j_orig - (days_total/360.0))
             y_roll_j = np.interp(t_roll_j, xp_sorted, fp_sorted)
-            gain_j = (rj - y_roll_j) * 100.0 * self.dv01_j_curr if rj_valid else 0.0
+            gain_j = (rj - y_roll_j) * 100.0 * self.dv01_j_curr
             
             self.pnl_roll_cash = gain_i + gain_j
         else:
             self.pnl_roll_cash = 0.0
 
-        # Totals
+        # 5. Totals
         self.pnl_cash = self.pnl_price_cash + self.pnl_carry_cash + self.pnl_roll_cash
         if self.scale_dv01 != 0.0 and np.isfinite(self.scale_dv01):
             self.pnl_bp = self.pnl_cash / self.scale_dv01
@@ -338,7 +297,7 @@ class PairPos:
         else:
             self.pnl_bp = 0.0; self.pnl_price_bp = 0.0; self.pnl_carry_bp = 0.0; self.pnl_roll_bp = 0.0
 
-        # Z-Score
+        # 6. Z-Score (Kept robust as Z-scores are non-linear, lookup is safer than interp for Z)
         zi = _get_z_at_tenor(snap_last, self.tenor_i)
         zj = _get_z_at_tenor(snap_last, self.tenor_j)
         
@@ -412,7 +371,8 @@ def run_month(
     # --- REGIME PREP ---
     sig_lookup = None
     if regime_signals is not None and not regime_signals.empty:
-        sig_lookup = regime_signals.set_index("decision_ts").sort_index()
+        # Index for fast daily lookup
+        sig_lookup = regime_signals.drop_duplicates("decision_ts").set_index("decision_ts").sort_index()
     
     DYN_THRESH_ENABLE = getattr(cr, "DYN_THRESH_ENABLE", False)
 
@@ -437,7 +397,22 @@ def run_month(
         if snap_last.empty: continue
 
         # ============================================================
-        # 0) CALCULATE DYNAMIC THRESHOLDS
+        # OPTIMIZATION: PRE-CALC CURVE VECTORS (ONCE PER DAY)
+        # ============================================================
+        valid_curve = snap_last[["tenor_yrs", "rate"]].dropna()
+        xp_sorted = valid_curve["tenor_yrs"].values.astype(float)
+        fp_sorted = valid_curve["rate"].values.astype(float)
+        
+        # Sort is required for np.interp
+        sort_idx = np.argsort(xp_sorted)
+        xp_sorted = xp_sorted[sort_idx]
+        fp_sorted = fp_sorted[sort_idx]
+        
+        # Funding rate (Shortest tenor)
+        r_float = fp_sorted[0] if len(fp_sorted) > 0 else 0.0
+
+        # ============================================================
+        # 0) CALCULATE DYNAMIC THRESHOLDS (The Transmission)
         # ============================================================
         z_entry_curr = Z_ENTRY_BASE
         z_exit_curr  = Z_EXIT_BASE
@@ -449,12 +424,17 @@ def run_month(
                 row = sig_lookup.loc[dts]
                 if isinstance(row, pd.DataFrame): row = row.iloc[0]
                 
-                trend_z  = float(row["trendiness_abs"]) if "trendiness_abs" in row else 0.0
-                health_z = float(row["signal_health_z"]) if "signal_health_z" in row else 0.0
+                # --- NEW MAPPING: Volatility (Defense) and Dispersion (Offense) ---
+                # 1. Defense: scale_roll_z (Vol Spike) or normalized scale_mean
+                trend_z = float(row["scale_roll_z"]) if "scale_roll_z" in row else 0.0
+                
+                # 2. Offense: z_xs_std (Dispersion)
+                health_z = float(row["z_xs_std"]) if "z_xs_std" in row else 1.0
                 
                 sens_trend = float(getattr(cr, "SENS_TRENDINESS", 0.0))
                 sens_health = float(getattr(cr, "SENS_HEALTH", 0.0))
                 
+                # Formula: 1 + (Vol * DefensiveWeight) + (Dispersion * OffensiveWeight)
                 raw_mult = 1.0 + (trend_z * sens_trend) + (health_z * sens_health)
                 regime_mult = max(0.5, min(raw_mult, 3.0)) 
                 
@@ -468,7 +448,8 @@ def run_month(
         still_open: list[PairPos] = []
         
         for pos in open_positions:
-            zsp = pos.mark(snap_last, decision_ts=dts)
+            # OPTIMIZATION: PASS PRE-CALCULATED VECTORS
+            zsp = pos.mark(snap_last, xp_sorted, fp_sorted, r_float, decision_ts=dts)
             
             entry_z = pos.entry_zspread
             exit_flag = None
@@ -482,11 +463,11 @@ def run_month(
                     sign_curr = np.sign(curr_dir)
                     same_side = (sign_entry != 0) and (sign_entry == sign_curr)
                     
-                    # Profit Take (Dynamic)
+                    # Profit Take: Use DYNAMIC z_exit_curr
                     if same_side and (abs(curr_dir) <= abs(entry_dir)) and (abs(curr_dir) <= z_exit_curr):
                         exit_flag = "reversion"
                     
-                    # Stop Loss (Dynamic)
+                    # Stop Loss: Use DYNAMIC z_stop_curr
                     dz_dir = curr_dir - entry_dir
                     if same_side and (abs(curr_dir) >= abs(entry_dir)) and (abs(dz_dir) >= z_stop_curr):
                         exit_flag = "stop"
@@ -503,19 +484,16 @@ def run_month(
                     z_improvement = (pos.entry_zspread - zsp) * pos.dir_sign
                     vel_price = z_improvement / days_held
                     
-                    # Carry Velocity
-                    scale_i, scale_j = 0.0005, 0.0005
-                    try:
-                        row_i = snap_last[snap_last["tenor_yrs"] == pos.tenor_i]
-                        row_j = snap_last[snap_last["tenor_yrs"] == pos.tenor_j]
-                        if not row_i.empty and "scale" in row_i.columns: scale_i = float(row_i["scale"].iloc[0])
-                        if not row_j.empty and "scale" in row_j.columns: scale_j = float(row_j["scale"].iloc[0])
-                    except: pass
-                    pair_scale = (scale_i + scale_j) / 2.0
+                    # Carry Velocity (Scaled to Z)
+                    # Approx Scale (Fall back to 0.5bp if missing)
+                    pair_scale = 0.0050
+                    if "scale" in snap_last.columns:
+                        pair_scale = float(snap_last["scale"].median())
                     
-                    # Realized Daily Drift (Fixed Unit Conversion: Bps / 100.0)
+                    # Realized Daily Drift (Rate %)
+                    # (Carry_BP + Roll_BP) is in Bps. Divide by 100 to get Rate Units (%).
                     total_drift_bps = (pos.pnl_carry_bp + pos.pnl_roll_bp)
-                    daily_drift_rate = (total_drift_bps / days_held) / 100.0 
+                    daily_drift_rate = (total_drift_bps / days_held) / 100.0
                     
                     vel_carry = daily_drift_rate / max(1e-6, pair_scale)
                     
@@ -562,14 +540,17 @@ def run_month(
                     "scale_dv01": pos.scale_dv01,
                     "entry_zspread": pos.entry_zspread,
                     
+                    # PnL
                     "pnl_net_bp": pos.pnl_bp - tcost_bp, 
                     "pnl_net_cash": pos.pnl_cash - tcost_cash,
                     "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
                     
+                    # Attribution
                     "pnl_price_bp": pos.pnl_price_bp, "pnl_carry_bp": pos.pnl_carry_bp,
                     "pnl_roll_bp": pos.pnl_roll_bp, "pnl_price_cash": pos.pnl_price_cash,
                     "pnl_carry_cash": pos.pnl_carry_cash, "pnl_roll_cash": pos.pnl_roll_cash,
                     
+                    # Analytics
                     "days_held_equiv": pos.age_decisions / max(1, decisions_per_day),
                     "trade_id": pos.meta.get("trade_id"),
                     "side": pos.meta.get("side"),
@@ -639,8 +620,10 @@ def run_month(
                 fly_alignment = hedge_dir * fly_z_exec
                 fly_bonus_base = -1.0 * fly_alignment * float(getattr(cr, "FLY_WEIGHT", 0.15))
 
-            drift_exec = calc_trade_drift(exec_tenor, side_s, snap_srt)
+            # Drift of Execution Leg
+            drift_exec = calc_trade_drift(exec_tenor, side_s, float(exec_row["rate"]), r_float, xp_sorted, fp_sorted)
 
+            # Search Alternates
             for _, alt in snap_srt.iterrows():
                 alt_tenor = float(alt["tenor_yrs"])
                 
@@ -681,7 +664,7 @@ def run_month(
                     thresh += SHORT_END_EXTRA_Z
                 
                 # 6. Drift Logic
-                drift_alt = calc_trade_drift(alt_tenor, side_s, snap_srt)
+                drift_alt = calc_trade_drift(alt_tenor, side_s, float(alt["rate"]), r_float, xp_sorted, fp_sorted)
                 net_drift_bps = drift_alt - drift_exec 
                 
                 if net_drift_bps < DRIFT_GATE: continue 
@@ -698,7 +681,7 @@ def run_month(
                     best_score = score
                     best_c_row = alt
 
-            # Execute
+            # Execute Best
             if best_c_row is not None:
                 rate_i, rate_j = None, None
                 ti, tj = tenor_to_ticker(float(best_c_row["tenor_yrs"])), tenor_to_ticker(t_trade)
@@ -712,11 +695,11 @@ def run_month(
                               scale_dv01=float(h["dv01"]), 
                               meta={"trade_id": h.get("trade_id"), "side": h.get("side")},
                               entry_rate_i=rate_i, entry_rate_j=rate_j,
-                              # Metadata
+                              # --- PASS METADATA ---
                               fly_bonus=fly_bonus_base,
                               regime_mult=regime_mult,
                               z_entry_base=Z_ENTRY_BASE,
-                              z_entry_final=z_entry_curr) 
+                              z_entry_final=z_entry_curr) # The threshold used to pass
                 open_positions.append(pos)
                 ledger_rows.append({"decision_ts": dts, "event": "open"})
 
@@ -784,10 +767,9 @@ if __name__ == "__main__":
         print("[ERROR] No trades.pkl found. Strategy mode is deprecated. Overlay requires trades.")
         sys.exit(1)
 
-    print(f"[INIT] Hybrid Filters (Signals)...")
+    print(f"[INIT] Hybrid Filters (Regime Only)...")
     signals = hf.get_or_build_hybrid_signals()
-    # Note: We no longer rely on the boolean mask for blocking. 
-    # We pass the full signals df to enable dynamic thresholds.
+    # Note: We skip the regime_mask creation, we pass signals for dynamic logic
 
     print(f"[EXEC] Running Overlay on {len(months)} months.")
     pos, led, by = run_all(months, carry=True, force_close_end=True, hedge_df=trades, regime_signals=signals)
