@@ -130,3 +130,30 @@ RISK_NAIVE_LIMIT  = 80_000   # Max Absolute Net DV01 allowed on either side
 FLY_ENABLE     = True
 FLY_WEIGHT     = 0.15   # Bonus weight (e.g., 0.15 sigmas per unit of Fly Z)
 FLY_MIN_DIST   = 1.5    # Wings must be at least 1.5y away (avoids noisy 9s/10s/11s)
+
+# ==========================================
+# BUTTERFLY / FLY OVERLAY CONFIG
+# ==========================================
+
+# 1. RUN MODE
+# Options: "fly" (New Engine), "overlay" (Legacy Pair Engine)
+RUN_MODE = "fly" 
+
+# 2. FLY CONSTRUCTION RULES
+# "STRICT": Belly must match Hedge Tenor exactly (Zero Basis Risk).
+# "FLEXIBLE": Belly can be +/- 2.5y from Hedge Tenor (Basis Risk for Alpha).
+# Recommendation: Start with STRICT.
+FLY_ANCHOR_MODE = "STRICT" 
+
+# Wings must be at least 2y away and at most 7y away from belly.
+# Example: For 10y Belly -> Scans 8y/12y (min) up to 3y/17y (max).
+FLY_WING_WIDTH_RANGE = (2.0, 7.0) 
+
+# 3. TREND LOGIC
+# Days to calculate the moving average Z-score.
+# 20 Days = approx 1 trading month. Standard for "Short Term Trend".
+Z_TREND_WINDOW = 20 
+
+# 4. DRIFT WEIGHT (Updated for Flies)
+# Flies rely heavily on roll-down. Increase this from 0.2 to 0.75 or 1.0.
+DRIFT_WEIGHT = 0.75 
