@@ -154,7 +154,7 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
 # ------------------------
 class PairPos:
     def __init__(self, open_ts, cheap_row, rich_row, w_i, w_j, decisions_per_day, *, 
-                 scale_dv01=1.0, mode="strategy", meta=None, dir_sign=None, 
+                 scale_dv01=1.0, mode="overlay", meta=None, dir_sign=None, 
                  entry_rate_i=None, entry_rate_j=None,
                  # --- METADATA ---
                  fly_bonus=0.0, regime_mult=1.0, 
@@ -321,7 +321,7 @@ def run_month(
     decision_freq: str | None = None,
     open_positions: Optional[List[PairPos]] | None = None,
     carry_in: bool = True,
-    mode: str = "strategy",
+    mode: str = "overlay",
     hedges: Optional[pd.DataFrame] = None,
     overlay_use_caps: Optional[bool] = None,
     regime_mask: Optional[pd.Series] = None,        
