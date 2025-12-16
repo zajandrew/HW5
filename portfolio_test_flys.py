@@ -95,6 +95,10 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
     return df[cols + extra]
 
 def calc_leg_drift(tenor, rate, r_float, cs_func):
+    """
+    Calculates 1-Day Drift (Carry + Roll) in Basis Points.
+    Uses Cubic Spline for accurate Roll-down.
+    """
     dt = 1.0/360.0
     carry_bps = (rate - r_float) * 100.0 * dt
     rolled_rate = float(cs_func(tenor - dt))
@@ -124,8 +128,6 @@ class FlyPos:
         self.t_belly_orig, self.t_left_orig, self.t_right_orig = self.t_belly, self.t_left, self.t_right
         
         # --- Safety Cap ---
-        # "Minimum Tenor Safety Factor": e.g. 73.0 (from 365/5). 
-        # Max Days = Tenor * Factor.
         safety_factor = float(getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0))
         self.max_days_fly = min(self.t_belly, self.t_left, self.t_right) * safety_factor
 
@@ -148,7 +150,7 @@ class FlyPos:
         self.dv01_left_curr  = self.dv01_left_entry
         self.dv01_right_curr = self.dv01_right_entry
 
-        # --- Notional Init ---
+        # --- Notional Init (For Carry Calc) ---
         self.not_belly = self.dv01_belly_entry / max(1e-6, self.t_belly)
         self.not_left  = self.dv01_left_entry  / max(1e-6, self.t_left)
         self.not_right = self.dv01_right_entry / max(1e-6, self.t_right)
@@ -367,13 +369,11 @@ def run_month(
             if hasattr(pos, 'last_z_val'):
                 curr_z = pos.last_z_val
                 
-                # A. Reversion (Profit Take)
+                # Check Z_EXIT (Reversion)
                 if abs(curr_z) <= z_exit_curr: 
                     exit_flag = "reversion"
                 
-                # B. Stop Loss (Based on Z-Score)
-                # If we entered Short (-1) at +2.0, we stop if it goes to +5.0 (Rising is bad).
-                # If we entered Long (+1) at -2.0, we stop if it goes to -5.0 (Falling is bad).
+                # Check Z_STOP
                 entry_z = pos.entry_z
                 bad_move = 0.0
                 if entry_z > 0: bad_move = curr_z - entry_z
@@ -382,7 +382,7 @@ def run_month(
                 if bad_move >= z_stop_curr: 
                     exit_flag = "stop"
 
-            # C. Dynamic Stalemate (Velocity)
+            # Check Dynamic Stalemate (Velocity)
             STALE_ENABLE = getattr(cr, "STALE_ENABLE", False)
             if STALE_ENABLE and exit_flag is None:
                 STALE_START = float(getattr(cr, "STALE_START_DAYS", 3.0))
@@ -390,15 +390,7 @@ def run_month(
                 
                 days_held = pos.age_decisions / max(1, decisions_per_day)
                 if days_held >= STALE_START:
-                    # 1. Price Velocity (Z-Score improvement per day)
                     needed_dir = pos.dm 
-                    
-                    # LOGIC FIX:
-                    # If Short (-1), we entered Low (e.g. -2) and want High (0).
-                    #   Improvement = Current (-1) - Entry (-2) = +1. (Positive)
-                    # If Long (+1), we entered High (e.g. +2) and want Low (0).
-                    #   Improvement = Entry (+2) - Current (+1) = +1. (Positive)
-                    
                     if needed_dir == -1.0:
                         z_improvement = curr_z - pos.entry_z
                     else:
@@ -406,24 +398,19 @@ def run_month(
                         
                     vel_price = z_improvement / days_held
 
-                    # 2. Carry Velocity (Scaled)
                     pair_scale = 0.0050
                     if "scale" in snap_last.columns:
                         pair_scale = float(snap_last["scale"].median())
                     
-                    # Realized Daily Drift (%)
-                    # Divide BPs by 100 to get Rate % (e.g. 1bp = 0.01%)
                     total_drift_bps = (pos.pnl_carry_bp + pos.pnl_roll_bp)
                     daily_drift_rate = (total_drift_bps / days_held) / 100.0
                     
-                    # Normalize Drift to Z-Score units (Sigma equivalent)
                     vel_carry = daily_drift_rate / max(1e-6, pair_scale)
                     
                     if (vel_price + vel_carry) < MIN_VELOCITY:
                         exit_flag = "stalemate"
 
-
-            # D. Safety Cap (Min Tenor Rule)
+            # Check Safety Cap
             if exit_flag is None:
                 if pos.age_decisions >= (pos.max_days_fly * decisions_per_day): 
                     exit_flag = "safety_cap"
@@ -559,6 +546,9 @@ def run_month(
             
             if not valid_wings: continue
             
+            # --- FINAL ENTRY GATE (Fix for user's concern) ---
+            if cand_score < z_entry_curr: continue
+
             z_hist = z_history.get(t_belly, [])
             z_slow = np.mean(z_hist) if len(z_hist) > 5 else z_curr
             
