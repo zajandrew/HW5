@@ -124,7 +124,7 @@ class FlyPos:
         
         self.open_ts = open_ts
         self.meta = meta or {}
-        self.mode = "fly"
+        self.mode = "overlay"  # Set mode to 'overlay' to match your analytics filter
         self.scale_dv01 = float(scale_dv01)
         
         # --- Tenors ---
@@ -422,7 +422,7 @@ def run_month(
                 pos.exit_reason = exit_flag
 
             row = {
-                "decision_ts": dts, "event": "mark", "mode": "fly",
+                "decision_ts": dts, "event": "mark", "mode": pos.mode,
                 "tenor_i": pos.t_belly, 
                 "pnl_bp": pos.pnl_bp, "pnl_cash": pos.pnl_cash,
                 "pnl_price_bp": pos.pnl_price_bp, "pnl_carry_bp": pos.pnl_carry_bp,
@@ -444,10 +444,10 @@ def run_month(
 
                 cl_row = {
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, 
-                    "exit_reason": pos.exit_reason, "mode": "fly",
+                    "exit_reason": pos.exit_reason, "mode": pos.mode,
                     "pnl_net_bp": pnl_net_bp_final, 
                     "pnl_net_cash": pnl_net_cash_final,
-                    "tcost_bp": tcost_bp,
+                    "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
                     "days_held": pos.age_decisions / decisions_per_day,
                     "trade_id": pos.meta.get("trade_id", -1),
                     "scale_dv01": pos.scale_dv01,
@@ -560,7 +560,7 @@ def run_month(
             
             open_positions.append(pos)
             ledger_rows.append({
-                "decision_ts": dts, "event": "open", "mode": "fly", 
+                "decision_ts": dts, "event": "open", "mode": pos.mode,
                 "tenor_i": t_belly, 
                 "scale_dv01": hedge_dv01, 
                 "side": pos.side_desc
@@ -612,8 +612,8 @@ def run_all(yymms, *, decision_freq=None, carry=True, force_close_end=False, hed
             pnl_net_bp_final = pos.pnl_price_bp + pos.pnl_carry_bp + pos.pnl_roll_bp - tcost_bp
             
             row = {
-                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc", "mode": "fly",
-                "pnl_net_bp": pnl_net_bp_final, "pnl_net_cash": pnl_net_cash_final, "tcost_bp": tcost_bp,
+                "open_ts": pos.open_ts, "close_ts": pos.close_ts, "exit_reason": "eoc", "mode": pos.mode,
+                "pnl_net_bp": pnl_net_bp_final, "pnl_net_cash": pnl_net_cash_final, "tcost_bp": tcost_bp, "tcost_cash": tcost_cash,
                 "scale_dv01": pos.scale_dv01,
                 "tenor_i": pos.t_belly, "tenor_left": pos.t_left, "tenor_right": pos.t_right,
                 # Granular PnL
