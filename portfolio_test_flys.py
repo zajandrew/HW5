@@ -124,7 +124,8 @@ class FlyPos:
         
         self.open_ts = open_ts
         self.meta = meta or {}
-        self.mode = "overlay"  # Set mode to 'overlay' to match your analytics filter
+        # Keep mode as 'overlay' for compatibility with your analytics script filters
+        self.mode = "overlay"  
         self.scale_dv01 = float(scale_dv01)
         
         # --- Tenors ---
@@ -261,7 +262,7 @@ class FlyPos:
                 
             self.last_mark_ts = decision_ts
 
-        # Aggregation
+        # Aggregation (Incremental)
         self.pnl_cash = self.pnl_price_cash + self.pnl_carry_cash + self.pnl_roll_cash
         self.pnl_bp = self.pnl_cash / self.scale_dv01 if self.scale_dv01 else 0.0
         self.age_decisions += 1
@@ -296,7 +297,7 @@ def run_month(
     df = pd.read_parquet(enh_path)
     if df.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), (open_positions or []), z_history
 
-    # FORCE Decisions Per Day to 1 if Daily, else calc from data
+    # FORCE Decisions Per Day to 1 if Daily
     if decision_freq == "D":
         df["decision_ts"] = df["ts"].dt.floor("d")
         decisions_per_day = 1
@@ -320,7 +321,7 @@ def run_month(
     DRIFT_GATE = float(getattr(cr, "DRIFT_GATE_BPS", -100.0)) 
     DRIFT_W = float(getattr(cr, "DRIFT_WEIGHT", 0.0))
 
-    # --- REGIME (MATCHED TO SCREENSHOT LOGIC) ---
+    # --- REGIME ---
     sig_lookup = None
     if regime_signals is not None and not regime_signals.empty:
         sig_lookup = regime_signals.drop_duplicates("decision_ts").set_index("decision_ts").sort_index()
@@ -438,9 +439,12 @@ def run_month(
                 tcost_bp = SWITCH_COST_BP
                 tcost_cash = tcost_bp * pos.scale_dv01
                 
-                # --- EXPLICIT TIE-OUT SUMS ---
-                pnl_net_cash_final = pos.pnl_price_cash + pos.pnl_carry_cash + pos.pnl_roll_cash - tcost_cash
-                pnl_net_bp_final = pos.pnl_price_bp + pos.pnl_carry_bp + pos.pnl_roll_bp - tcost_bp
+                # --- EXPLICIT TIE-OUT SUMS (FORCING MATH) ---
+                pnl_gross_cash = pos.pnl_price_cash + pos.pnl_carry_cash + pos.pnl_roll_cash
+                pnl_net_cash_final = pnl_gross_cash - tcost_cash
+                
+                pnl_gross_bp = pos.pnl_price_bp + pos.pnl_carry_bp + pos.pnl_roll_bp
+                pnl_net_bp_final = pnl_gross_bp - tcost_bp
 
                 cl_row = {
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, 
