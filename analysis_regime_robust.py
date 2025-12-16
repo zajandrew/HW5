@@ -9,7 +9,7 @@ Methodology:
 2. Aggregates thousands of trades into a Super-Ledger.
 3. Bins trades by Regime Factor Quartiles (Q1=Low, Q4=High).
 4. Analyzes PRICE PNL primarily to identify "Falling Knife" regimes without Carry bias.
-5. [NEW] Outputs the Min/Max values of the signal for each bin to calibrate thresholds.
+5. Outputs detailed Ranges, PnL, and Consistency for EVERY Quartile.
 """
 
 import pandas as pd
@@ -39,15 +39,14 @@ QUARTILE_LABELS = ["Q1_Low", "Q2_MidLow", "Q3_MidHigh", "Q4_High"]
 # ==============================================================================
 
 def run_robust_analysis():
-    print(f"\n" + "="*80)
-    print(f"{'ROBUST REGIME DIAGNOSTIC (PRICE-FOCUSED)':^80}")
-    print(f"="*80)
+    print(f"\n" + "="*120)
+    print(f"{'ROBUST REGIME DIAGNOSTIC (PRICE-FOCUSED)':^120}")
+    print(f"="*120)
     print(f"[INFO] Using Engine Settings from 'cr_config.py'")
     print(f"[NOTE] Ensure Z_ENTRY/Z_STOP are LOOSE to catch 'Falling Knives' for analysis.\n")
 
     # 1. Load Regime Signals
     signals = hf.get_or_build_hybrid_signals()
-    # Ensure correct timestamp format for merging (Naive)
     signals["decision_ts"] = pd.to_datetime(signals["decision_ts"], utc=True).dt.tz_convert(None)
     
     # 2. Find All Synthetic Tapes
@@ -71,10 +70,9 @@ def run_robust_analysis():
         try:
             # Load Tape
             hedges = pd.read_pickle(tape_path)
-            # Fix Timezone
             hedges["tradetimeUTC"] = pd.to_datetime(hedges["tradetimeUTC"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
             
-            # Run Engine (Phase 1 Settings)
+            # Run Engine
             pos, _, _ = pt.run_all(
                 months, 
                 decision_freq="D", 
@@ -101,14 +99,12 @@ def run_robust_analysis():
     # 4. Aggregate
     super_ledger = pd.concat(all_trades, ignore_index=True)
     
-    # Filter for Overlay only if column exists (Fly mode might not set 'mode' explicitly in older logs)
     if "mode" in super_ledger.columns:
         super_ledger = super_ledger[super_ledger["mode"].isin(["overlay", "fly"])].copy()
         
     print(f"\n[LOAD] Super-Ledger created with {len(super_ledger)} total trades.")
 
     # 5. Merge with Signals
-    # Map Trade Open Time -> Decision Time
     super_ledger["open_ts"] = pd.to_datetime(super_ledger["open_ts"], utc=True).dt.tz_convert(None)
     
     if cr.DECISION_FREQ == "D":
@@ -126,89 +122,95 @@ def run_robust_analysis():
     summary_data = []
 
     for factor in valid_factors:
-        print(f"\n" + "-"*100)
+        print(f"\n" + "-"*120)
         print(f"FACTOR ANALYSIS: {factor}")
-        print("-"*100)
+        print("-"*120)
         
         try:
-            # Binning across the entire Super-Ledger
             df["bin"] = pd.qcut(df[factor], 4, labels=QUARTILE_LABELS, duplicates='drop')
         except ValueError:
             print(f"  [SKIP] Not enough unique values to bin {factor}.")
             continue
             
-        # Detailed Aggregation
         stats = df.groupby("bin", observed=False).agg(
-            # --- Range Definition (The "What is Q4?" answer) ---
             Min_Val=(factor, "min"),
             Max_Val=(factor, "max"),
-            
             Count=("pnl_net_bp", "count"),
-            
-            # --- The Truth (Price) ---
             Price_Mean=("pnl_price_bp", "mean"),
             Price_WinRate=("pnl_price_bp", lambda x: (x > 0).mean()),
-            
-            # --- The Bottom Line (Total) ---
             Total_Mean=("pnl_net_bp", "mean"),
-            
-            # --- Consistency ---
             Tape_Agree=("pnl_price_bp", lambda x: _check_consistency(df.loc[x.index]))
         )
         
-        # Calculate Spread (Q4 - Q1) for Price PnL
-        if len(stats) >= 2: # At least 2 bins needed
+        # Calculate Metrics for Summary Table
+        if len(stats) >= 2: 
             try:
-                # Handle dropped duplicates if quartiles merged
+                # Calc Spread (High - Low)
                 q1_idx = stats.index[0]
                 q4_idx = stats.index[-1]
-                
                 q1_price = stats.loc[q1_idx, "Price_Mean"]
                 q4_price = stats.loc[q4_idx, "Price_Mean"]
-                price_spread = q4_price - q1_price
                 
-                # Grab the threshold values for the summary
-                q4_min = stats.loc[q4_idx, "Min_Val"]
-                
-                summary_data.append({
-                    "Factor": factor, 
-                    "Price_Spread_Q4-Q1": price_spread,
-                    "Q4_Min_Threshold": q4_min, # <--- The number you put in config!
-                    "Q1_Price_PnL": q1_price,
-                    "Q4_Price_PnL": q4_price,
-                    "Q4_Price_WinRate": stats.loc[q4_idx, "Price_WinRate"],
-                })
-            except: pass
+                entry = {"Factor": factor, "Spread_Q4-Q1": q4_price - q1_price}
+
+                # Extract Per-Quartile Metrics
+                for q_label in QUARTILE_LABELS:
+                    if q_label in stats.index:
+                        mn = stats.loc[q_label, "Min_Val"]
+                        mx = stats.loc[q_label, "Max_Val"]
+                        pnl = stats.loc[q_label, "Price_Mean"]
+                        agree = stats.loc[q_label, "Tape_Agree"]
+                        
+                        # Short labels for column width
+                        short_q = q_label.split("_")[0] # "Q1", "Q2"
+                        entry[f"{short_q}_Range"] = f"{mn:.2f}->{mx:.2f}"
+                        entry[f"{short_q}_PnL"] = f"{pnl:+.1f}"
+                        entry[f"{short_q}_Agr"] = f"{agree:.0%}"
+                    else:
+                        short_q = q_label.split("_")[0]
+                        entry[f"{short_q}_Range"] = "-"
+                        entry[f"{short_q}_PnL"] = "-"
+                        entry[f"{short_q}_Agr"] = "-"
+
+                summary_data.append(entry)
+            except Exception as e: 
+                print(f"[WARN] Could not summarize {factor}: {e}")
         
-        # Format for display
+        # Display Intermediate Table
         pd.options.display.float_format = '{:,.2f}'.format
-        # Reorder columns for readability
-        cols = ["Min_Val", "Max_Val", "Count", "Price_Mean", "Price_WinRate", "Total_Mean", "Tape_Agree"]
+        cols = ["Min_Val", "Max_Val", "Count", "Price_Mean", "Price_WinRate", "Tape_Agree"]
         print(stats[cols].to_string())
 
     # 7. Impact Summary
     if summary_data:
-        summary_df = pd.DataFrame(summary_data).sort_values("Price_Spread_Q4-Q1", ascending=True)
+        summary_df = pd.DataFrame(summary_data).sort_values("Spread_Q4-Q1", ascending=True)
         
-        print(f"\n" + "="*100)
-        print(f"{'IMPACT SUMMARY (Ranked by PRICE PnL Damage)':^100}")
-        print(f"="*100)
-        print("INTERPRETATION:")
-        print(" * Q4_Min_Threshold: This is the specific value where the 'High' regime starts.")
-        print(" * NEGATIVE SPREAD: High Values hurt PnL. Use Defensive Weight (SENS > 0).")
-        print(" * POSITIVE SPREAD: High Values help PnL. Use Offensive Weight (SENS < 0).")
-        print("-" * 100)
+        print(f"\n" + "="*160)
+        print(f"{'FULL IMPACT SUMMARY (Price PnL & Consistency)':^160}")
+        print(f"="*160)
         
-        cols = ["Factor", "Price_Spread_Q4-Q1", "Q4_Min_Threshold", "Q1_Price_PnL", "Q4_Price_PnL", "Q4_Price_WinRate"]
-        print(summary_df[cols].to_string(index=False))
+        # Build Column List dynamically
+        cols = ["Factor", "Spread_Q4-Q1"]
+        for q in ["Q1", "Q2", "Q3", "Q4"]:
+            cols.extend([f"{q}_Range", f"{q}_PnL", f"{q}_Agr"])
+            
+        # Rename for compact printing
+        rename_map = {c: c.replace("_Range", " Range").replace("_PnL", " PnL").replace("_Agr", " %") for c in cols}
+        summary_df = summary_df.rename(columns=rename_map)
+        final_cols = list(rename_map.values())
+        
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', 1000)
+        pd.set_option('display.colheader_justify', 'center')
+
+        print(summary_df[final_cols].to_string(index=False))
+        print("-" * 160)
 
 def _check_consistency(sub_df):
     """
     Returns the fraction of unique tapes that had >0 Price PnL in this subset.
-    This prevents 'One Lucky Tape' from skewing the stats.
     """
     if sub_df.empty: return 0.0
-    # Group by Source Tape and calc mean Price PnL for this bin
     tape_performance = sub_df.groupby("source_tape")["pnl_price_bp"].mean()
     positive_tapes = (tape_performance > 0).sum()
     total_tapes = len(tape_performance)
