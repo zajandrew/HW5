@@ -391,13 +391,19 @@ def run_month(
                 days_held = pos.age_decisions / max(1, decisions_per_day)
                 if days_held >= STALE_START:
                     # 1. Price Velocity (Z-Score improvement per day)
-                    # Note: We need 'dir_sign' logic. If we want Z to drop, Z_imp = (Entry - Curr).
-                    # If we want Z to rise, Z_imp = (Curr - Entry).
-                    # Simplified: We use 'needed_dir' logic. 
-                    # If needed_dir=-1 (Pay), we want Z down. Imp = Entry - Curr.
-                    # If needed_dir=+1 (Rec), we want Z up. Imp = Curr - Entry.
-                    needed_dir = pos.dm # Stored as direction_multiplier
-                    z_improvement = (pos.entry_z - curr_z) if needed_dir == -1.0 else (curr_z - pos.entry_z)
+                    needed_dir = pos.dm 
+                    
+                    # LOGIC FIX:
+                    # If Short (-1), we entered Low (e.g. -2) and want High (0).
+                    #   Improvement = Current (-1) - Entry (-2) = +1. (Positive)
+                    # If Long (+1), we entered High (e.g. +2) and want Low (0).
+                    #   Improvement = Entry (+2) - Current (+1) = +1. (Positive)
+                    
+                    if needed_dir == -1.0:
+                        z_improvement = curr_z - pos.entry_z
+                    else:
+                        z_improvement = pos.entry_z - curr_z
+                        
                     vel_price = z_improvement / days_held
 
                     # 2. Carry Velocity (Scaled)
@@ -406,12 +412,16 @@ def run_month(
                         pair_scale = float(snap_last["scale"].median())
                     
                     # Realized Daily Drift (%)
+                    # Divide BPs by 100 to get Rate % (e.g. 1bp = 0.01%)
                     total_drift_bps = (pos.pnl_carry_bp + pos.pnl_roll_bp)
                     daily_drift_rate = (total_drift_bps / days_held) / 100.0
+                    
+                    # Normalize Drift to Z-Score units (Sigma equivalent)
                     vel_carry = daily_drift_rate / max(1e-6, pair_scale)
                     
                     if (vel_price + vel_carry) < MIN_VELOCITY:
                         exit_flag = "stalemate"
+
 
             # D. Safety Cap (Min Tenor Rule)
             if exit_flag is None:
