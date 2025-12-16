@@ -62,7 +62,6 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
 
     if "side" in df.columns:
         df["side"] = df["side"].astype(str).str.upper()
-        # CPAY = Client Pays (Desk Pays). CRCV = Client Receives (Desk Receives).
         df = df[df["side"].isin(["CPAY", "CRCV"])]
     else:
         print("[ERROR] Hedge tape missing 'side'.")
@@ -96,19 +95,10 @@ def prepare_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame
     return df[cols + extra]
 
 def calc_leg_drift(tenor, rate, r_float, cs_func):
-    """
-    Calculates 1-Day Drift (Carry + Roll) in Basis Points.
-    Uses Cubic Spline for accurate Roll-down.
-    """
-    # 1. Carry (Yield - Cost of Funds)
     dt = 1.0/360.0
     carry_bps = (rate - r_float) * 100.0 * dt
-    
-    # 2. Roll-Down (Curve Slide)
-    # RolledRate is the yield at (Tenor - 1day)
     rolled_rate = float(cs_func(tenor - dt))
     roll_bps = (rate - rolled_rate) * 100.0
-    
     return carry_bps + roll_bps
 
 # ------------------------
@@ -124,7 +114,6 @@ class FlyPos:
         
         self.open_ts = open_ts
         self.meta = meta or {}
-        # Keep mode as 'overlay' for compatibility with your analytics script filters
         self.mode = "overlay"  
         self.scale_dv01 = float(scale_dv01)
         
@@ -134,15 +123,18 @@ class FlyPos:
         self.t_right = float(right_row["tenor_yrs"])
         self.t_belly_orig, self.t_left_orig, self.t_right_orig = self.t_belly, self.t_left, self.t_right
         
+        # --- Safety Cap ---
+        # "Minimum Tenor Safety Factor": e.g. 73.0 (from 365/5). 
+        # Max Days = Tenor * Factor.
+        safety_factor = float(getattr(cr, "MIN_TENOR_SAFETY_FACTOR", 73.0))
+        self.max_days_fly = min(self.t_belly, self.t_left, self.t_right) * safety_factor
+
         # --- Weights & Direction ---
-        # direction_multiplier (dm): +1.0 (Rec Belly), -1.0 (Pay Belly)
         self.dm = direction_multiplier
-        
         self.w_belly = 1.0 * self.dm
         self.w_left  = -0.5 * self.dm
         self.w_right = -0.5 * self.dm
         
-        # Explicit Direction (+1 = Rec, -1 = Pay)
         self.dir_belly = 1 if self.w_belly > 0 else -1
         self.dir_left  = 1 if self.w_left > 0 else -1
         self.dir_right = 1 if self.w_right > 0 else -1
@@ -156,8 +148,7 @@ class FlyPos:
         self.dv01_left_curr  = self.dv01_left_entry
         self.dv01_right_curr = self.dv01_right_entry
 
-        # --- Notional Init (For Carry Calc) ---
-        # Proxy: Notional = DV01 / Tenor
+        # --- Notional Init ---
         self.not_belly = self.dv01_belly_entry / max(1e-6, self.t_belly)
         self.not_left  = self.dv01_left_entry  / max(1e-6, self.t_left)
         self.not_right = self.dv01_right_entry / max(1e-6, self.t_right)
@@ -167,7 +158,6 @@ class FlyPos:
         self.r_entry_left  = float(left_row["rate"])
         self.r_entry_right = float(right_row["rate"])
         
-        # Current/Exit Rates
         self.r_curr_belly = self.r_entry_belly
         self.r_curr_left  = self.r_entry_left
         self.r_curr_right = self.r_entry_right
@@ -219,36 +209,24 @@ class FlyPos:
         
         cs = CubicSpline(xp, fp)
         
-        # Update Current Rates
         self.r_curr_belly = float(cs(self.t_belly))
         self.r_curr_left  = float(cs(self.t_left))
         self.r_curr_right = float(cs(self.t_right))
         
-        # ==========================
-        # 1. PRICE PNL
-        # ==========================
         pnl_p_b = (self.r_entry_belly - self.r_curr_belly) * 100.0 * self.dv01_belly_curr * self.dir_belly
         pnl_p_l = (self.r_entry_left - self.r_curr_left)   * 100.0 * self.dv01_left_curr  * self.dir_left
         pnl_p_r = (self.r_entry_right - self.r_curr_right) * 100.0 * self.dv01_right_curr * self.dir_right
-        
         self.pnl_price_cash = pnl_p_b + pnl_p_l + pnl_p_r
         
-        # ==========================
-        # 2. CARRY & ROLL PNL
-        # ==========================
         if decision_ts and self.last_mark_ts:
             dt_days = (decision_ts - self.last_mark_ts).days
             if dt_days > 0:
                 t_frac = dt_days / 360.0
-                
-                # Carry: (Coupon - Funding) * Notional * 100 * Time
                 carry_b = (self.r_entry_belly - r_float) * 100.0 * self.not_belly * t_frac * self.dir_belly
                 carry_l = (self.r_entry_left  - r_float) * 100.0 * self.not_left  * t_frac * self.dir_left
                 carry_r = (self.r_entry_right - r_float) * 100.0 * self.not_right * t_frac * self.dir_right
-                
                 self.pnl_carry_cash += (carry_b + carry_l + carry_r)
                 
-                # Rolldown: (CurrRate - RolledRate) * 100 * DV01 * Dir
                 step = 1.0/360.0
                 r_roll_b = float(cs(self.t_belly - step))
                 r_roll_l = float(cs(self.t_left  - step))
@@ -257,12 +235,10 @@ class FlyPos:
                 roll_b = (self.r_curr_belly - r_roll_b) * 100.0 * self.dv01_belly_curr * self.dir_belly * dt_days
                 roll_l = (self.r_curr_left  - r_roll_l) * 100.0 * self.dv01_left_curr  * self.dir_left  * dt_days
                 roll_r = (self.r_curr_right - r_roll_r) * 100.0 * self.dv01_right_curr * self.dir_right * dt_days
-                
                 self.pnl_roll_cash += (roll_b + roll_l + roll_r)
                 
             self.last_mark_ts = decision_ts
 
-        # Aggregation (Incremental)
         self.pnl_cash = self.pnl_price_cash + self.pnl_carry_cash + self.pnl_roll_cash
         self.pnl_bp = self.pnl_cash / self.scale_dv01 if self.scale_dv01 else 0.0
         self.age_decisions += 1
@@ -297,7 +273,6 @@ def run_month(
     df = pd.read_parquet(enh_path)
     if df.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), (open_positions or []), z_history
 
-    # FORCE Decisions Per Day to 1 if Daily
     if decision_freq == "D":
         df["decision_ts"] = df["ts"].dt.floor("d")
         decisions_per_day = 1
@@ -313,11 +288,9 @@ def run_month(
     Z_EXIT_BASE  = float(getattr(cr, "Z_EXIT", 0.40))
     Z_STOP_BASE  = float(getattr(cr, "Z_STOP", 3.00))
     SWITCH_COST_BP = float(getattr(cr, "OVERLAY_SWITCH_COST_BP", 0.10))
-    
     FLY_WING_MIN, FLY_WING_MAX = getattr(cr, "FLY_WING_WIDTH_RANGE", (2.0, 7.0))
     TREND_WINDOW = int(getattr(cr, "Z_TREND_WINDOW", 20))
     MIN_TENOR_FLOOR = 0.5 
-    
     DRIFT_GATE = float(getattr(cr, "DRIFT_GATE_BPS", -100.0)) 
     DRIFT_W = float(getattr(cr, "DRIFT_WEIGHT", 0.0))
 
@@ -363,27 +336,19 @@ def run_month(
         z_stop_curr  = Z_STOP_BASE
         regime_mult  = 1.0
         
-        # --- DYNAMIC THRESHOLDS (IMAGE LOGIC) ---
         if DYN_THRESH_ENABLE and sig_lookup is not None:
             if dts in sig_lookup.index:
                 row = sig_lookup.loc[dts]
                 if isinstance(row, pd.DataFrame): row = row.iloc[0]
                 
-                # 1. Defense: scale_roll_z (Vol Spike) normalized by 0.01
                 scale_z = float(row["scale_roll_z"]) / 0.01 if "scale_roll_z" in row else 0.0
-                
-                # 2. Offense: z_xs_std (Dispersion)
                 disp_z  = float(row["z_xs_std"]) if "z_xs_std" in row else 1.0
-                
-                # 3. Health: signal_health_z
                 health_z = float(row["signal_health_z"]) if "signal_health_z" in row else 1.0
 
-                # 4. Sensitivities
                 sens_scale = float(getattr(cr, "SENS_SCALE", 0.0))
                 sens_disp  = float(getattr(cr, "SENS_DISP", 0.0))
                 sens_health = float(getattr(cr, "SENS_HEALTH", 0.0))
 
-                # Formula: 1 + (Scale*Sens) + (Disp*Sens) + (Health*Sens)
                 raw_mult = 1.0 + (scale_z * sens_scale) + (disp_z * sens_disp) + (health_z * sens_health)
                 regime_mult = max(0.5, min(raw_mult, 3.0))
                 
@@ -401,21 +366,57 @@ def run_month(
             
             if hasattr(pos, 'last_z_val'):
                 curr_z = pos.last_z_val
-                if abs(curr_z) <= z_exit_curr: exit_flag = "reversion"
+                
+                # A. Reversion (Profit Take)
+                if abs(curr_z) <= z_exit_curr: 
+                    exit_flag = "reversion"
+                
+                # B. Stop Loss (Based on Z-Score)
+                # If we entered Short (-1) at +2.0, we stop if it goes to +5.0 (Rising is bad).
+                # If we entered Long (+1) at -2.0, we stop if it goes to -5.0 (Falling is bad).
                 entry_z = pos.entry_z
-                bad_move = (curr_z - entry_z) if entry_z > 0 else (entry_z - curr_z)
-                if bad_move >= z_stop_curr: exit_flag = "stop"
+                bad_move = 0.0
+                if entry_z > 0: bad_move = curr_z - entry_z
+                else: bad_move = entry_z - curr_z
+                
+                if bad_move >= z_stop_curr: 
+                    exit_flag = "stop"
 
+            # C. Dynamic Stalemate (Velocity)
             STALE_ENABLE = getattr(cr, "STALE_ENABLE", False)
             if STALE_ENABLE and exit_flag is None:
                 STALE_START = float(getattr(cr, "STALE_START_DAYS", 3.0))
+                MIN_VELOCITY = float(getattr(cr, "STALE_MIN_VELOCITY_Z", 0.015))
+                
                 days_held = pos.age_decisions / max(1, decisions_per_day)
-                if days_held >= STALE_START and pos.pnl_bp < -10.0: 
-                    exit_flag = "stalemate_loss" 
+                if days_held >= STALE_START:
+                    # 1. Price Velocity (Z-Score improvement per day)
+                    # Note: We need 'dir_sign' logic. If we want Z to drop, Z_imp = (Entry - Curr).
+                    # If we want Z to rise, Z_imp = (Curr - Entry).
+                    # Simplified: We use 'needed_dir' logic. 
+                    # If needed_dir=-1 (Pay), we want Z down. Imp = Entry - Curr.
+                    # If needed_dir=+1 (Rec), we want Z up. Imp = Curr - Entry.
+                    needed_dir = pos.dm # Stored as direction_multiplier
+                    z_improvement = (pos.entry_z - curr_z) if needed_dir == -1.0 else (curr_z - pos.entry_z)
+                    vel_price = z_improvement / days_held
 
+                    # 2. Carry Velocity (Scaled)
+                    pair_scale = 0.0050
+                    if "scale" in snap_last.columns:
+                        pair_scale = float(snap_last["scale"].median())
+                    
+                    # Realized Daily Drift (%)
+                    total_drift_bps = (pos.pnl_carry_bp + pos.pnl_roll_bp)
+                    daily_drift_rate = (total_drift_bps / days_held) / 100.0
+                    vel_carry = daily_drift_rate / max(1e-6, pair_scale)
+                    
+                    if (vel_price + vel_carry) < MIN_VELOCITY:
+                        exit_flag = "stalemate"
+
+            # D. Safety Cap (Min Tenor Rule)
             if exit_flag is None:
-                limit = getattr(pos, 'max_days_fly', 60)
-                if pos.age_decisions >= (limit * decisions_per_day): exit_flag = "safety_cap"
+                if pos.age_decisions >= (pos.max_days_fly * decisions_per_day): 
+                    exit_flag = "safety_cap"
 
             if exit_flag is not None:
                 pos.closed = True
@@ -431,7 +432,8 @@ def run_month(
                 "pnl_price_cash": pos.pnl_price_cash,
                 "pnl_carry_cash": pos.pnl_carry_cash,
                 "pnl_roll_cash": pos.pnl_roll_cash,
-                "rate_belly": pos.r_curr_belly, "closed": pos.closed
+                "rate_belly": pos.r_curr_belly, "closed": pos.closed,
+                "entry_z": pos.entry_z, "current_z": curr_z
             }
             ledger_rows.append(row)
 
@@ -439,12 +441,9 @@ def run_month(
                 tcost_bp = SWITCH_COST_BP
                 tcost_cash = tcost_bp * pos.scale_dv01
                 
-                # --- EXPLICIT TIE-OUT SUMS (FORCING MATH) ---
-                pnl_gross_cash = pos.pnl_price_cash + pos.pnl_carry_cash + pos.pnl_roll_cash
-                pnl_net_cash_final = pnl_gross_cash - tcost_cash
-                
-                pnl_gross_bp = pos.pnl_price_bp + pos.pnl_carry_bp + pos.pnl_roll_bp
-                pnl_net_bp_final = pnl_gross_bp - tcost_bp
+                # --- EXPLICIT TIE-OUT SUMS ---
+                pnl_net_cash_final = pos.pnl_price_cash + pos.pnl_carry_cash + pos.pnl_roll_cash - tcost_cash
+                pnl_net_bp_final = pos.pnl_price_bp + pos.pnl_carry_bp + pos.pnl_roll_bp - tcost_bp
 
                 cl_row = {
                     "open_ts": pos.open_ts, "close_ts": pos.close_ts, 
@@ -457,19 +456,17 @@ def run_month(
                     "scale_dv01": pos.scale_dv01,
                     "tenor_i": pos.t_belly, "tenor_left": pos.t_left, "tenor_right": pos.t_right,
                     "side": pos.side_desc,
-                    # Granular PnL (Cash)
                     "pnl_price_cash": pos.pnl_price_cash,
                     "pnl_carry_cash": pos.pnl_carry_cash,
                     "pnl_roll_cash":  pos.pnl_roll_cash,
-                    # Granular PnL (Bps)
                     "pnl_price_bp": pos.pnl_price_bp,
                     "pnl_carry_bp": pos.pnl_carry_bp,
                     "pnl_roll_bp":  pos.pnl_roll_bp,
-                    # Tie-Out Data
                     "dir_belly": pos.dir_belly, "dir_left": pos.dir_left, "dir_right": pos.dir_right,
                     "rate_belly_entry": pos.r_entry_belly, "rate_belly_exit": pos.r_curr_belly,
                     "rate_left_entry":  pos.r_entry_left,  "rate_left_exit":  pos.r_curr_left,
                     "rate_right_entry": pos.r_entry_right, "rate_right_exit": pos.r_curr_right,
+                    "entry_z": pos.entry_z, "exit_z": curr_z
                 }
                 closed_rows.append(cl_row)
             else:
