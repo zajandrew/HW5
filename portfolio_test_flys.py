@@ -546,10 +546,32 @@ def run_month(
             
             if not valid_wings: continue
             
-            # --- FINAL ENTRY GATE (Fix for user's concern) ---
+                        # --- FINAL ENTRY GATE ---
+            # 1. Score Threshold: Does the best candidate beat the entry bar?
             if cand_score < z_entry_curr: continue
 
+            # --- MOMENTUM FILTER (Falling Knife Protection) ---
+            # Retrieve Configs (Defaults: 5 days, 0.25 threshold)
+            MOM_DAYS = int(getattr(cr, "Z_MOMENTUM_DAYS", 5))
+            MOM_THRESH = float(getattr(cr, "Z_MOMENTUM_THRESHOLD", 0.25))
+            
             z_hist = z_history.get(t_belly, [])
+            
+            # We need enough history to check momentum
+            if len(z_hist) >= MOM_DAYS:
+                # Calculate momentum: Current Z - Z from N days ago
+                z_mom = z_curr - z_hist[-MOM_DAYS] 
+                
+                # Logic: If we want Rec (+1), we want Z to FALL.
+                # If Z is RISING (Momentum > +0.25), we are fighting the trend. Wait.
+                if needed_dir == 1.0 and z_mom > MOM_THRESH: continue 
+                
+                # Logic: If we want Pay (-1), we want Z to RISE.
+                # If Z is FALLING (Momentum < -0.25), we are fighting the trend. Wait.
+                if needed_dir == -1.0 and z_mom < -MOM_THRESH: continue
+
+            # --- LONG TERM CONTEXT ---
+            # Maintain z_slow (20-day) for future "Fair Value" exit logic if needed
             z_slow = np.mean(z_hist) if len(z_hist) > 5 else z_curr
             
             pos = FlyPos(dts, belly, cand_left, cand_right, decisions_per_day,
