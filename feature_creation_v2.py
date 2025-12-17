@@ -261,6 +261,7 @@ def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Seri
 def load_history_daily(target_yymm: str) -> pd.DataFrame:
     """
     Loads strictly DAILY CLOSES from history.
+    Ensures 'ts' is a column, not an index.
     """
     path_data = Path(getattr(cr, "PATH_DATA", "."))
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
@@ -282,38 +283,60 @@ def load_history_daily(target_yymm: str) -> pd.DataFrame:
         cache_path = path_enh / cache_name
         
         if cache_path.exists():
-            history_dfs.append(pd.read_parquet(cache_path))
+            df = pd.read_parquet(cache_path)
+            history_dfs.append(df)
         else:
-            # If Summary doesn't exist, build it from raw (Tail/Close)
+            # If Summary doesn't exist, build it from raw
             raw_path = path_data / f"{curr_str}_features.parquet"
             if raw_path.exists():
                 try:
                     df = pd.read_parquet(raw_path)
+                    
+                    # --- SAFETY: Handle User's Custom Index Logic ---
                     df = _to_ts_index(df)
+                    # If _to_ts_index put ts in the index, move it back to column
+                    if "ts" not in df.columns and (df.index.name == "ts" or "ts" in df.index.names):
+                        df = df.reset_index()
+                    
                     df = _apply_calendar_and_hours(df) 
                     df = _zeros_to_nan(df)
                     df_long = _melt_long(df, tenormap)
                     
                     # Create Daily Close Summary
                     df_daily = _make_decision_buckets(df_long, 'D', mode='tail')
+                    
+                    # Save and Append
                     df_daily.to_parquet(cache_path, index=False)
                     history_dfs.append(df_daily)
                 except Exception as e:
                     print(f"[WARN] Failed generating history {curr_str}: {e}")
 
     if not history_dfs: return pd.DataFrame()
-    return pd.concat(history_dfs).sort_values("ts").reset_index(drop=True)
-
+    
+    # Concatenate and final safety check
+    df_final = pd.concat(history_dfs).sort_values("ts").reset_index(drop=True)
+    if "ts" not in df_final.columns and df_final.index.name == "ts":
+        df_final = df_final.reset_index()
+        
+    return df_final
+    
 # -----------------------
 # Main Processor
 # -----------------------
 def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
+    # --- FIX: Ensure History has 'ts' column ---
+    # This prevents the KeyError inside the worker
+    if "ts" not in df_history_daily.columns and df_history_daily.index.name == "ts":
+        df_history_daily = df_history_daily.reset_index()
+    # -------------------------------------------
+
     # 1. Setup Container
     out = df_bucket.copy()
     
     # 2. Get History (Strictly < Bucket Date)
     t_date = pd.to_datetime(dts).normalize()
-    # Ensure we have enough history
+    
+    # Now this line is safe because we guaranteed 'ts' is a column above
     hist_window = df_history_daily[df_history_daily["ts"] < t_date]
     
     pca_z = np.nan
@@ -321,11 +344,10 @@ def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
     
     # 3. Fit & Apply PCA
     if pca_config['enable']:
-        # Fit on Daily
         cols = sorted(out["tenor_yrs"].unique().tolist())
+        # Pass hist_window (which definitely has 'ts' column now)
         model = _pca_fit_panel_robust(hist_window, cols, pca_config['n_comps'])
         
-        # Apply to Hourly
         if model:
             pca_z, pca_scale = _pca_apply_hybrid(out, model)
             out["z_pca"] = pca_z
@@ -335,7 +357,6 @@ def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
     out["z_spline"] = z_spline
     
     # 5. Combine Logic
-    # Use PCA Scale if available (it connects to history), else Spline Scale
     raw_scale = 0.01
     if np.isfinite(pca_scale) and pca_scale > 1e-6:
         raw_scale = pca_scale
