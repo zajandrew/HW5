@@ -382,9 +382,8 @@ def build_month(yymm: str) -> None:
     df_history_daily = load_history_daily(yymm)
 
     # 4. Processing Context
-    buckets = df_hourly["ts"].unique()
-    buckets.sort()
-    
+    buckets = np.sort(df_hourly["ts"].unique())
+
     pca_cfg = {
         'enable': bool(getattr(cr, "PCA_ENABLE", True)),
         'n_comps': int(getattr(cr, "PCA_COMPONENTS", 3))
