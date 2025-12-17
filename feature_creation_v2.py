@@ -311,14 +311,22 @@ def load_history_daily(target_yymm: str) -> pd.DataFrame:
                 except Exception as e:
                     print(f"[WARN] Failed generating history {curr_str}: {e}")
 
-    if not history_dfs: return pd.DataFrame()
+        # Define the expected schema
+    expected_cols = ["ts", "tenor_yrs", "rate"]
     
-    # Concatenate and final safety check
+    if not history_dfs:
+        # Return empty DF but WITH columns so filters don't crash
+        print(f"[{_now()}] [WARN] No history found. PCA will be skipped for this month.")
+        return pd.DataFrame(columns=expected_cols)
+    
     df_final = pd.concat(history_dfs).sort_values("ts").reset_index(drop=True)
+    
+    # Safety: Ensure columns exist
     if "ts" not in df_final.columns and df_final.index.name == "ts":
         df_final = df_final.reset_index()
         
     return df_final
+
     
 # -----------------------
 # Main Processor
