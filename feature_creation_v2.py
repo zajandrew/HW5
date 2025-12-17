@@ -387,10 +387,25 @@ def build_month(yymm: str) -> None:
 
     print(f"[{_now()}] [TARGET] Loading {yymm}...")
     df_wide = pd.read_parquet(in_path)
+    
+    # --- SAFETY: V3 Time Logic ---
     df_wide = _to_ts_index(df_wide)
+    # Ensure ts is a column before applying calendar
+    if "ts" not in df_wide.columns and df_wide.index.name == "ts":
+        df_wide = df_wide.reset_index()
+
     df_wide = _apply_calendar_and_hours(df_wide)
     df_wide = _zeros_to_nan(df_wide)
+    
+    # Check if empty after filters
+    if df_wide.empty:
+        print(f"[{_now()}] [WARN] {yymm}: No data remaining after Calendar/Hours filter.")
+        return
+
     df_long = _melt_long(df_wide, getattr(cr, "TENOR_YEARS", {}))
+    if df_long.empty:
+        print(f"[{_now()}] [WARN] {yymm}: Data empty after melt (check TENOR_YEARS config).")
+        return
     
     # 2. Generate Files 1 & 2 (Hourly Rates & Daily Summary)
     
@@ -401,18 +416,28 @@ def build_month(yymm: str) -> None:
     df_hourly.to_parquet(path_hourly, index=False)
     
     # File 2: Daily Summary (The History for Next Month)
-    # Uses 'tail' to capture the Close
     print(f"[{_now()}] [PREP] Generating Daily Summary (Close)...")
     df_daily = _make_decision_buckets(df_long, 'D', mode='tail')
     path_daily = path_enh / f"{yymm}_summary_D.parquet"
     df_daily.to_parquet(path_daily, index=False)
 
-    # 3. Load History
-    df_history_daily = load_history_daily(yymm)
+    # 3. Load History & COMBINE (The Fix for Warm Start)
+    # Load previous months
+    df_past_history = load_history_daily(yymm)
+    
+    # COMBINE: Past Months + Current Month (So Far)
+    # This ensures that on Day 15, we have Days 1-14 available for PCA
+    if not df_past_history.empty:
+        df_full_context = pd.concat([df_past_history, df_daily], ignore_index=True)
+    else:
+        df_full_context = df_daily.copy() # Cold start: Context is just this month
+
+    # Ensure context is sorted and has no duplicates (just in case)
+    df_full_context = df_full_context.drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values('ts')
 
     # 4. Processing Context
     buckets = np.sort(df_hourly["ts"].unique())
-
+    
     pca_cfg = {
         'enable': bool(getattr(cr, "PCA_ENABLE", True)),
         'n_comps': int(getattr(cr, "PCA_COMPONENTS", 3))
@@ -425,9 +450,9 @@ def build_month(yymm: str) -> None:
     print(f"[{_now()}] [PROCESS] Hybrid PCA on {len(buckets)} buckets...")
 
     def _one(dts):
-        # Slice the specific hourly bucket from the pre-bucketed dataframe
         snap = df_hourly[df_hourly["ts"] == dts]
-        return _process_hybrid_bucket(dts, snap, df_history_daily, pca_cfg)
+        # Pass the FULL context (Past + Current Month)
+        return _process_hybrid_bucket(dts, snap, df_full_context, pca_cfg)
 
     parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one)(d) for d in buckets)
     
@@ -439,10 +464,14 @@ def build_month(yymm: str) -> None:
     # File 3: Enhanced Output
     out_name = f"{yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
     out_path = path_enh / out_name
-    out.to_parquet(out_path, index=False)
     
-    valid_pct = np.isfinite(pd.to_numeric(out['z_comb'], errors='coerce')).mean() * 100
-    print(f"[DONE] {yymm} -> {out_path} (Valid Z: {valid_pct:.1f}%)")
+    if not out.empty and 'z_comb' in out.columns:
+        out.to_parquet(out_path, index=False)
+        zr = pd.to_numeric(out['z_comb'], errors='coerce')
+        valid_pct = float(np.isfinite(zr).mean() * 100)
+        print(f"[DONE] {yymm} -> {out_path} (Valid Z: {valid_pct:.1f}%)")
+    else:
+        print(f"[WARN] {yymm} produced EMPTY output.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
