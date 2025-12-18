@@ -3,7 +3,7 @@ import datetime
 import math
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -115,7 +115,6 @@ def _make_decision_buckets(df_long: pd.DataFrame, freq: str, mode: str = 'head')
     df = df.sort_values(['decision_ts', 'tenor_yrs', 'ts'])
     
     # 3. Group by Bucket + Tenor
-    # This ensures that if 2y trades at :05 and 10y at :20, both land in the bucket
     g = df.groupby(['decision_ts', 'tenor_yrs'], as_index=False)
     
     if mode == 'tail':
@@ -127,8 +126,51 @@ def _make_decision_buckets(df_long: pd.DataFrame, freq: str, mode: str = 'head')
     return df_bucketed.drop(columns=['ts']).rename(columns={'decision_ts': 'ts'})
 
 # -----------------------
-# Math: Spline & PCA
+# Math: Hurst, Spline & PCA
 # -----------------------
+
+def _calc_hurst_rs(series: np.ndarray, min_chunk: int = 8) -> float:
+    """
+    Calculates Hurst Exponent using Rescaled Range (R/S) analysis.
+    H < 0.5: Mean Reverting (Butterfly)
+    H > 0.5: Trending (Momentum)
+    """
+    series = np.array(series)
+    N = len(series)
+    if N < 100: return 0.5 # Not enough history for structural signal
+    
+    max_chunk = N // 2
+    if max_chunk < min_chunk: return 0.5
+    
+    # Log-spaced chunks
+    chunks = np.unique(np.linspace(min_chunk, max_chunk, num=10).astype(int))
+    rs_values = []
+    
+    for n in chunks:
+        num_splits = N // n
+        # Crop to perfectly divisible
+        tmp = series[:num_splits * n].reshape(num_splits, n)
+        
+        # R/S Calculation
+        means = np.mean(tmp, axis=1, keepdims=True)
+        y = tmp - means
+        z = np.cumsum(y, axis=1)
+        r = np.max(z, axis=1) - np.min(z, axis=1)
+        s = np.std(tmp, axis=1, ddof=1)
+        s[s == 0] = 1e-9 # Protect div/0
+        
+        rs = np.mean(r / s)
+        rs_values.append(rs)
+        
+    # Regression: log(R/S) ~ H * log(n)
+    try:
+        y_reg = np.log(rs_values)
+        x_reg = np.log(chunks)
+        H, _ = np.polyfit(x_reg, y_reg, 1)
+        return float(H)
+    except:
+        return 0.5
+
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
@@ -140,7 +182,7 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     y = s_fit["rate"].values.astype(float)
     
     try:
-        # s=1e-2 is approx 3bps smoothing noise for Percent units (4.25)
+        # s=1e-2 preserves local microstructure ("wiggles") for RV trading
         spl = UnivariateSpline(x, y, k=3, s=1e-2)
         fit = spl(x)
         resid = y - fit
@@ -151,6 +193,7 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
         if scale < 1e-4: scale = 0.01
         
+        # Z-score
         z = (resid - resid.mean()) / scale
         m = {ten: val for ten, val in zip(x, z)}
         out.loc[s_fit.index] = s_fit["tenor_yrs"].map(m).values
@@ -158,111 +201,118 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     except:
         return out, DEFAULT_SCALE
 
-def _pca_fit_panel_robust(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps: int):
+def _pca_fit_panel_robust(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps: int) -> Optional[Dict[str, Any]]:
     """
-    Fits PCA on Daily History with SIGN FLIP CORRECTION.
+    Fits PCA on DIFFERENCED data (Yield Changes), consistent with RV literature.
+    Returns model + Historical Residuals for Hurst calculation.
     """
     if panel_long.empty: return None
     
-    # Pivot to Matrix (Days x Tenors)
+    # 1. Pivot to Matrix (Days x Tenors)
     W = (panel_long.pivot(index="ts", columns="tenor_yrs", values="rate").sort_index())
     W = W.reindex(columns=cols_ordered).ffill().dropna(how="any")
-    if W.shape[0] < (n_comps + 5) or W.shape[1] < n_comps: return None
-
-    X = W.values.astype(float)
-    mu = X.mean(axis=0, keepdims=True)
-    Xc = X - mu
     
-    # SVD
-    U, S, VT = np.linalg.svd(Xc, full_matrices=False)
-    comps = VT[:n_comps, :] # Shape (n_comps, n_tenors)
+    X_levels = W.values.astype(float)
+    if X_levels.shape[0] < (n_comps + 10): return None
+
+    # 2. Compute Changes (Diffs) -> Stationarity
+    # We lose the first row
+    X_diffs = np.diff(X_levels, axis=0)
+    
+    # 3. Robust Scaling (Median/IQR) -> Correlation-like Matrix
+    mu = np.median(X_diffs, axis=0)
+    q75, q25 = np.percentile(X_diffs, [75, 25], axis=0)
+    sigma = 0.7413 * (q75 - q25)
+    sigma[sigma < 1e-6] = 1.0 # Protect div/0
+    
+    # Z-scored changes
+    Z = (X_diffs - mu) / sigma
+    
+    # 4. SVD
+    U, S, VT = np.linalg.svd(Z, full_matrices=False)
+    comps = VT[:n_comps, :] # (n_comps, n_tenors)
     
     # --- SIGN FLIP FIX ---
     for i in range(n_comps):
-        # PC1 (Level): Ensure sum is Positive
-        if i == 0:
-            if np.sum(comps[i]) < 0:
-                comps[i] = -comps[i]
-        
-        # PC2 (Slope): Ensure Long End (Last) > Short End (First)
-        # Assumes cols_ordered is sorted (2y -> 30y)
-        elif i == 1:
-            if comps[i][-1] < comps[i][0]: 
-                comps[i] = -comps[i]
-        
-        # PC3 (Curve/Fly): Ensure Belly (Middle) is Positive (Rich Belly = High Rate)
-        elif i == 2:
+        if i == 0: # PC1 Level: Sum Positive
+            if np.sum(comps[i]) < 0: comps[i] = -comps[i]
+        elif i == 1: # PC2 Slope: Long > Short
+            if comps[i][-1] < comps[i][0]: comps[i] = -comps[i]
+        elif i == 2: # PC3 Curve: Belly Positive
             mid_idx = len(comps[i]) // 2
-            if comps[i][mid_idx] < 0:
-                comps[i] = -comps[i]
+            if comps[i][mid_idx] < 0: comps[i] = -comps[i]
 
     evr = (S**2) / (S**2).sum()
     
-    # Calculate Residual Scale (from History) for Z-scoring
-    # We want to know the typical residual noise of the history to scale the live z-score
-    # Reconstruct History
-    weights = (Xc @ comps.T) # (Dates x Comps)
-    recon = weights @ comps # (Dates x Tenors)
-    resid_hist = Xc - recon
-    
-    # Global Residual Scale (Aggregated across tensor or per tenor? Usually per tenor or global)
-    # Let's use a single global robust scale for simplicity, or we can return the matrix.
-    # For now, we compute it during application to keep this function pure.
+    # 5. Calculate Historical Residuals (for Hurst)
+    # Project Z onto Comps
+    factors = comps @ Z.T # (comps x days)
+    recon_z = (comps.T @ factors).T # (days x tenors)
+    resid_z = Z - recon_z # These are the historical Z-score errors
     
     return {
         "cols": list(W.columns), 
-        "mean": mu.ravel(), 
+        "mean_diff": mu,
+        "sigma_diff": sigma,
         "components": comps, 
-        "evr": evr[:n_comps]
+        "evr": evr[:n_comps],
+        "last_level": X_levels[-1, :], # Needed to calc live shock
+        "hist_resid_z": resid_z # Needed for Hurst
     }
 
 def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Series, float]:
     """
-    Applies DAILY model to HOURLY data.
+    Applies PCA by calculating the LIVE SHOCK (Current - Prev Close).
     """
     out = pd.Series(index=df_hourly.index, dtype=float)
     scale = np.nan
     
     if not pca_model or df_hourly.empty: return out, scale
 
-    cols, mu, comps = pca_model["cols"], np.asarray(pca_model["mean"]), np.asarray(pca_model["components"])
+    cols = pca_model["cols"]
+    mu_diff = pca_model["mean_diff"]
+    sigma_diff = pca_model["sigma_diff"]
+    comps = pca_model["components"]
+    last_level = pca_model["last_level"] # Vector of yesterday's close rates
     
     # Align Data
     snap = df_hourly.set_index("tenor_yrs")["rate"].reindex(cols)
     if snap.isnull().any(): return out, scale # Can't project if tenors missing
 
-    x = snap.values.astype(float)
+    current_level = snap.values.astype(float)
     
-    # Project: (Rate - DailyMean) dot Components
-    # weights represents the "Level", "Slope" value of this specific hour
-    weights = comps @ (x - mu) 
+    # 1. Calculate Live Shock (The "Move" of the day)
+    live_diff = current_level - last_level
     
-    # Reconstruct
-    recon = (comps.T @ weights) + mu
+    # 2. Standardize using Historical Vol
+    live_z_input = (live_diff - mu_diff) / sigma_diff
     
-    # Residual (The Alpha)
-    resid = x - recon
+    # 3. Project & Reconstruct
+    factors = comps @ live_z_input
+    recon_z_move = comps.T @ factors
     
-    # Calculate Scale (Robust MAD of this specific snapshot's residuals across tenors)
-    # This tells us "How disjointed is the curve right now?"
-    med = np.median(resid)
-    mad = np.median(np.abs(resid - med))
-    scale = (1.4826 * mad) if mad > 0 else resid.std(ddof=1)
+    # 4. Residual (Alpha)
+    resid_z = live_z_input - recon_z_move
     
-    # Normalize
+    # 5. Scale Logic (Robust MAD of the residual vector)
+    # We convert back to bps space for intuitive scaling, or keep in Z space.
+    # Let's keep Z space consistency with Spline.
+    # How noisy is this specific curve snapshot?
+    med = np.median(resid_z)
+    mad = np.median(np.abs(resid_z - med))
+    scale = (1.4826 * mad) if mad > 0 else np.std(resid_z, ddof=1)
+    
     if scale < 1e-4: scale = 0.01
-    z_scores = (resid - resid.mean()) / scale
     
-    return df_hourly["tenor_yrs"].map(dict(zip(cols, z_scores))), scale
+    # Final Z-Score (Residual normalized by cross-sectional noise)
+    final_z = (resid_z - resid_z.mean()) / scale
+    
+    return df_hourly["tenor_yrs"].map(dict(zip(cols, final_z))), scale
 
 # -----------------------
 # History Loading (Daily Close)
 # -----------------------
 def load_history_daily(target_yymm: str) -> pd.DataFrame:
-    """
-    Loads strictly DAILY CLOSES from history.
-    Ensures 'ts' is a column, not an index.
-    """
     path_data = Path(getattr(cr, "PATH_DATA", "."))
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
     target_dt = datetime.datetime.strptime(target_yymm, "%y%m")
@@ -278,7 +328,6 @@ def load_history_daily(target_yymm: str) -> pd.DataFrame:
         curr_dt = target_dt - relativedelta(months=i)
         curr_str = curr_dt.strftime("%y%m")
         
-        # We look for the SUMMARY_D file (Daily Closes)
         cache_name = f"{curr_str}_summary_D.parquet"
         cache_path = path_enh / cache_name
         
@@ -286,42 +335,31 @@ def load_history_daily(target_yymm: str) -> pd.DataFrame:
             df = pd.read_parquet(cache_path)
             history_dfs.append(df)
         else:
-            # If Summary doesn't exist, build it from raw
             raw_path = path_data / f"{curr_str}_features.parquet"
             if raw_path.exists():
                 try:
                     df = pd.read_parquet(raw_path)
-                    
-                    # --- SAFETY: Handle User's Custom Index Logic ---
                     df = _to_ts_index(df)
-                    # If _to_ts_index put ts in the index, move it back to column
                     if "ts" not in df.columns and (df.index.name == "ts" or "ts" in df.index.names):
                         df = df.reset_index()
                     
                     df = _apply_calendar_and_hours(df) 
                     df = _zeros_to_nan(df)
                     df_long = _melt_long(df, tenormap)
-                    
-                    # Create Daily Close Summary
                     df_daily = _make_decision_buckets(df_long, 'D', mode='tail')
                     
-                    # Save and Append
                     df_daily.to_parquet(cache_path, index=False)
                     history_dfs.append(df_daily)
                 except Exception as e:
                     print(f"[WARN] Failed generating history {curr_str}: {e}")
 
-        # Define the expected schema
     expected_cols = ["ts", "tenor_yrs", "rate"]
     
     if not history_dfs:
-        # Return empty DF but WITH columns so filters don't crash
-        print(f"[{_now()}] [WARN] No history found. PCA will be skipped for this month.")
+        print(f"[{_now()}] [WARN] No history found. PCA will be skipped.")
         return pd.DataFrame(columns=expected_cols)
     
     df_final = pd.concat(history_dfs).sort_values("ts").reset_index(drop=True)
-    
-    # Safety: Ensure columns exist
     if "ts" not in df_final.columns and df_final.index.name == "ts":
         df_final = df_final.reset_index()
         
@@ -332,37 +370,51 @@ def load_history_daily(target_yymm: str) -> pd.DataFrame:
 # Main Processor
 # -----------------------
 def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
-    # --- FIX: Ensure History has 'ts' column ---
-    # This prevents the KeyError inside the worker
+    # Ensure History has 'ts' column
     if "ts" not in df_history_daily.columns and df_history_daily.index.name == "ts":
         df_history_daily = df_history_daily.reset_index()
-    # -------------------------------------------
 
-    # 1. Setup Container
     out = df_bucket.copy()
     
-    # 2. Get History (Strictly < Bucket Date)
+    # 1. Get History (Strictly < Bucket Date)
     t_date = pd.to_datetime(dts).normalize()
-    
-    # Now this line is safe because we guaranteed 'ts' is a column above
     hist_window = df_history_daily[df_history_daily["ts"] < t_date]
     
     pca_z = np.nan
     pca_scale = np.nan
+    hurst_map = {}
     
-    # 3. Fit & Apply PCA
+    # 2. Fit PCA & Calc Hurst
     if pca_config['enable']:
         cols = sorted(out["tenor_yrs"].unique().tolist())
-        # Pass hist_window (which definitely has 'ts' column now)
+        # This now returns the model AND the historical residuals
         model = _pca_fit_panel_robust(hist_window, cols, pca_config['n_comps'])
         
         if model:
+            # A. Live PCA Signal
             pca_z, pca_scale = _pca_apply_hybrid(out, model)
             out["z_pca"] = pca_z
+            
+            # B. Hurst Regime Calculation
+            # We have historical residuals in model["hist_resid_z"]
+            # Shape: (Days, Tenors)
+            resid_hist = model["hist_resid_z"]
+            
+            for i, tenor in enumerate(model["cols"]):
+                if i < resid_hist.shape[1]:
+                    # Calculate H on the residuals of this specific tenor
+                    h_val = _calc_hurst_rs(resid_hist[:, i])
+                    hurst_map[tenor] = h_val
 
-    # 4. Spline (Intraday)
+    # 3. Spline (Intraday)
     z_spline, spline_scale = _spline_fit_safe(out)
     out["z_spline"] = z_spline
+    
+    # 4. Map Hurst
+    if hurst_map:
+        out["hurst"] = out["tenor_yrs"].map(hurst_map)
+    else:
+        out["hurst"] = 0.5
     
     # 5. Combine Logic
     raw_scale = 0.01
@@ -388,54 +440,39 @@ def build_month(yymm: str) -> None:
     print(f"[{_now()}] [TARGET] Loading {yymm}...")
     df_wide = pd.read_parquet(in_path)
     
-    # --- SAFETY: V3 Time Logic ---
     df_wide = _to_ts_index(df_wide)
-    # Ensure ts is a column before applying calendar
     if "ts" not in df_wide.columns and df_wide.index.name == "ts":
         df_wide = df_wide.reset_index()
 
     df_wide = _apply_calendar_and_hours(df_wide)
     df_wide = _zeros_to_nan(df_wide)
     
-    # Check if empty after filters
     if df_wide.empty:
-        print(f"[{_now()}] [WARN] {yymm}: No data remaining after Calendar/Hours filter.")
+        print(f"[{_now()}] [WARN] {yymm}: No data after filters.")
         return
 
     df_long = _melt_long(df_wide, getattr(cr, "TENOR_YEARS", {}))
     if df_long.empty:
-        print(f"[{_now()}] [WARN] {yymm}: Data empty after melt (check TENOR_YEARS config).")
+        print(f"[{_now()}] [WARN] {yymm}: Data empty after melt.")
         return
     
-    # 2. Generate Files 1 & 2 (Hourly Rates & Daily Summary)
-    
-    # File 1: Hourly Rates (The Target)
+    # 2. Generate Files
     print(f"[{_now()}] [PREP] Bucketing Hourly Rates...")
     df_hourly = _make_decision_buckets(df_long, 'H', mode='head')
-    path_hourly = path_enh / f"{yymm}_rates_H.parquet"
-    df_hourly.to_parquet(path_hourly, index=False)
+    df_hourly.to_parquet(path_enh / f"{yymm}_rates_H.parquet", index=False)
     
-    # File 2: Daily Summary (The History for Next Month)
-    print(f"[{_now()}] [PREP] Generating Daily Summary (Close)...")
+    print(f"[{_now()}] [PREP] Generating Daily Summary...")
     df_daily = _make_decision_buckets(df_long, 'D', mode='tail')
-    path_daily = path_enh / f"{yymm}_summary_D.parquet"
-    df_daily.to_parquet(path_daily, index=False)
+    df_daily.to_parquet(path_enh / f"{yymm}_summary_D.parquet", index=False)
 
-    # 3. Load History & COMBINE (The Fix for Warm Start)
-    # Load previous months
+    # 3. Load Context
     df_past_history = load_history_daily(yymm)
-    
-    # COMBINE: Past Months + Current Month (So Far)
-    # This ensures that on Day 15, we have Days 1-14 available for PCA
     if not df_past_history.empty:
         df_full_context = pd.concat([df_past_history, df_daily], ignore_index=True)
     else:
-        df_full_context = df_daily.copy() # Cold start: Context is just this month
+        df_full_context = df_daily.copy()
 
-    # Ensure context is sorted and has no duplicates (just in case)
     df_full_context = df_full_context.drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values('ts')
-
-    # 4. Processing Context
     buckets = np.sort(df_hourly["ts"].unique())
     
     pca_cfg = {
@@ -443,15 +480,14 @@ def build_month(yymm: str) -> None:
         'n_comps': int(getattr(cr, "PCA_COMPONENTS", 3))
     }
     
-    # 5. Parallel Execution
+    # 4. Parallel Execution
     N_JOBS = int(getattr(cr, "N_JOBS", 1))
     jobs = max(1, min((os.cpu_count() // 2), 8)) if N_JOBS == 0 else N_JOBS
 
-    print(f"[{_now()}] [PROCESS] Hybrid PCA on {len(buckets)} buckets...")
+    print(f"[{_now()}] [PROCESS] Hybrid PCA + Hurst on {len(buckets)} buckets...")
 
     def _one(dts):
         snap = df_hourly[df_hourly["ts"] == dts]
-        # Pass the FULL context (Past + Current Month)
         return _process_hybrid_bucket(dts, snap, df_full_context, pca_cfg)
 
     parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one)(d) for d in buckets)
@@ -461,7 +497,6 @@ def build_month(yymm: str) -> None:
     else:
         out = pd.DataFrame()
 
-    # File 3: Enhanced Output
     out_name = f"{yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
     out_path = path_enh / out_name
     
