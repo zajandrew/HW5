@@ -242,3 +242,53 @@ def clean_hedge_tape(
     extra = [c for c in out.columns if c not in cols]
     
     return out[cols + extra]
+
+# ==============================================================================
+# 4. LIVE CURVE PARSER
+# ==============================================================================
+
+def build_live_curve(
+    row: pd.Series, 
+    ticker_map: Dict[str, float]
+) -> Optional[SplineCurve]:
+    """
+    Scrapes wide-format columns from a hedge tape row to build a SplineCurve.
+    Args:
+        row: A pandas Series (single row from hedge tape).
+        ticker_map: Dictionary mapping column names (e.g., 'USOSFR2') to float years (2.0).
+    Returns:
+        SplineCurve object or None if insufficient data.
+    """
+    tenors = []
+    rates = []
+    
+    # 1. Iterate through known tickers in config
+    for ticker, yr in ticker_map.items():
+        # Check if ticker exists in row index (handling standard variants)
+        # We check exact match, or '_mid' suffix often found in data
+        val = None
+        if ticker in row.index:
+            val = row[ticker]
+        elif f"{ticker}_mid" in row.index:
+            val = row[f"{ticker}_mid"]
+        elif f"{ticker} rate" in row.index:
+            val = row[f"{ticker} rate"]
+            
+        # 2. Validate
+        if val is not None:
+            try:
+                f_val = float(val)
+                if np.isfinite(f_val) and f_val > -5.0 and f_val < 20.0: # Sanity check
+                    tenors.append(yr)
+                    rates.append(f_val)
+            except (ValueError, TypeError):
+                continue
+                
+    # 3. Build Curve if we have enough points (Need 3+ for Cubic)
+    if len(tenors) < 3:
+        return None
+        
+    try:
+        return SplineCurve(np.array(tenors), np.array(rates))
+    except Exception:
+        return None
