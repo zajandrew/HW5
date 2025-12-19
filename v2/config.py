@@ -112,7 +112,8 @@ PARAMS = {
     
     # Execution
     "MIN_TENOR": 0.5,
-    "MAX_CONCURRENT": 50,
+    "MAX_CONCURRENT": 1e10,
+    "PIVOT_POINT": 5.0,
     
     # Fly Specifics
     "FLY_WEIGHT_METHOD": "convexity", # 'convexity' or 'duration'
