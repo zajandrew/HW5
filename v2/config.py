@@ -64,7 +64,7 @@ PCA_LOOKBACK_DAYS = 126
 
 # Hurst: 6 Months (~126 trading days)
 # We want the regime signal to be aligned with our PCA model
-HURST_WINDOW      = 126    
+HURST_WINDOW      = 126    ## Not implemented, assumed to be the same as PCA window
 
 # Volatility: 1 Month (~21 days)
 VOL_LOOKBACK      = 21
