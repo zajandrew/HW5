@@ -168,80 +168,39 @@ def calc_signal_drift(
 # ==============================================================================
 # 3. TAPE INGESTION
 # ==============================================================================
+def _map_instrument_to_tenor(instr: str) -> Optional[float]:
+    if instr is None or not isinstance(instr, str): return None
+    instr = instr.strip()
+    mapped = cr.BBG_DICT.get(instr, instr)
+    tenor = cr.TENOR_YEARS.get(mapped)
+    return float(tenor) if tenor is not None else None
 
-def clean_hedge_tape(
-    df: pd.DataFrame, 
-    decision_freq: str = "H",
-    ticker_map: Optional[Dict[str, float]] = None
-) -> pd.DataFrame:
-    """
-    Standardizes the hedge tape columns and types.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
+def clean_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty: return pd.DataFrame()
+    df = raw_df.copy()
+    # Ensure UTC conversion is robust
+    df["trade_ts"] = pd.to_datetime(df["tradetimeUTC"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
     
-    out = df.copy()
-    
-    # 1. Time Normalization
-    # Support 'tradetimeUTC' (common) or 'ts'
-    if "tradetimeUTC" in out.columns:
-        out["trade_ts"] = pd.to_datetime(out["tradetimeUTC"], utc=True).dt.tz_localize(None)
-    elif "ts" in out.columns:
-        out["trade_ts"] = pd.to_datetime(out["ts"], utc=True).dt.tz_localize(None)
-    else:
-        # Fallback if no time provided (rare)
-        out["trade_ts"] = pd.Timestamp.utcnow().tz_localize(None)
-        
-    # 2. Decision Bucket
-    freq = decision_freq.upper()
-    if freq == "H":
-        out["decision_ts"] = out["trade_ts"].dt.floor("h")
-    else:
-        out["decision_ts"] = out["trade_ts"].dt.floor("d")
-        
-    # 3. Instrument / Tenor Mapping
-    if "instrument" in out.columns and ticker_map:
-        # Helper to map "USOSFR10" -> 10.0
-        def _map(x):
-            s = str(x).strip()
-            return float(ticker_map.get(s, ticker_map.get(s.split()[0], np.nan)))
-        
-        out["tenor_yrs"] = out["instrument"].apply(_map)
-    elif "tenor_yrs" not in out.columns:
-        # If no mapping provided, assume tenor_yrs must exist or fail
-        return pd.DataFrame() # Fail safe
-        
-    out = out.dropna(subset=["tenor_yrs"])
-    
-    # 4. Side Normalization
-    # Expect: "CPAY" (Payer), "CRCV" (Receiver), or "Pay"/"Rec"
-    if "side" in out.columns:
-        out["side"] = out["side"].astype(str).str.upper()
-        # Filter for valid swaps only
-        valid_sides = ["CPAY", "CRCV", "PAY", "REC", "PAYER", "RECEIVER"]
-        out = out[out["side"].isin(valid_sides)]
-    
-    # 5. DV01 / Risk
-    # Map 'EqVolDelta' or 'dv01' to 'dv01'
-    if "EqVolDelta" in out.columns:
-        out["dv01"] = pd.to_numeric(out["EqVolDelta"], errors="coerce").abs()
-    elif "dv01" in out.columns:
-        out["dv01"] = pd.to_numeric(out["dv01"], errors="coerce").abs()
-    
-    out = out.dropna(subset=["dv01"])
-    out = out[out["dv01"] > 1.0] # Filter noise
-    
-    # 6. ID
-    if "trade_id" not in out.columns:
-        out = out.reset_index(drop=True)
-        out["trade_id"] = out.index.astype(int)
+    decision_freq = str(decision_freq).upper()
+    if decision_freq == "D": df["decision_ts"] = df["trade_ts"].dt.floor("d")
+    elif decision_freq == "H": df["decision_ts"] = df["trade_ts"].dt.floor("h")
+    else: raise ValueError("DECISION_FREQ must be 'D' or 'H'.")
 
-    # 7. Return Clean Subset
-    cols = ["decision_ts", "trade_ts", "trade_id", "tenor_yrs", "side", "dv01"]
-    # Preserve other metadata if exists
-    extra = [c for c in out.columns if c not in cols]
+    df["side"] = df["side"].astype(str).str.upper()
+    df = df[df["side"].isin(["CPAY", "CRCV"])]
+    df["tenor_yrs"] = df["instrument"].map(_map_instrument_to_tenor)
+    df = df[np.isfinite(df["tenor_yrs"])]
+    df["dv01"] = pd.to_numeric(df["EqVolDelta"], errors="coerce")
+    df = df[np.isfinite(df["dv01"]) & (df["dv01"] > 0)]
+    df = df.dropna(subset=["trade_ts", "decision_ts", "tenor_yrs", "dv01"])
     
-    return out[cols + extra]
+    if "trade_id" not in df.columns:
+        df = df.reset_index(drop=True)
+        df["trade_id"] = df.index.astype(int)
+        
+    cols = ["trade_id", "trade_ts", "decision_ts", "tenor_yrs", "side", "dv01"]
+    extra = [c for c in df.columns if c not in cols]
+    return df[cols + extra]
 
 # ==============================================================================
 # 4. LIVE CURVE PARSER
