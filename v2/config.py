@@ -2,7 +2,14 @@
 config.py
 
 Central configuration for the All-Weather RV Strategy.
-Holds paths, physics constants, and the Regime Logic dictionaries.
+Holds paths, physics constants, feature parameters, and strategy logic.
+
+SECTIONS:
+1. I/O & PATHS
+2. GLOBAL PHYSICS & MAPPINGS
+3. FEATURE CREATION SETTINGS
+4. REGIME DEFINITIONS
+5. STRATEGY PARAMETERS (PAIRS VS FLYS)
 """
 
 from pathlib import Path
@@ -10,87 +17,89 @@ from pathlib import Path
 # ==============================================================================
 # 1. FILE PATHS & I/O
 # ==============================================================================
-# Paths should be relative or absolute based on your environment
 BASE_DIR = Path(".")
-PATH_DATA = BASE_DIR / "data" / "features"
-PATH_ENH  = BASE_DIR / "data" / "enhanced"
-PATH_OUT  = BASE_DIR / "data" / "output"
+PATH_DATA = BASE_DIR / "data" / "features"   # Raw Feature Inputs
+PATH_ENH  = BASE_DIR / "data" / "enhanced"   # Hourly Enhanced Data (Anchor)
+PATH_OUT  = BASE_DIR / "data" / "output"     # Backtest Results
 
-# File Suffixes (for versioning)
-ENH_SUFFIX = ""
-OUT_SUFFIX = "_v1_allweather"
+# File Naming Conventions
+ENH_SUFFIX = ""                # Suffix for intermediate files (e.g., _v1)
+OUT_SUFFIX = "_v1_allweather"  # Suffix for final output ledgers
+TRADE_TYPES = "trades"         # Name of hedge tape pickle file (w/o extension)
 
 # ==============================================================================
-# 2. EXECUTION PHYSICS
+# 2. GLOBAL PHYSICS & MAPPINGS
 # ==============================================================================
-DECISION_FREQ = "H"  # 'D' for Daily, 'H' for Hourly
-CALC_METHOD   = "cubic" # 'linear' or 'cubic' (Spline type)
+DECISION_FREQ = "H"   # 'D' for Daily, 'H' for Hourly
+CALC_METHOD   = "cubic" # Spline interpolation method
 
-# Tenor Definitions (Tickers to Years)
+# Standard Tenor Map (Internal Keys -> Years)
 TENOR_YEARS = {
     "1Y": 1.0, "2Y": 2.0, "3Y": 3.0, "5Y": 5.0, 
-    "7Y": 7.0, "10Y": 10.0, "20Y": 20.0, "30Y": 30.0
+    "7Y": 7.0, "10Y": 10.0, "12Y": 12.0, "15Y": 15.0,
+    "20Y": 20.0, "25Y": 25.0, "30Y": 30.0
 }
 
-# Trade sizing
-DEFAULT_SCALE_DV01 = 10_000.0
+# Bloomberg Ticker Map (Tape Columns -> Internal Keys)
+# Used by clean_hedge_tape to parse raw input
+BBG_DICT = {
+    "USOSFR1": "1Y",  "USOSFR1 Curncy": "1Y",
+    "USOSFR2": "2Y",  "USOSFR2 Curncy": "2Y",
+    "USOSFR3": "3Y",  "USOSFR3 Curncy": "3Y",
+    "USOSFR5": "5Y",  "USOSFR5 Curncy": "5Y",
+    "USOSFR7": "7Y",  "USOSFR7 Curncy": "7Y",
+    "USOSFR10": "10Y", "USOSFR10 Curncy": "10Y",
+    "USOSFR12": "12Y", "USOSFR12 Curncy": "12Y",
+    "USOSFR15": "15Y", "USOSFR15 Curncy": "15Y",
+    "USOSFR20": "20Y", "USOSFR20 Curncy": "20Y",
+    "USOSFR25": "25Y", "USOSFR25 Curncy": "25Y",
+    "USOSFR30": "30Y", "USOSFR30 Curncy": "30Y",
+}
 
 # ==============================================================================
-# 3. REGIME LOGIC (The "Brain")
+# 3. FEATURE CREATION SETTINGS
 # ==============================================================================
+# PCA: 6 Months (~126 trading days)
+PCA_LOOKBACK_DAYS = 126   
 
-# Strategy Modes: 'curve', 'fly', 'both'
-STRATEGY_MODE = "both" 
+# Hurst: 6 Months (~126 trading days)
+# We want the regime signal to be aligned with our PCA model
+HURST_WINDOW      = 126    
 
-# The Master Regime Dictionary
-# Structure:
-#   Type -> Mode (Threshold/Multiplier) -> Signal -> Value
+# Volatility: 1 Month (~21 days)
+VOL_LOOKBACK      = 21
+
+# ==============================================================================
+# 4. REGIME DEFINITIONS (The "Brain")
+# ==============================================================================
+STRATEGY_MODE = "both" # Options: 'curve', 'fly', 'both'
+
 REGIME_CONFIG = {
-    # --------------------------------------------------------------------------
-    # CURVE TRADES (Momentum/Directional)
-    # --------------------------------------------------------------------------
+    # MOMENTUM REGIME (High Trend) -> Favors Curve Trades
     "curve": {
         "threshold": {
-            # Gating Logic: Only trade Curve if...
-            # Example: Block if Hurst is too low (Range bound market)
-            "hurst_max": (0.45, "greater"), 
+            "hurst_max": (0.45, "greater"), # Hurst > 0.45 enables Curve
         },
         "multiplier": {
-            # Scoring Logic: Adjust Z-Entry based on signal
-            # Example: If Vol (scale) is high, lower the entry bar (chase the trend)
-            "scale_mean": (1.5, "multiply", 0.8), # If scale > 1.5, multiply entry Z by 0.8
-            # Example: If Trend (slope) agrees, lower bar
-            "z_slope_abs": (0.5, "subtract", 0.5) # If slope > 0.5, subtract 0.5 from entry Z
+            # In high vol, we widen the entry gate (require higher signal)
+            "scale_mean": (1.5, "multiply", 1.2), 
         }
     },
-
-    # --------------------------------------------------------------------------
-    # FLY TRADES (Mean Reversion)
-    # --------------------------------------------------------------------------
+    # REVERSION REGIME (Low Trend) -> Favors Fly Trades
     "fly": {
         "threshold": {
-            # Gating Logic: Only trade Fly if...
-            # Example: Block if Hurst is too high (Trending market)
-            "hurst_max": (0.55, "less"),
-            # Example: Block if Vol is exploding
-            "scale_mean": (2.0, "less")
+            "hurst_max": (0.55, "less"),    # Hurst < 0.55 enables Flys
+            "scale_mean": (2.5, "less")     # Block Flys in extreme crisis Vol
         },
         "multiplier": {
-            # Scoring Logic:
-            # Example: If Vol is super low, demand higher premium (raise bar)
-            "scale_mean": (0.5, "multiply", 1.2)
+            "scale_mean": (0.5, "multiply", 0.8) # Tighten gates in calm markets
         }
     },
-
-    # --------------------------------------------------------------------------
-    # ARBITRATION (When Mode == 'Both')
-    # --------------------------------------------------------------------------
+    # ARBITRATION LOGIC
     "both": {
         "priority": {
-            # If signals conflict, which wins?
-            # Logic: If Hurst > 0.6, force Curve mode. Else Fly.
             "signal": "hurst_max",
-            "split_level": 0.55,
+            "split_level": 0.55,      # Above 0.55 = Trend (Curve), Below = Reversion (Fly)
             "above_split": "curve",
             "below_split": "fly"
         }
@@ -98,36 +107,46 @@ REGIME_CONFIG = {
 }
 
 # ==============================================================================
-# 4. ENTRY / EXIT PARAMETERS
+# 5. STRATEGY PARAMETERS
 # ==============================================================================
-PARAMS = {
-    # Base Z-Scores
-    "Z_ENTRY": 0.75,
-    "Z_EXIT": 0.25,
-    "Z_STOP": 3.00,
-    
-    # Drift Logic
-    "DRIFT_GATE_BPS": -5.0,  # Minimum daily carry/roll allowed (don't bleed)
-    "DRIFT_WEIGHT": 0.20,    # How much drift boosts the Z-score (score = z + drift*w)
-    
-    # Execution
-    "MIN_TENOR": 0.5,
-    "MAX_CONCURRENT": 1e10,
-    "PIVOT_POINT": 5.0,
-    
-    # Fly Specifics
-    "FLY_WEIGHT_METHOD": "convexity", # 'convexity' or 'duration'
-    "FLY_WING_WIDTH": (1.5, 7.0),     # Min/Max distance for wings
-    
-    # Momentum (Falling Knife)
-    "MOMENTUM_WINDOW": 5,    # Days to look back for fast trend
-    "MOMENTUM_GATE": 0.25    # Z-score velocity threshold
+# Global Limits
+MIN_TENOR = 0.5
+MAX_CONCURRENT = 50
 
-    # Zombie Filter (Half-Life)
-    "MAX_HALFLIFE_DAYS": 20.0,  # If Mean Reversion takes > 20 days, skip trade.
-    "MIN_HALFLIFE_R2": 0.20,    # Confidence in the mean reversion fit.
+# --- STRATEGY A: CURVE (PAIRS) - MOMENTUM LOGIC ---
+PARAMS_PAIR = {
+    "Z_ENTRY": 0.50,          # Lower entry bar allowed because we require Trend Alignment
+    "Z_EXIT_MOMENTUM": -0.1,  # Exit when Trend Flips (Momentum < -0.1)
+    "Z_STOP": 3.0,            # Hard Stop (Approx 30bps)
     
-    # Gamma Charge (Convexity)
-    # If we are Short Gamma (Long Fly), we demand extra drift/z-score
-    "CONVEXITY_PREMIUM_BPS": 2.0,
+    "DRIFT_GATE_BPS": 0.0,    # Momentum trades just need positive carry (not massive)
+    "DRIFT_WEIGHT": 0.50,     # We weight Carry heavily to ensure we are paid to wait
+    
+    "MOMENTUM_WINDOW": 10,    # Lookback for Trend Calculation (Days)
+    "PIVOT_POINT": 5.0        # Segmentation: Trade <5Y vs <5Y OR >5Y vs >5Y. No crossing.
+}
+
+# --- STRATEGY B: FLY (BUTTERFLIES) - MEAN REVERSION LOGIC ---
+PARAMS_FLY = {
+    "Z_ENTRY": 1.25,          # High entry bar (Require extreme dislocation)
+    "Z_EXIT_REVERSION": 0.25, # Exit when Fair Value is restored (Z -> 0)
+    "Z_STOP": 3.0,            # Hard Stop
+    
+    "DRIFT_GATE_BPS": -2.0,   # Can tolerate slight negative drift if Z is huge
+    "DRIFT_WEIGHT": 0.20,     # Weight Z-score (Reversion) higher than Carry
+    
+    "CONVEXITY_PREMIUM_BPS": 2.0, # Extra drift required to sell Gamma
+    "MAX_HALFLIFE_DAYS": 20.0,    # "Zombie Filter": Kill trade if reversion takes >20 days
+    
+    "FLY_WING_WIDTH": (1.5, 7.0), # Min/Max wing width in years
+    "FLY_WEIGHT_METHOD": "convexity" # Neutralize slope/curvature
+}
+
+# --- LEGACY / FALLBACK (If needed for generic calls) ---
+PARAMS = {
+    "MOMENTUM_WINDOW": 10,
+    "Z_STOP": 3.0,
+    "MIN_TENOR": 0.5,
+    "MAX_CONCURRENT": 50,
+    "MAX_HALFLIFE_DAYS": 20.0
 }
