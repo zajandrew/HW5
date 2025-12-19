@@ -209,9 +209,7 @@ def clean_hedge_tape(raw_df: pd.DataFrame, decision_freq: str) -> pd.DataFrame:
 # Add this to math_core.py
 
 def build_live_curve(
-    row: pd.Series, 
-    bbg_map: Dict[str, str], 
-    tenor_map: Dict[str, float]
+    row: pd.Series
 ) -> Optional[SplineCurve]:
     """
     Scrapes wide-format columns from your hedge tape row to build a SplineCurve.
@@ -224,7 +222,7 @@ def build_live_curve(
     # or just iterate the columns present in the row.
     
     # Robust Strategy: Iterate your known BBG keys (USOSFR1, etc.)
-    for ticker_col, standard_key in bbg_map.items():
+    for ticker_col, standard_key in cr.TENOR_YEARS.items():
         val = None
         
         # Check if the exact ticker is a column in the row
@@ -241,7 +239,7 @@ def build_live_curve(
                 f_val = float(val)
                 # Sanity Check: Rates between -5% and 20%
                 if np.isfinite(f_val) and -5.0 < f_val < 20.0:
-                    t_yr = tenor_map.get(standard_key)
+                    t_yr = standard_key
                     if t_yr:
                         tenors.append(t_yr)
                         rates.append(f_val)
