@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 from typing import Tuple, Optional, Dict, Union
+import config as cr
 
 # ==============================================================================
 # 1. YIELD CURVE ENGINE
