@@ -1,0 +1,171 @@
+# The All-Weather Relative Value Strategy: Architecture & Logic Report
+
+## 1. Executive Summary
+
+### The Problem Space
+
+We are operating as an **Execution Overlay** on an institutional rates desk. This introduces specific, rigid constraints that disqualify standard "Hedge Fund" approaches:
+
+* **Instrument Universe:** Restricted strictly to **SOFR Swaps** (Tick Data). No bonds, no futures, no cross-asset proxies.
+* **Trigger Constraint:** We cannot originate risk freely. We can only trade when the desk executes a client flow. Our goal is to "upgrade" the desk’s naive hedge (e.g., Paying 10Y) into a statistically superior relative value package (e.g., Paying 8s/10s/12s Fly) that offsets the same DV01 risk.
+* **Benchmark:** The strategy is judged against a "Naive 1:1 Hedge." Success is defined as outperforming the direct hedge via positive carry, roll-down, or statistical convergence (Alpha).
+
+### The Research Thesis: "Freight Trains vs. Rubber Bands"
+
+Our strategy is built on the empirical distinction between the two primary drivers of the yield curve, derived from Principal Component Analysis (PCA) and Hurst Exponent research:
+
+1. **Slope (PC2) = "The Freight Train":** Driven by macroeconomic cycles (Fed policy, inflation trends). These moves are persistent and trending (High Hurst > 0.5). Trading against them (Mean Reversion) is dangerous.
+2. **Curvature (PC3) = "The Rubber Band":** Driven by local supply/demand imbalances and liquidity gaps. These moves are constrained by arbitrage; kinks in the curve tend to snap back quickly (Low Hurst < 0.5).
+
+### The Solution: The "Dual-Curve" Engine
+
+We have engineered a system that:
+
+1. **Diagnoses the Regime:** Uses a 6-month Hurst Exponent to determine if the market is Trending or Mean Reverting.
+2. **Splits the Logic:** Routes Curve trades to a **Momentum Strategy** and Butterfly trades to a **Mean Reversion Strategy**.
+3. **Bridges Time:** Uses a sophisticated **Dual-Curve Projection** to execute on live tick data while governed by stable, hourly statistical models.
+
+---
+
+## 2. Architecture Overview
+
+The system operates as a uni-directional pipeline, moving from raw data to decision execution.
+
+### Phase 1: Feature Creation (`feature_creation.py`)
+
+* **Role:** "The Map Maker."
+* **Frequency:** Runs monthly (historical) or daily (live).
+* **Logic:**
+* **PCA Model (6 Months / 126 Days):** Calculates the eigenvectors for Level, Slope, and Curvature. This defines the "Laws of Motion" for the curve over the medium term.
+* **Hurst Exponent (6 Months / 126 Days):** Analyzes the residuals of the PCA model. If , the residuals are trending. If , they are reverting.
+* **Volatility (1 Month / 21 Days):** The "Reflex." Measures recent panic levels to adjust entry gates instantly.
+
+
+
+### Phase 2: The Hourly Anchor (`math_core.py`)
+
+* **Role:** "The Strategic Context."
+* **Frequency:** Updates every hour (Decision Bucket).
+* **Logic:**
+* It freezes the **Mean Rate** and **Volatility Scale** at the top of the hour.
+* It establishes the **Regime State** (Trend vs. Reversion) for the next 60 minutes.
+* *Why:* This prevents the model from "chasing its tail" by recalculating factors on every single tick.
+
+
+
+### Phase 3: The Live Execution Engine (`strategy_main.py`)
+
+* **Role:** "The Tactical Sniper."
+* **Frequency:** Event-driven (Triggered by Hedge Tape).
+* **Logic:**
+* Ingests the **Live Hedge Tape** (containing real-time rates).
+* **Projects** these live rates onto the Hourly Anchor to calculate a "Live Z-Score."
+* Executes trades immediately if they pass the Regime, Momentum, and Value gates.
+
+
+
+---
+
+## 3. Strategy Logic Deep Dive
+
+### A. The "Dual-Curve" Projection
+
+This is the mathematical core that ensures stationarity. We do not trade on raw price levels (Non-Stationary). We trade on the **Deviation from the Hourly Mean** (Stationary).
+
+* **Anchor:** At 10:00 AM, the model says the 10Y "Fair Value" is 4.20% with a Volatility of 5bps.
+* **Live:** At 10:14 AM, the market moves to 4.25%.
+* **Calculation:**
+
+
+
+* **Result:** The strategy sees a +1.0 Sigma signal and executes, even though the hourly data hasn't updated yet.
+
+### B. Strategy Routing (Pairs vs. Flys)
+
+The `RegimeManager` acts as a traffic cop based on the Hurst Exponent.
+
+#### **1. Curve Strategy (Pairs)**
+
+* **Regime:** Enabled when **Hurst > 0.45** (Trending).
+* **Philosophy:** "Ride the Freight Train."
+* **Constraint: The Pivot Point (5Y)**
+*
+* We strictly enforce market segmentation. A Pair cannot cross the 5Y line (e.g., 2s10s is banned). We only trade **Front End** (e.g., 2s5s) or **Back End** (e.g., 7s30s).
+
+
+* **Entry Logic: Momentum Alignment**
+* We calculate the **Momentum** of the spread over the last 10 days.
+* We **ONLY** enter if the Momentum is positive (Trend is moving in our favor).
+* *Goal:* To differentiate between a "Cheap Value" (falling knife) and a "Breakout" (profitable trend).
+
+
+* **Exit Logic:** **Trend Exhaustion.** We close the trade when the Momentum flips negative (), signaling the trend has stalled.
+
+#### **2. Butterfly Strategy (Flys)**
+
+* **Regime:** Enabled when **Hurst < 0.55** (Mean Reverting).
+* **Philosophy:** "Snap the Rubber Band."
+* **Constraint: The Zombie Filter (Half-Life)**
+* We calculate the Ornstein-Uhlenbeck Half-Life of the residuals.
+* If , the trade is blocked. We do not tie up balance sheet on trades that take months to converge.
+
+
+* **Constraint: The Gamma Charge**
+* Buying a Fly (neutralizing slope) usually involves Selling Convexity (Short Gamma).
+* We demand a **Convexity Premium** (e.g., +2bps Drift) to compensate for this risk.
+
+
+* **Entry Logic: Extreme Dislocation**
+* We enter only when  (Statistically cheap).
+
+
+* **Exit Logic:** **Fair Value Reversion.** We close the trade when  (e.g., ). We bank the profit immediately.
+
+---
+
+## 4. Lifecycle & Verification
+
+### Transaction Costs
+
+Every trade is born with a debt.
+
+* **Cost:** .
+* **Implementation:** In `instruments.py`, this cost is subtracted from `pnl_total` immediately upon instantiation.
+* **Effect:** A trade must earn at least 0.1 bps of Alpha just to break even.
+
+### The Marking Process
+
+We utilize a **Cash-Based PnL Canon** to ensure accuracy. We do not rely on "approximate basis points."
+
+1. **Inception ():** We derive **Fixed Notional** from the Target DV01 ().
+2. **Daily Mark ():**
+* **Price PnL:** .
+* **Carry PnL:** .
+* *Verification:* By using the Fixed Notional for carry, we accurately capture the dollar value of the spread, regardless of curve shape.
+
+
+
+### Exits & Safety Valves
+
+The strategy employs a prioritized "Ejection Seat" hierarchy:
+
+1. **Hard Stop Loss (Priority 1):** If PnL drops below -30bps (approx 3 Sigma), immediate close. Logic: "The model is wrong."
+2. **Time Stop (Priority 2):** If held > 20 days, close. Logic: "Capital efficiency."
+3. **Strategic Exit (Priority 3):**
+* **Pairs:** Momentum flip (Trend over).
+* **Flys:** Z-Score Reversion (Profit taken).
+
+
+
+---
+
+## 5. Conclusion
+
+This architecture represents a robust, institutional-grade solution to the SOFR overlay problem.
+
+* It respects the **Physics** of the market (splitting Momentum vs. Reversion).
+* It respects the **Constraints** of the desk (Execution on Client Flow).
+* It respects the **Math** of the model (Stationarity via Dual-Curve Projection).
+* It respects the **Risk** of the business (Gamma Charges and Zombie Filters).
+
+You are now equipped with a fully verifiable, research-aligned algorithmic trading engine.
