@@ -59,9 +59,12 @@ class SwapLeg:
         # Let's decay the tenor for lookup to capture rolldown physics.
         
         decay_years = (dt_days / 360.0) if dt_days > 0 else 0.0
-        # For lookup, we don't let tenor go below 0
-        t_lookup = max(0.01, self.tenor_orig - (pd.Timestamp(curve.date) - self.open_ts).days / 360.0)
         
+        # Update the Remaining Tenor
+        self.tenor = max(0.01, self.tenor - decay_years)
+        t_lookup = self.tenor
+        
+        # 2. Update Rate & Risk
         self.curr_rate = curve.get_rate(t_lookup)
         
         # Risk Factor (DV01 per unit of notional)
@@ -170,17 +173,17 @@ class PairPos:
     def mark(self, curve: mc.SplineCurve, ts: pd.Timestamp):
         if self.closed: return
         
-        dt_days = (ts - self.last_mark_ts).days
-        curve.date = ts # Hack to pass date to Leg
+        delta = ts - self.last_mark_ts
+        dt_days = delta.total_seconds() / 86400.0 
         
-        for leg in self.legs:
-            leg.mark(curve, dt_days)
+        for leg in self.legs: 
+            leg.mark(curve, dt_days) # Pass fractional incremental time
             
         self.last_mark_ts = ts
         
     @property
     def pnl_total(self):
-        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs) - self.txn_cost_cash
+        return sum(l.pnl_price + l.pnl_carry for l in self.legs) - self.txn_cost_cash
         
     @property
     def pnl_bps(self):
@@ -254,17 +257,17 @@ class FlyPos:
     def mark(self, curve: mc.SplineCurve, ts: pd.Timestamp):
         if self.closed: return
         
-        dt_days = (ts - self.last_mark_ts).days
-        curve.date = ts
+        delta = ts - self.last_mark_ts
+        dt_days = delta.total_seconds() / 86400.0 
         
-        for leg in self.legs:
-            leg.mark(curve, dt_days)
+        for leg in self.legs: 
+            leg.mark(curve, dt_days) # Pass fractional incremental time
             
         self.last_mark_ts = ts
 
     @property
     def pnl_total(self):
-        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs) - self.txn_cost_cash
+        return sum(l.pnl_price + l.pnl_carry for l in self.legs) - self.txn_cost_cash
         
     @property
     def pnl_bps(self):
