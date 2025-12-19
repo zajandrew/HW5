@@ -172,6 +172,53 @@ def _calc_hurst_rs(series: np.ndarray, min_chunk: int = 8) -> float:
     except:
         return 0.5
 
+def _calc_ou_halflife(series: np.ndarray) -> Tuple[float, float]:
+    """
+    Fits an Ornstein-Uhlenbeck process to the residual series.
+    dX_t = theta * (mu - X_t) * dt + sigma * dW_t
+    
+    Discrete form: x_t = alpha + beta * x_{t-1} + epsilon
+    Half-Life = -ln(2) / ln(beta)
+    
+    Returns: (HalfLife_Days, R_Squared)
+    """
+    if len(series) < 10: return (np.nan, 0.0)
+    
+    # Lag the series: y = x_t, x = x_{t-1}
+    y = series[1:]
+    x = series[:-1]
+    
+    # Linear Regression
+    # We want slope (beta)
+    # center data for stability
+    x_mean = np.mean(x)
+    y_mean = np.mean(y)
+    
+    numerator = np.sum((x - x_mean) * (y - y_mean))
+    denominator = np.sum((x - x_mean)**2)
+    
+    if denominator == 0: return (np.nan, 0.0)
+    
+    beta = numerator / denominator
+    alpha = y_mean - beta * x_mean
+    
+    # Calculate R2
+    y_pred = alpha + beta * x
+    ss_res = np.sum((y - y_pred)**2)
+    ss_tot = np.sum((y - y_mean)**2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
+    
+    # Calculate Half Life
+    # If beta >= 1.0, it's non-stationary (Random Walk or Trending), Infinite HL
+    if beta >= 0.999: 
+        return (999.0, r2)
+    if beta <= 0.0: # Oscillation
+        return (0.1, r2)
+        
+    # HL = -ln(2) / ln(beta) * dt (assuming dt=1 day)
+    hl = -np.log(2) / np.log(beta)
+    return (float(hl), float(r2))
+
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
@@ -384,6 +431,7 @@ def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
     pca_z = np.nan
     pca_scale = np.nan
     hurst_map = {}
+    halflife_map = {}
     
     # 2. Fit PCA & Calc Hurst
     out["z_pca"] = pca_z
@@ -407,6 +455,8 @@ def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
                     # Calculate H on the residuals of this specific tenor
                     h_val = _calc_hurst_rs(resid_hist[:, i])
                     hurst_map[tenor] = h_val
+                    hl, r2 = _calc_ou_halflife(resid_hist[:, i])
+                    halflife_map[tenor] = hl
 
     # 3. Spline (Intraday)
     z_spline, spline_scale = _spline_fit_safe(out)
@@ -417,6 +467,11 @@ def _process_hybrid_bucket(dts, df_bucket, df_history_daily, pca_config):
         out["hurst"] = out["tenor_yrs"].map(hurst_map)
     else:
         out["hurst"] = 0.5
+
+    if halflife_map:
+        out["halflife"] = out["tenor_yrs"].map(halflife_map)
+    else:
+        out["halflife"] = 999.0 # Default to "Zombie" if calc fails
     
     # 5. Combine Logic
     raw_scale = 0.01
