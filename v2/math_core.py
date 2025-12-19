@@ -246,49 +246,53 @@ def clean_hedge_tape(
 # ==============================================================================
 # 4. LIVE CURVE PARSER
 # ==============================================================================
+# Add this to math_core.py
 
 def build_live_curve(
     row: pd.Series, 
-    ticker_map: Dict[str, float]
+    bbg_map: Dict[str, str], 
+    tenor_map: Dict[str, float]
 ) -> Optional[SplineCurve]:
     """
-    Scrapes wide-format columns from a hedge tape row to build a SplineCurve.
-    Args:
-        row: A pandas Series (single row from hedge tape).
-        ticker_map: Dictionary mapping column names (e.g., 'USOSFR2') to float years (2.0).
-    Returns:
-        SplineCurve object or None if insufficient data.
+    Scrapes wide-format columns from your hedge tape row to build a SplineCurve.
+    Uses your existing BBG_DICT and TENOR_YEARS to find columns.
     """
     tenors = []
     rates = []
     
-    # 1. Iterate through known tickers in config
-    for ticker, yr in ticker_map.items():
-        # Check if ticker exists in row index (handling standard variants)
-        # We check exact match, or '_mid' suffix often found in data
+    # Reverse map: We need to know that "10Y" corresponds to column "USOSFR10"
+    # or just iterate the columns present in the row.
+    
+    # Robust Strategy: Iterate your known BBG keys (USOSFR1, etc.)
+    for ticker_col, standard_key in bbg_map.items():
         val = None
-        if ticker in row.index:
-            val = row[ticker]
-        elif f"{ticker}_mid" in row.index:
-            val = row[f"{ticker}_mid"]
-        elif f"{ticker} rate" in row.index:
-            val = row[f"{ticker} rate"]
+        
+        # Check if the exact ticker is a column in the row
+        if ticker_col in row.index:
+            val = row[ticker_col]
+        # Check for common suffixes if exact match fails
+        elif f"{ticker_col} Curncy" in row.index:
+            val = row[f"{ticker_col} Curncy"]
+        elif f"{ticker_col}_mid" in row.index:
+            val = row[f"{ticker_col}_mid"]
             
-        # 2. Validate
         if val is not None:
             try:
                 f_val = float(val)
-                if np.isfinite(f_val) and f_val > -5.0 and f_val < 20.0: # Sanity check
-                    tenors.append(yr)
-                    rates.append(f_val)
-            except (ValueError, TypeError):
+                # Sanity Check: Rates between -5% and 20%
+                if np.isfinite(f_val) and -5.0 < f_val < 20.0:
+                    t_yr = tenor_map.get(standard_key)
+                    if t_yr:
+                        tenors.append(t_yr)
+                        rates.append(f_val)
+            except:
                 continue
-                
-    # 3. Build Curve if we have enough points (Need 3+ for Cubic)
-    if len(tenors) < 3:
+    
+    # Need at least 3 points for a Cubic Spline
+    if len(tenors) < 3: 
         return None
         
     try:
         return SplineCurve(np.array(tenors), np.array(rates))
-    except Exception:
+    except:
         return None
