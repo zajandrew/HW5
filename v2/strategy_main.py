@@ -313,6 +313,7 @@ def flatten_position(pos: Union[inst.PairPos, inst.FlyPos], state: str) -> Dict:
         "scale_dv01": pos.scale_dv01,
         "pnl_total_bps": pos.pnl_bps,
         "pnl_total_cash": pos.pnl_total,
+        "txn_cost": getattr(pos, "txn_cost_cash", 0.0),
         "drift_score": pos.meta.get("drift_score"),
         "z_entry_val": pos.meta.get("trade_z_entry"),
         "mom_entry_val": pos.meta.get("trade_mom_entry"),
