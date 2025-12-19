@@ -128,6 +128,8 @@ class PairPos:
         self.closed = False
         self.exit_reason = None
         self.last_mark_ts = ts
+        self.txn_cost_bps = 0.1
+        self.txn_cost_cash = self.txn_cost_bps * self.scale_dv01
         
         # 1. Determine Direction (Weights)
         # Standard: DV01 Neutral
@@ -178,7 +180,7 @@ class PairPos:
         
     @property
     def pnl_total(self):
-        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs)
+        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs) - self.txn_cost_cash
         
     @property
     def pnl_bps(self):
@@ -206,6 +208,8 @@ class FlyPos:
         self.closed = False
         self.exit_reason = None
         self.last_mark_ts = ts
+        self.txn_cost_bps = 0.1
+        self.txn_cost_cash = self.txn_cost_bps * self.scale_dv01
         
         # 1. Belly Setup
         t_b, r_b = belly['tenor'], belly['rate']
@@ -260,7 +264,7 @@ class FlyPos:
 
     @property
     def pnl_total(self):
-        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs)
+        return sum(l.pnl_price + l.pnl_carry + l.pnl_roll for l in self.legs) - self.txn_cost_cash
         
     @property
     def pnl_bps(self):
