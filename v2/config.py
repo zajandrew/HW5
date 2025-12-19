@@ -121,4 +121,12 @@ PARAMS = {
     # Momentum (Falling Knife)
     "MOMENTUM_WINDOW": 5,    # Days to look back for fast trend
     "MOMENTUM_GATE": 0.25    # Z-score velocity threshold
+
+    # Zombie Filter (Half-Life)
+    "MAX_HALFLIFE_DAYS": 20.0,  # If Mean Reversion takes > 20 days, skip trade.
+    "MIN_HALFLIFE_R2": 0.20,    # Confidence in the mean reversion fit.
+    
+    # Gamma Charge (Convexity)
+    # If we are Short Gamma (Long Fly), we demand extra drift/z-score
+    "CONVEXITY_PREMIUM_BPS": 2.0,
 }
