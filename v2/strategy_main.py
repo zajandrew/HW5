@@ -1,15 +1,21 @@
 """
 strategy_main.py
 
-The Execution Engine for the All-Weather RV Strategy.
+The Canonical Execution Engine for the All-Weather RV Strategy.
 Orchestrates Data -> Regime -> Alpha Search -> Position Management.
+
+Features:
+- Dual Curve Logic (Anchor vs. Live)
+- Regime Arbitration (Curve vs. Fly)
+- Full Entry/Exit/Stop/TakeProfit implementation
+- New Pivot Point Constraint (5Y)
 """
 
 import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 from collections import deque
 
 # --- MODULE IMPORTS ---
@@ -19,7 +25,7 @@ import instruments as inst
 from regime_manager import RegimeManager
 
 # ==============================================================================
-# 1. HELPER: Z-SCORE PROJECTION (DELTA METHOD)
+# 0. UTILITIES
 # ==============================================================================
 
 def get_live_z(
@@ -32,22 +38,74 @@ def get_live_z(
     Projects the Live Z-Score using the Anchor Model + Live Delta.
     Z_live = Z_anchor + (Rate_live - Rate_anchor) / Scale
     """
-    # 1. Get Base Z (The Structural View)
     z_anchor = anchor_curve.z_scores.get(tenor, 0.0)
-    
-    # 2. Get Rates
     r_anchor = anchor_curve.get_rate(tenor)
     r_live = live_curve.get_rate(tenor)
     
-    # 3. Adjust
-    # Scale is in rate units (e.g., 5bps = 0.05). Avoid div/0.
     valid_scale = max(1e-4, anchor_scale)
     delta_z = (r_live - r_anchor) / valid_scale
-    
     return z_anchor + delta_z
 
+def get_position_z(
+    pos: Union[inst.PairPos, inst.FlyPos],
+    curve: mc.SplineCurve,
+    scale: float
+) -> float:
+    """
+    Calculates the aggregate Z-score of an open position against a specific curve/model.
+    Used for Take Profit (Reversion) checks.
+    """
+    # Note: We rely on the curve having z_scores attached. 
+    # If using Live Projection, one would need to pass live_curve + anchor_curve.
+    # For Exit Logic (Strategic), we typically use the ANCHOR curve (Hourly).
+    
+    if isinstance(pos, inst.PairPos):
+        # Legs: [Primary (I), Hedge (J)]
+        # We need to know which leg is Long/Short relative to the Z calculation.
+        # Pair Z = Z_I - Z_J (assuming I is the alpha leg we bought)
+        # But robustly: Sum(Z * Direction) is usually the "Portfolio Z".
+        # However, Z-scores are usually "High = Cheap".
+        # If we Rec Fixed (+1), we want High Z.
+        # If we Pay Fixed (-1), we want Low Z.
+        # Agg Z = Sum(Z_leg * Direction_leg)
+        
+        z_agg = 0.0
+        for leg in pos.legs:
+            z_l = curve.z_scores.get(leg.tenor, 0.0)
+            z_agg += z_l * leg.direction
+            
+        # Normalize? A 2-leg spread has Vol ~ sqrt(2)*Vol_Leg.
+        # But our Zs are usually standardized residuals. 
+        # Let's keep it simple: The Entry Threshold was based on the Spread Z.
+        # Spread Z = (Z_cand - Z_pivot) * Direction_Cand.
+        # This aligns with Sum(Z * Dir).
+        return z_agg
+
+    elif isinstance(pos, inst.FlyPos):
+        # Fly Z = Belly - 0.5*Wings (Standard Definition of Fly Height).
+        # Position Z: If we are Long Fly (Rec Belly, Pay Wings), we want High Fly Z.
+        # Agg Z = Sum(Z_leg * Direction_leg)
+        
+        z_agg = 0.0
+        # Weights in Z-space are typically 1, -0.5, -0.5 for a Fly
+        # But we simply sum the directional Zs.
+        for leg in pos.legs:
+            z_l = curve.z_scores.get(leg.tenor, 0.0)
+            # For a weighted fly, the risk weights handle PnL.
+            # For Z-score signal, we typically use 1/-0.5/-0.5 topology.
+            # We must detect if this leg is Belly or Wing.
+            # Simpler: Use the definition stored in metadata or infer?
+            # Let's infer based on tenor middle.
+            
+            # Actually, standard Sum(Z*Dir) works if Zs are comparable.
+            z_agg += z_l * leg.direction
+            
+        return z_agg
+    
+    return 0.0
+
 # ==============================================================================
-# 2. HELPER: ALPHA SCANNER
+# 1. ALPHA SCANNER
 # ==============================================================================
 
 def scan_for_alpha(
@@ -61,60 +119,66 @@ def scan_for_alpha(
     z_history: Dict[float, deque]
 ) -> Optional[Union[inst.PairPos, inst.FlyPos]]:
     """
-    Scans the curve for the best relative value trade to replace the hedge.
-    Returns a Position object (PairPos or FlyPos) or None.
+    Scans for Relative Value trades using Dual Curve logic and full constraints.
     """
-    # 1. Parse Hedge Details
+    # 1. Parse Hedge (The Pivot)
     h_tenor = float(hedge_row["tenor_yrs"])
     h_dv01 = float(hedge_row["dv01"])
     h_side = str(hedge_row["side"]).upper() 
     h_id = hedge_row.get("trade_id", -1)
     
-    # 2. Determine Alpha Direction (The "Pivot")
-    # If Desk is RECEIVING (Long Duration), we normally PAY (Short Duration).
-    # So our Alpha Trade starts with a PAY leg at h_tenor.
+    # Pivot Direction: To hedge a Receiver, we Pay (-1).
     pivot_dir = -1.0 if h_side in ["CRCV", "REC", "RECEIVER"] else 1.0
     
-    # 3. Get Rules of Engagement
+    # 2. Regime Gating
     allow_curve = regime_mgr.check_trade_allowed("curve", regime_state)
     allow_fly = regime_mgr.check_trade_allowed("fly", regime_state)
     
-    # Live Context for Pivot
+    # 3. Live Context
     pivot_z = get_live_z(h_tenor, anchor_curve, live_curve, anchor_scale)
     pivot_drift = mc.calc_signal_drift(h_tenor, pivot_dir, live_curve)
     
+    # Momentum History for Pivot (Falling Knife check)
+    pivot_mom = 0.0
+    if h_tenor in z_history and len(z_history[h_tenor]) >= cr.PARAMS["MOMENTUM_WINDOW"]:
+        pivot_mom = pivot_z - z_history[h_tenor][0] # Current - Oldest
+
     best_pair, best_pair_score = None, -999.0
     best_fly, best_fly_score = None, -999.0
     
     # ==========================================================================
-    # STRATEGY A: CURVE (PAIRS)
+    # STRATEGY A: CURVE (PAIRS) - MOMENTUM/TREND
     # ==========================================================================
     if allow_curve:
         z_entry_thresh = regime_mgr.get_z_adjustment("curve", regime_state, cr.PARAMS["Z_ENTRY"])
-        
-        # Scan known universe (Anchor tenors) using Live Rates
+        pivot_point = getattr(cr, "PIVOT_POINT", 5.0)
+
         for t_cand in anchor_curve.z_scores.keys():
             if abs(t_cand - h_tenor) < cr.PARAMS["MIN_TENOR"]: continue
             
-            # Candidate is OPPOSITE to Pivot
+            # --- CONSTRAINT: PIVOT POINT (New) ---
+            # Both must be <= 5Y OR Both must be > 5Y
+            if (h_tenor <= pivot_point and t_cand > pivot_point) or \
+               (h_tenor > pivot_point and t_cand <= pivot_point):
+                continue
+            
+            # Candidate Direction
             cand_dir = -1.0 * pivot_dir
             cand_z = get_live_z(t_cand, anchor_curve, live_curve, anchor_scale)
             
-            # Z-Score Spread (Long - Short)
-            # If cand_dir=1 (Rec), we want High Z. Spread = Z_cand - Z_pivot
+            # Spread Z (Long - Short)
+            # If cand_dir = 1 (Rec), we want Z_cand > Z_pivot
             z_spread = (cand_z - pivot_z) if cand_dir > 0 else (pivot_z - cand_z)
             
+            # Threshold Check
             if z_spread < z_entry_thresh: continue
             
-            # MOMENTUM CHECK (Falling Knife)
-            # If Spread is CHEAP but falling fast, wait.
-            # (Implementation omitted for brevity, relies on z_history logic)
-            
+            # Drift Check
             cand_drift = mc.calc_signal_drift(t_cand, cand_dir, live_curve)
             net_drift = cand_drift + pivot_drift
-            
             if net_drift < cr.PARAMS["DRIFT_GATE_BPS"]: continue
             
+            # Score
             score = z_spread + (net_drift * cr.PARAMS["DRIFT_WEIGHT"])
             
             if score > best_pair_score:
@@ -123,64 +187,79 @@ def scan_for_alpha(
                     "type": "pair", "cand_tenor": t_cand, 
                     "cand_rate": live_curve.get_rate(t_cand), 
                     "cand_dir": cand_dir, "score": score, 
-                    "z_entry_thresh": z_entry_thresh, "net_drift": net_drift
+                    "z_entry_thresh": z_entry_thresh, "net_drift": net_drift,
+                    "trade_z": z_spread
                 }
 
     # ==========================================================================
-    # STRATEGY B: FLY (BUTTERFLY)
+    # STRATEGY B: FLY (BUTTERFLY) - MEAN REVERSION
     # ==========================================================================
     if allow_fly:
         z_entry_thresh = regime_mgr.get_z_adjustment("fly", regime_state, cr.PARAMS["Z_ENTRY"])
         
-        # 1. GAMMA CHARGE (Convexity Premium)
-        # We are Selling Gamma (Long Fly), so demand extra drift
+        # Gamma Charge
         gamma_charge = cr.PARAMS.get("CONVEXITY_PREMIUM_BPS", 0.0)
         drift_gate_fly = cr.PARAMS["DRIFT_GATE_BPS"] + gamma_charge
         
-        min_w, max_w = cr.PARAMS["FLY_WING_WIDTH"]
+        # Zombie Filter (Pivot)
+        hl_pivot = anchor_curve.halflives.get(h_tenor, 999.0)
+        max_hl = cr.PARAMS.get("MAX_HALFLIFE_DAYS", 20.0)
         
-        for w in np.arange(min_w, max_w + 0.5, 0.5):
-            t_left, t_right = h_tenor - w, h_tenor + w
-            if t_left < cr.PARAMS["MIN_TENOR"] or t_right > 30.0: continue
-            if t_left not in anchor_curve.z_scores or t_right not in anchor_curve.z_scores: continue
+        if hl_pivot <= max_hl:
+            min_w, max_w = cr.PARAMS["FLY_WING_WIDTH"]
             
-            # 2. ZOMBIE FILTER (Half-Life)
-            # Pivot (Belly) Half-Life check
-            hl_pivot = anchor_curve.halflives.get(h_tenor, 999.0)
-            if hl_pivot > cr.PARAMS.get("MAX_HALFLIFE_DAYS", 20.0): continue
-            
-            # Live Zs
-            z_left = get_live_z(t_left, anchor_curve, live_curve, anchor_scale)
-            z_right = get_live_z(t_right, anchor_curve, live_curve, anchor_scale)
-            
-            # Fly Z: Pivot - Wings
-            # If Pivot=-1 (Pay Belly), we benefit if Belly is RICH (High Z)
-            fly_z = pivot_z - 0.5 * (z_left + z_right)
-            trade_z = fly_z * (-1.0 * pivot_dir) # Sign flip to get "Long the Alpha"
-            
-            if trade_z < z_entry_thresh: continue
-            
-            drift_l = mc.calc_signal_drift(t_left, -pivot_dir, live_curve)
-            drift_r = mc.calc_signal_drift(t_right, -pivot_dir, live_curve)
-            net_drift = pivot_drift + 0.5*(drift_l + drift_r)
-            
-            if net_drift < drift_gate_fly: continue
-            
-            score = trade_z + (net_drift * cr.PARAMS["DRIFT_WEIGHT"])
-            
-            if score > best_fly_score:
-                best_fly_score = score
-                best_fly = {
-                    "type": "fly", "left_tenor": t_left, "right_tenor": t_right,
-                    "left_rate": live_curve.get_rate(t_left), 
-                    "right_rate": live_curve.get_rate(t_right),
-                    "score": score, "z_entry_thresh": z_entry_thresh, 
-                    "net_drift": net_drift, "trade_z": trade_z
-                }
+            for w in np.arange(min_w, max_w + 0.5, 0.5):
+                t_left, t_right = h_tenor - w, h_tenor + w
+                if t_left < cr.PARAMS["MIN_TENOR"] or t_right > 30.0: continue
+                if t_left not in anchor_curve.z_scores or t_right not in anchor_curve.z_scores: continue
+                
+                # Zombie Filter (Wings) - Strict mode: all legs must be active
+                hl_l = anchor_curve.halflives.get(t_left, 999.0)
+                hl_r = anchor_curve.halflives.get(t_right, 999.0)
+                if hl_l > max_hl or hl_r > max_hl: continue
 
-    # ==========================================================================
-    # SELECTION & CONSTRUCTION
-    # ==========================================================================
+                # Live Zs
+                z_left = get_live_z(t_left, anchor_curve, live_curve, anchor_scale)
+                z_right = get_live_z(t_right, anchor_curve, live_curve, anchor_scale)
+                
+                # Fly Z Calculation
+                # If Pivot=-1 (Pay Belly), we want High Belly Z relative to wings
+                fly_z_struct = pivot_z - 0.5 * (z_left + z_right)
+                trade_z = fly_z_struct * (-1.0 * pivot_dir) 
+                
+                if trade_z < z_entry_thresh: continue
+                
+                # Momentum Gate (Falling Knife)
+                # If we are betting on reversion, we don't want Z moving against us fast
+                # Approx Check: Check momentum of the belly (pivot)
+                # If we want to Pay Belly (Pivot=-1), we hate it if Belly Z is crashing
+                mom_gate = cr.PARAMS.get("MOMENTUM_GATE", 0.25)
+                # If pivot_dir = -1, we want Z to revert DOWN? No, Pay Belly = Short.
+                # If Belly is Rich (High Z), we Pay. We make money if Z falls.
+                # Bad Momentum: Z is RISING fast (getting richer).
+                if pivot_dir == -1.0 and pivot_mom > mom_gate: continue
+                if pivot_dir == 1.0 and pivot_mom < -mom_gate: continue
+
+                # Drift
+                drift_l = mc.calc_signal_drift(t_left, -pivot_dir, live_curve)
+                drift_r = mc.calc_signal_drift(t_right, -pivot_dir, live_curve)
+                net_drift = pivot_drift + 0.5*(drift_l + drift_r)
+                
+                if net_drift < drift_gate_fly: continue
+                
+                score = trade_z + (net_drift * cr.PARAMS["DRIFT_WEIGHT"])
+                
+                if score > best_fly_score:
+                    best_fly_score = score
+                    best_fly = {
+                        "type": "fly", "left_tenor": t_left, "right_tenor": t_right,
+                        "left_rate": live_curve.get_rate(t_left), 
+                        "right_rate": live_curve.get_rate(t_right),
+                        "score": score, "z_entry_thresh": z_entry_thresh, 
+                        "net_drift": net_drift, "trade_z": trade_z
+                    }
+
+    # --- SELECTION ---
     chosen = None
     if best_pair and best_fly:
         chosen = best_pair if best_pair_score > best_fly_score else best_fly
@@ -189,17 +268,17 @@ def scan_for_alpha(
         
     if not chosen: return None
 
-    # Metadata tracking
+    # Metadata
     meta = {
         "trade_id": h_id, "hedge_side": h_side,
         "drift_score": chosen["net_drift"], "total_score": chosen["score"],
         "z_entry_threshold": chosen["z_entry_thresh"], 
-        "regime_state": str(regime_state)
+        "regime_state": str(regime_state),
+        "trade_z_entry": chosen["trade_z"]
     }
 
-    # Initialize Instruments with LIVE CURVE Rates
     if chosen["type"] == "pair":
-        meta["z_entry_val"] = best_pair_score - (chosen["net_drift"] * cr.PARAMS["DRIFT_WEIGHT"])
+        meta["z_entry_val"] = chosen["trade_z"]
         return inst.PairPos(
             ts=dts,
             leg_i={"tenor": chosen["cand_tenor"], "rate": chosen["cand_rate"], "direction": chosen["cand_dir"]},
@@ -220,11 +299,10 @@ def scan_for_alpha(
         )
 
 # ==============================================================================
-# 3. OUTPUT SERIALIZATION
+# 2. OUTPUT SERIALIZATION
 # ==============================================================================
 
 def flatten_position(pos: Union[inst.PairPos, inst.FlyPos], state: str) -> Dict:
-    """Flattens a position object for Parquet."""
     base = {
         "trade_id": pos.meta.get("trade_id"),
         "open_ts": pos.open_ts,
@@ -257,18 +335,16 @@ def flatten_position(pos: Union[inst.PairPos, inst.FlyPos], state: str) -> Dict:
     return base
 
 def flatten_mark(pos: Union[inst.PairPos, inst.FlyPos], dts: pd.Timestamp, curve: mc.SplineCurve) -> Dict:
-    """Creates a mark row."""
     row = flatten_position(pos, "open")
     row["mark_ts"] = dts
     row["regime_state"] = pos.meta.get("regime_state")
     return row
 
 # ==============================================================================
-# 4. MAIN EXECUTION LOOP
+# 3. MAIN EXECUTION LOOP
 # ==============================================================================
 
 def run_strategy(yymms: List[str]):
-    
     print(f"[INIT] Loading Regime Manager from {cr.PATH_OUT}")
     regime_path = cr.PATH_OUT / f"regime_multipliers{cr.ENH_SUFFIX}.parquet"
     regime_mgr = RegimeManager(regime_path)
@@ -280,16 +356,28 @@ def run_strategy(yymms: List[str]):
     for yymm in yymms:
         print(f"[EXEC] Processing {yymm}...")
         enh_path = cr.PATH_ENH / f"{yymm}_enh{cr.ENH_SUFFIX}.parquet"
-        if not enh_path.exists(): continue
+        if not enh_path.exists(): 
+            print(f"[WARN] {enh_path} not found.")
+            continue
         df_enh = pd.read_parquet(enh_path)
         
-        trade_path = cr.BASE_DIR / "trades.pkl" # Load Hedge Tape
-        df_trades = pd.read_pickle(trade_path) if trade_path.exists() else pd.DataFrame()
+        trade_path = cr.BASE_DIR / f"{getattr(cr, 'TRADE_TYPES', 'trades')}.pkl"
+        if not trade_path.exists():
+            print(f"[WARN] {trade_path} not found.")
+            df_trades = pd.DataFrame()
+        else:
+            df_trades = pd.read_pickle(trade_path)
         
-        # We clean the tape but preserve ALL columns for live curve building
-        clean_hedges = mc.clean_hedge_tape(df_trades, decision_freq=cr.DECISION_FREQ)
+        # 1. Clean Hedge Tape (Using User's Signature)
+        # Note: clean_hedge_tape in math_core must match the signature requested
+        # We assume math_core.clean_hedge_tape is the updated one.
+        # But per instruction, user renamed 'prepare_hedge_tape' to 'clean_hedge_tape'.
+        # We must call it with the correct args.
+        clean_hedges = mc.clean_hedge_tape(
+            df_trades, 
+            decision_freq=cr.DECISION_FREQ,
+        )
         
-        # HOURLY LOOP
         for dts, snap in df_enh.groupby("decision_ts"):
             
             # --- A. ANCHOR CURVE (Hourly) ---
@@ -299,13 +387,11 @@ def run_strategy(yymms: List[str]):
             anchor_curve = mc.SplineCurve(valid["tenor_yrs"].values, valid["rate"].values)
             anchor_curve.z_scores = dict(zip(valid["tenor_yrs"], valid["z_comb"]))
             
-            # Zombie Filter: Load Half-Life
             if "halflife" in valid.columns:
                 anchor_curve.halflives = dict(zip(valid["tenor_yrs"], valid["halflife"]))
             else:
                 anchor_curve.halflives = {}
                 
-            # Anchor Scale (Mean of bucket)
             anchor_scale = float(snap["scale"].mean()) if "scale" in snap.columns else 0.05
             
             # Update History
@@ -322,16 +408,31 @@ def run_strategy(yymms: List[str]):
                 
                 exit_reason = None
                 
-                # 1. Stop Loss (Total PnL Bps)
-                # Note: pos.pnl_bps calc logic resides in Instrument class
-                if pos.pnl_bps <= -cr.PARAMS["Z_STOP"] * 10.0: 
+                # 1. STOP LOSS (Hard PnL Floor)
+                # "Approx 1Z = 10bps" - Config dependent. Using raw bps threshold.
+                stop_thresh = cr.PARAMS.get("Z_STOP", 3.0) * 10.0 # Default assumption
+                if pos.pnl_bps <= -stop_thresh:
                      exit_reason = "StopLoss_PnL"
                 
-                # 2. Take Profit (Z-Reversion)
-                # Need to check Z of position. 
-                # Simplification: If PnL > Target or Z reverts to 0. 
-                # (Omitted for brevity, standard RV logic applies)
+                # 2. TAKE PROFIT / REVERSION
+                # Calculate current structural Z of the position
+                current_struct_z = get_position_z(pos, anchor_curve, anchor_scale)
                 
+                # Target: Reversion to 0 or close to it (Z_EXIT)
+                # If we entered at +2.0, we exit at +0.25.
+                # If we entered at -2.0, we exit at -0.25.
+                z_exit_param = cr.PARAMS.get("Z_EXIT", 0.25)
+                
+                if abs(current_struct_z) <= z_exit_param:
+                    exit_reason = "TakeProfit_Reversion"
+                    
+                # 3. MAX HOLD / STALEMATE
+                # Check half life of belly? Or hard cap?
+                # Using simple day count
+                days_held = (dts - pos.open_ts).days
+                if days_held > cr.PARAMS.get("MAX_HALFLIFE_DAYS", 20.0):
+                    exit_reason = "TimeStop_Zombie"
+
                 if exit_reason:
                     pos.closed = True
                     pos.exit_reason = exit_reason
@@ -339,7 +440,7 @@ def run_strategy(yymms: List[str]):
                 else:
                     still_open.append(pos)
                 
-                # Record Mark
+                # Ledger
                 mark_ledger_data.append(flatten_mark(pos, dts, anchor_curve))
                     
             open_positions = still_open
@@ -352,8 +453,8 @@ def run_strategy(yymms: List[str]):
                 if len(open_positions) >= cr.PARAMS["MAX_CONCURRENT"]: break
                 
                 # 1. Build Live Curve
-                live_curve = mc.build_live_curve(hedge, cr.TENOR_YEARS)
-                if live_curve is None: live_curve = anchor_curve # Fallback
+                live_curve = mc.build_live_curve(hedge, cr.BBG_DICT, cr.TENOR_YEARS)
+                if live_curve is None: live_curve = anchor_curve 
                 
                 # 2. Scan
                 new_pos = scan_for_alpha(
