@@ -21,7 +21,8 @@ def _now():
 def _to_ts_index(df: pd.DataFrame) -> pd.DataFrame:
     if "ts" not in df.columns:
         if df.index.name in ("ts", "sec"):
-            df = df.reset_index().rename(columns={df.columns[0]: "ts"})
+            df = df.reset_index()
+            df = df.rename(columns={df.columns[0]: "ts"})
         else:
             raise KeyError("No 'ts' column found.")
     df = df.copy()
@@ -33,13 +34,15 @@ def _to_ts_index(df: pd.DataFrame) -> pd.DataFrame:
 # Calendar & Hours
 # -----------------------
 def _get_ql_calendar():
-    if not getattr(cr, "USE_QL_CALENDAR", False): return None
+    if not getattr(cr, "USE_QL_CALENDAR", False): 
+        return None
     try:
         market = str(getattr(cr, "QL_US_MARKET", "FederalReserve"))
         direct = getattr(ql.UnitedStates, market, None)
         if direct is not None: return ql.UnitedStates(direct)
         return ql.UnitedStates()
-    except: return None
+    except: 
+        return None
 
 def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     if df_wide.empty: return df_wide
@@ -65,9 +68,11 @@ def _apply_calendar_and_hours(df_wide: pd.DataFrame) -> pd.DataFrame:
     df_wide["ts_local"] = df_wide["ts"].dt.tz_localize("UTC").dt.tz_convert(tz_local)
     tmp = df_wide.set_index("ts_local").sort_index()
     tmp = tmp.between_time(start_str, end_str)
+    
     tmp["ts"] = tmp.index.tz_convert("UTC").tz_localize(None)
     tmp = tmp.reset_index(drop=True)
-    if "ts_local" in tmp.columns: tmp = tmp.drop(columns=["ts_local"])                                             
+    if "ts_local" in tmp.columns: tmp = tmp.drop(columns=["ts_local"])
+        
     return tmp
 
 # -----------------------
