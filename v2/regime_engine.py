@@ -20,6 +20,27 @@ import cr_config_new as cr
 # 1. GENERIC SIGNAL EXTRACTORS
 # ======================================================================
 
+def _acceleration(x: np.ndarray) -> float:
+    """
+    Calculates the change in slope (2nd Derivative).
+    Returns positive if accelerating up, negative if decelerating/curving down.
+    """
+    valid = x[np.isfinite(x)]
+    if len(valid) < 5: return np.nan
+    
+    # Split the window in half to compare recent slope vs old slope
+    mid = len(valid) // 2
+    first_half = valid[:mid]
+    second_half = valid[mid:]
+    
+    slope_1 = _slope(first_half)
+    slope_2 = _slope(second_half)
+    
+    if np.isnan(slope_1) or np.isnan(slope_2):
+        return np.nan
+        
+    return slope_2 - slope_1
+
 def _slope(x: np.ndarray) -> float:
     """Calculates linear slope of an array."""
     valid = x[np.isfinite(x)]
@@ -47,7 +68,8 @@ AGG_FUNCS = {
     "max": np.nanmax,
     "min": np.nanmin,
     "max_abs": _max_abs,
-    "slope": _slope
+    "slope": _slope,
+    "accel": _accel
 }
 
 # ======================================================================
