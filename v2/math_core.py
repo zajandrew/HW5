@@ -64,7 +64,8 @@ class SplineCurve:
         r_dec = self.get_rate(tenor) / 100.0
         # Protect against negative/zero rates for division
         denom = max(1e-4, 1.0 + r_dec)
-        return tenor / denom
+        duration_proxy = tenor / denom
+        return duration_proxy * 0.0001
 
     def get_funding_rate(self) -> float:
         return self.funding_rate
