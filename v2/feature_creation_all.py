@@ -369,16 +369,12 @@ def build_month(yymm: str) -> None:
         return _process_instantaneous_bucket(dts, snap, df_hist_daily, pca_cfg)
     parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one)(d) for d in buckets)
     df_instant = pd.concat(parts, ignore_index=True).sort_values(['ts', 'tenor_yrs'])
-    
-    # --- E. PHASE 2: REGIME & CUMSUM (Vectorized) ---
-    print(f"[{_now()}] [PHASE 2] Calculating Rolling Stats & Drift Accumulation...")
-    
-    
 
-[Image of data processing pipeline]
-
-
+    # --- E. PHASE 2: REGIME & TIME-AWARE DRIFT (Vectorized) ---
+    print(f"[{_now()}] [PHASE 2] Calculating Rolling Regime Stats & Drift Accumulation...")
+    
     # 1. Prep for Rolling
+    # We add DV01 to targets so the ML knows if volatility is changing
     target_cols = ['z_comb', 'z_pca', 'z_spline', 'carry_bps_day', 'roll_bps_day', 'total_drift_day', 'hurst', 'halflife', 'dv01']
     keep_cols = ['ts', 'tenor_yrs'] + [c for c in target_cols if c in df_instant.columns]
     
@@ -390,45 +386,63 @@ def build_month(yymm: str) -> None:
     df_full = pd.concat([hist_subset, df_instant[keep_cols]], ignore_index=True).sort_values(['tenor_yrs', 'ts'])
     
     # 2. Vectorized Rolling (Kitchen Sink)
-    # Using 5 (Half-Day), 10 (Day), 50 (Week) as discussed
-    windows = [5, 10, 50] 
+    windows = [5, 10, 50] # Half-Day, Full-Day, Week
     
     for col in target_cols:
         if col not in df_full.columns: continue
         
-        # Pre-group for speed
+        # Pre-calculate GroupBy object for speed
         grp = df_full.groupby('tenor_yrs')[col]
         
         for w in windows:
-            # A. KINETICS (Slope/Accel)
+            # --- A. KINETICS (Velocity & Acceleration) ---
             shift_w = grp.shift(w)
-            # Slope: (Val - Val_Old) / w
-            df_full[f"{col}_slope_{w}b"] = (df_full[col] - shift_w) / w
             
-            # Accel: Slope - Slope_Old
-            shift_w_half = df_full.groupby('tenor_yrs')[f"{col}_slope_{w}b"].shift(w // 2)
-            df_full[f"{col}_accel_{w}b"] = df_full[f"{col}_slope_{w}b"] - shift_w_half
+            # Slope: (Current - Old) / Window
+            col_slope = f"{col}_slope_{w}b"
+            df_full[col_slope] = (df_full[col] - shift_w) / w
             
-            # B. DISTRIBUTION (Min/Max/Mean/Std/Abs) - Replaces Regime Engine
-            # Using rolling() object
-            rolling_obj = grp.rolling(w)
+            # Accel: Slope - Slope_Old (Using half-window shift for 'instant' accel)
+            shift_w_half = df_full.groupby('tenor_yrs')[col_slope].shift(w // 2)
+            df_full[f"{col}_accel_{w}b"] = df_full[col_slope] - shift_w_half
             
-            df_full[f"{col}_mean_{w}b"] = rolling_obj.mean().values
-            df_full[f"{col}_std_{w}b"]  = rolling_obj.std().values
-            df_full[f"{col}_max_{w}b"]  = rolling_obj.max().values
-            df_full[f"{col}_min_{w}b"]  = rolling_obj.min().values
+            # --- B. DISTRIBUTION (The Regime Engine) ---
+            # Rolling Object
+            roll = grp.rolling(w)
             
-            # Max Abs (Distance from zero)
-            # We construct this by taking max(abs(min), abs(max)) - simplified logic
-            # Or just rolling max of abs series. 
-            # Optimization: create abs series first? 
-            # For now, let's skip explicit MaxAbs column as Min/Max capture bounds.
+            # Basic Stats
+            mean_val = roll.mean()
+            std_val  = roll.std()
+            max_val  = roll.max()
+            min_val  = roll.min()
             
-            # C. QUANTILES (Context)
-            # Quantiles are slow. Only do for key columns like z_comb.
-            if col == 'z_comb' or col == 'hurst':
-                df_full[f"{col}_q25_{w}b"] = rolling_obj.quantile(0.25).values
-                df_full[f"{col}_q75_{w}b"] = rolling_obj.quantile(0.75).values
+            df_full[f"{col}_mean_{w}b"] = mean_val.values
+            df_full[f"{col}_std_{w}b"]  = std_val.values
+            df_full[f"{col}_max_{w}b"]  = max_val.values
+            df_full[f"{col}_min_{w}b"]  = min_val.values
+            
+            # --- C. DERIVED METRICS (High Alpha) ---
+            
+            # 1. Max Abs (Stress Detector)
+            # Max of absolute values in window. 
+            # Optimization: MaxAbs is max(abs(Max), abs(Min))
+            df_full[f"{col}_max_abs_{w}b"] = np.maximum(np.abs(max_val), np.abs(min_val))
+            
+            # 2. Local Z-Score (Regime Normalization)
+            # (Current - RollingMean) / RollingStd
+            # Handles "Divide by Zero" with a tiny epsilon
+            df_full[f"{col}_zlocal_{w}b"] = (df_full[col] - mean_val) / (std_val + 1e-8)
+            
+            # 3. Range Position (Stochastic Oscillator)
+            # (Current - Min) / (Max - Min) -> 0.0 to 1.0
+            rng = max_val - min_val
+            df_full[f"{col}_rng_pos_{w}b"] = (df_full[col] - min_val) / (rng + 1e-8)
+
+            # --- D. QUANTILES (Context) ---
+            # Added for Z, Hurst, and Drift (Critical for Carry regimes)
+            if col in ['z_comb', 'hurst', 'total_drift_day']:
+                df_full[f"{col}_q25_{w}b"] = roll.quantile(0.25).values
+                df_full[f"{col}_q75_{w}b"] = roll.quantile(0.75).values
 
     # --- F. TIME-AWARE DRIFT ACCRUAL ---
     # 1. Calc Time Elapsed
