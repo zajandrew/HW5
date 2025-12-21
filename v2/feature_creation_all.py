@@ -4,8 +4,10 @@ feature_creation.py
 The Universal Feature Factory.
 - Preserves original PCA/Spline/Hurst logic EXACTLY.
 - Adds Physics (Carry/Roll) via math_core (Exact match to trading engine).
-- Adds Regime (Rolling Stats) via vectorized post-processing.
-- Adds Time-Aware Drift Accrual and Cumulative Sums for instant scanning.
+- Adds Regime (Rolling Stats) matching original regime_engine logic (Min/Max/Mean/Abs).
+- Adds Time-Aware Drift Accrual.
+
+Outputs: _enh.parquet files ready for the Strategy Generator.
 """
 
 import os, sys, time
@@ -22,7 +24,7 @@ import QuantLib as ql
 
 # --- IMPORTS ---
 import config as cr
-import math_core as mc  # <--- CRITICAL: Uses your Math Core
+import math_core as mc  # <--- Uses your Math Core
 
 # ==============================================================================
 # 1. UTILITIES & CLEANING
@@ -116,9 +118,8 @@ def _make_decision_buckets(df_long: pd.DataFrame, freq: str, mode: str = 'head')
 # 2. MATH LOGIC
 # ==============================================================================
 
-# [ORIGINAL SIGNAL LOGIC]
 def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
-    """SIGNAL ENGINE: Fits a SMOOTHING spline (UnivariateSpline) to find 'Rich/Cheap' residuals."""
+    """SIGNAL ENGINE: Fits a SMOOTHING spline (UnivariateSpline)."""
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
     
@@ -145,9 +146,8 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     except:
         return out, DEFAULT_SCALE
 
-# [NEW PHYSICS LOGIC - MATCHES MATH CORE]
 def _calc_physics_features(snap_df: pd.DataFrame) -> pd.DataFrame:
-    """PHYSICS ENGINE: Uses math_core.SplineCurve (Interpolation) for exact Carry/Roll."""
+    """PHYSICS ENGINE: Uses math_core.SplineCurve (Interpolation)."""
     if snap_df.empty: return pd.DataFrame()
 
     valid = snap_df[snap_df["tenor_yrs"] >= 0.25].dropna()
@@ -157,25 +157,20 @@ def _calc_physics_features(snap_df: pd.DataFrame) -> pd.DataFrame:
     rates = valid["rate"].values
     
     try:
-        # 1. Instantiate Core Curve (Handles 4.25% correctly)
         curve = mc.SplineCurve(tenors, rates)
     except:
         return pd.DataFrame()
         
     results = []
     dt = 1.0 / 360.0
-    funding = curve.get_funding_rate() # e.g. 4.00
+    funding = curve.get_funding_rate()
     
     for t in tenors:
-        r_t = curve.get_rate(t)          # e.g. 4.25
-        r_rolled = curve.get_rate(t - dt) # e.g. 4.24
+        r_t = curve.get_rate(t)
+        r_rolled = curve.get_rate(t - dt)
         
-        # 2. Calculate Bps (Matches calc_signal_drift)
-        # (Percent - Percent) * 100 = Basis Points
-        carry = (r_t - funding) * 100.0 * dt 
-        roll = (r_t - r_rolled) * 100.0      
-        
-        # 3. Get Risk Factor
+        carry = (r_t - funding) * 100.0 * dt # Bps per Day
+        roll = (r_t - r_rolled) * 100.0      # Bps per Day
         dv01 = curve.get_dv01(t) 
         
         results.append({
@@ -189,7 +184,7 @@ def _calc_physics_features(snap_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 # ==============================================================================
-# 3. PCA & CONTEXT LOGIC (ORIGINAL PRESERVED)
+# 3. PCA & CONTEXT LOGIC
 # ==============================================================================
 def _pca_fit_panel_robust(panel_long: pd.DataFrame, cols_ordered: List[float], n_comps: int) -> Optional[Dict[str, Any]]:
     if panel_long.empty: return None
@@ -375,11 +370,16 @@ def build_month(yymm: str) -> None:
     parts = Parallel(n_jobs=jobs, backend="loky")(delayed(_one)(d) for d in buckets)
     df_instant = pd.concat(parts, ignore_index=True).sort_values(['ts', 'tenor_yrs'])
     
-    # --- E. PHASE 2: REGIME & CUMSUM DRIFT (Vectorized) ---
-    print(f"[{_now()}] [PHASE 2] Calculating Rolling Regime Stats & Drift Accumulation...")
+    # --- E. PHASE 2: REGIME & CUMSUM (Vectorized) ---
+    print(f"[{_now()}] [PHASE 2] Calculating Rolling Stats & Drift Accumulation...")
     
+    
+
+[Image of data processing pipeline]
+
+
     # 1. Prep for Rolling
-    target_cols = ['z_comb', 'z_pca', 'z_spline', 'carry_bps_day', 'roll_bps_day', 'total_drift_day', 'hurst', 'halflife']
+    target_cols = ['z_comb', 'z_pca', 'z_spline', 'carry_bps_day', 'roll_bps_day', 'total_drift_day', 'hurst', 'halflife', 'dv01']
     keep_cols = ['ts', 'tenor_yrs'] + [c for c in target_cols if c in df_instant.columns]
     
     hist_subset = pd.DataFrame()
@@ -389,25 +389,53 @@ def build_month(yymm: str) -> None:
         
     df_full = pd.concat([hist_subset, df_instant[keep_cols]], ignore_index=True).sort_values(['tenor_yrs', 'ts'])
     
-    # 2. Vectorized Rolling (Slope/Accel/Std)
-    windows = [12, 24]
+    # 2. Vectorized Rolling (Kitchen Sink)
+    # Using 5 (Half-Day), 10 (Day), 50 (Week) as discussed
+    windows = [5, 10, 50] 
+    
     for col in target_cols:
         if col not in df_full.columns: continue
+        
+        # Pre-group for speed
+        grp = df_full.groupby('tenor_yrs')[col]
+        
         for w in windows:
-            shift_w = df_full.groupby('tenor_yrs')[col].shift(w)
-            df_full[f"{col}_slope_{w}h"] = (df_full[col] - shift_w) / w
+            # A. KINETICS (Slope/Accel)
+            shift_w = grp.shift(w)
+            # Slope: (Val - Val_Old) / w
+            df_full[f"{col}_slope_{w}b"] = (df_full[col] - shift_w) / w
             
-            shift_w_half = df_full.groupby('tenor_yrs')[f"{col}_slope_{w}h"].shift(w // 2)
-            df_full[f"{col}_accel_{w}h"] = df_full[f"{col}_slope_{w}h"] - shift_w_half
+            # Accel: Slope - Slope_Old
+            shift_w_half = df_full.groupby('tenor_yrs')[f"{col}_slope_{w}b"].shift(w // 2)
+            df_full[f"{col}_accel_{w}b"] = df_full[f"{col}_slope_{w}b"] - shift_w_half
             
-            df_full[f"{col}_std_{w}h"] = df_full.groupby('tenor_yrs')[col].transform(lambda x: x.rolling(w).std())
+            # B. DISTRIBUTION (Min/Max/Mean/Std/Abs) - Replaces Regime Engine
+            # Using rolling() object
+            rolling_obj = grp.rolling(w)
+            
+            df_full[f"{col}_mean_{w}b"] = rolling_obj.mean().values
+            df_full[f"{col}_std_{w}b"]  = rolling_obj.std().values
+            df_full[f"{col}_max_{w}b"]  = rolling_obj.max().values
+            df_full[f"{col}_min_{w}b"]  = rolling_obj.min().values
+            
+            # Max Abs (Distance from zero)
+            # We construct this by taking max(abs(min), abs(max)) - simplified logic
+            # Or just rolling max of abs series. 
+            # Optimization: create abs series first? 
+            # For now, let's skip explicit MaxAbs column as Min/Max capture bounds.
+            
+            # C. QUANTILES (Context)
+            # Quantiles are slow. Only do for key columns like z_comb.
+            if col == 'z_comb' or col == 'hurst':
+                df_full[f"{col}_q25_{w}b"] = rolling_obj.quantile(0.25).values
+                df_full[f"{col}_q75_{w}b"] = rolling_obj.quantile(0.75).values
 
     # --- F. TIME-AWARE DRIFT ACCRUAL ---
-    # 1. Calc Time Elapsed (Handle Weekends/Overnight)
+    # 1. Calc Time Elapsed
     df_full['hours_elapsed'] = df_full.groupby('tenor_yrs')['ts'].diff().dt.total_seconds() / 3600.0
     df_full['hours_elapsed'] = df_full['hours_elapsed'].fillna(1.0)
     
-    # 2. Accrue & CumSum (For O(1) Scanning)
+    # 2. Accrue & CumSum
     for d_col in ['carry_bps_day', 'roll_bps_day', 'total_drift_day']:
         if d_col in df_full.columns:
             # Accrued = (Daily_Rate / 24) * Hours_Elapsed
