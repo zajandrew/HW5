@@ -329,7 +329,7 @@ def collect_vols(
         combined.to_csv(out_csv, index=False)
     return combined
 
-if __name__ == "__main__":
+def run_all():
     # >>> EDIT THESE <<<
     ROOT_DIR = r"\\us.bank-dns.com\mspmetro\MN14GL\Derivatives\Mortgage\PolyPathsCSVData"
     OUT_CSV = r"VolSOFR_1M_concat.csv"
@@ -362,3 +362,7 @@ if __name__ == "__main__":
         recursive=False,
         write_out=True
     )
+    return combined
+
+if __name__ == "__main__":
+    run_all()
