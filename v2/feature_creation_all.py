@@ -618,13 +618,10 @@ def build_month(yymm: str) -> None:
     # Fallback map for common tickers if config differs
     for t_str in ["2Y", "5Y", "10Y", "30Y"]:
         if t_str not in tenor_map_rev:
-             # simple parser logic if needed, or rely on config
              pass
 
     # --- 2. PREP EXOG DATA (Context) ---
-    # We must process Volatility FIRST to have it ready for the merge.
     print(f"[{_now()}] [PREP] Processing Volatility & Auctions...")
-    # Assumes files exist in local directory or path defined in config
     path_vol = Path("VolSOFR_1M_concat.csv") 
     path_auc = Path("auc_data.csv")
     
@@ -674,9 +671,7 @@ def build_month(yymm: str) -> None:
         ).drop(columns=['ts_vol'])
 
     # --- 6. HISTORY CONTEXT (For Phase 1 PCA/Hurst) ---
-    # Load previous month daily summary for continuity
     df_past_history = pd.DataFrame()
-    # Logic to find prev month files (simplified):
     try:
         prev_dt = datetime.datetime.strptime(yymm, "%y%m") - relativedelta(months=1)
         prev_yymm = prev_dt.strftime("%y%m")
@@ -689,7 +684,6 @@ def build_month(yymm: str) -> None:
     df_full_context = df_full_context.drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values('ts')
 
     # --- 7. PHASE 1: INSTANTANEOUS SIGNAL (Parallel) ---
-    # Spline, PCA, Physics (Drift)
     buckets = np.sort(df_hourly["ts"].unique())
     pca_cfg = {
         'enable': bool(getattr(cr, "PCA_ENABLE", True)),
@@ -713,17 +707,56 @@ def build_month(yymm: str) -> None:
 
     df_instant = pd.concat(parts, ignore_index=True).sort_values(['ts','tenor_yrs'])
 
-    # --- 8. PHASE 2: HOURLY REGIME & DRIFT ACCRUAL (Vectorized) ---
+    # --- 8. PHASE 2: HOURLY REGIME & DRIFT ACCRUAL (Vectorized + Warm Start) ---
     print(f"[{_now()}] [PHASE 2] Calculating Hourly Rolling Stats & Accruals...")
     
-    # Needs history from previous hourlies for correct rolling windows
-    # (Assuming prev month _enh file exists, load tail. Simplified here.)
-    df_full_hourly = df_instant.copy() 
+    # --- A. WARM START LOGIC ---
+    # Load tail of previous month to ensure rolling stats (e.g. 50h avg) and Drift CumSum 
+    # don't start at 0/NaN on the 1st of the month.
+    MAX_LOOKBACK_HRS = 120  # 5 Day Buffer (Covers 50h window + weekend)
+    df_prev_tail = pd.DataFrame()
+    drift_offsets = {}
     
-    # 2. Vectorized Rolling (Kitchen Sink)
-    # Applied to Rates, Signals, and Physics
+    try:
+        curr_dt = datetime.datetime.strptime(yymm, "%y%m")
+        prev_dt = curr_dt - relativedelta(months=1)
+        prev_yymm = prev_dt.strftime("%y%m")
+        prev_enh_path = path_enh / f"{prev_yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
+
+        if prev_enh_path.exists():
+            # Load Previous Month
+            df_prev = pd.read_parquet(prev_enh_path)
+            
+            # 1. Capture Drift Offsets (The Final Value of the previous month)
+            # We will add this to the current month's accumulated drift
+            for d_col in ['total_drift_day', 'carry_bps_day', 'roll_bps_day']:
+                cs_col = d_col.replace('_day', '_cumsum')
+                if cs_col in df_prev.columns:
+                    # Get the last valid cumulative value for each tenor
+                    drift_offsets[cs_col] = df_prev.groupby('tenor_yrs')[cs_col].last().to_dict()
+
+            # 2. Slice Tail for Rolling Stats
+            last_ts = df_prev['ts'].max()
+            start_buffer = last_ts - pd.Timedelta(hours=MAX_LOOKBACK_HRS)
+            # Only keep columns present in current instant to avoid mismatch
+            common_cols = [c for c in df_instant.columns if c in df_prev.columns]
+            df_prev_tail = df_prev[df_prev['ts'] > start_buffer][common_cols].copy()
+            
+    except Exception as e:
+        print(f"[{_now()}] [WARN] Warm Start Load Failed: {e}")
+
+    # --- B. CONCATENATE BUFFER ---
+    if not df_prev_tail.empty:
+        # Stitch Past Tail + Current Month
+        df_full_hourly = pd.concat([df_prev_tail, df_instant], ignore_index=True)
+    else:
+        df_full_hourly = df_instant.copy()
+    
+    df_full_hourly = df_full_hourly.sort_values(['tenor_yrs', 'ts'])
+
+    # --- C. CALCULATE FEATURES (Kitchen Sink) ---
     target_cols = ['rate', 'z_comb', 'z_pca', 'z_spline', 'total_drift_day', 'dv01']
-    hourly_windows = [5, 10, 50] # Buckets (approx 0.5d, 1d, 1wk)
+    hourly_windows = [5, 10, 50] 
     
     features = [df_full_hourly]
     
@@ -732,26 +765,42 @@ def build_month(yymm: str) -> None:
             stats = _calc_kitchen_sink_stats(df_full_hourly, col, hourly_windows)
             features.append(stats)
             
-    df_final = pd.concat(features, axis=1)
-    # Cleanup duplicates
-    df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+    df_final_buffered = pd.concat(features, axis=1)
+    df_final_buffered = df_final_buffered.loc[:, ~df_final_buffered.columns.duplicated()]
     
-    # 3. Time-Aware Drift Accrual (The Weekend Problem)
-    # Calc Time Elapsed between buckets per tenor
-    df_final['hours_elapsed'] = df_final.groupby('tenor_yrs')['ts'].diff().dt.total_seconds() / 3600.0
-    # First item in group is NaN, assume 1 hour or 0? 1 hr is safer for trading logic.
-    df_final['hours_elapsed'] = df_final['hours_elapsed'].fillna(1.0)
+    # --- D. DRIFT ACCRUAL ---
+    # Calc Time Elapsed
+    df_final_buffered['hours_elapsed'] = df_final_buffered.groupby('tenor_yrs')['ts'].diff().dt.total_seconds() / 3600.0
+    df_final_buffered['hours_elapsed'] = df_final_buffered['hours_elapsed'].fillna(1.0)
     
-    # Accrue & CumSum
     for d_col in ['carry_bps_day', 'roll_bps_day', 'total_drift_day']:
-        if d_col in df_final.columns:
-            # Accrued = (Daily_Rate / 24) * Hours_Elapsed
+        if d_col in df_final_buffered.columns:
+            # Accrued
             accrued_col = d_col.replace('_day', '_accrued')
-            df_final[accrued_col] = (df_final[d_col] / 24.0) * df_final['hours_elapsed']
+            df_final_buffered[accrued_col] = (df_final_buffered[d_col] / 24.0) * df_final_buffered['hours_elapsed']
             
-            # CumSum = Running Total (To scan via subtraction later)
+            # CumSum (Resetting at start of buffer)
             cumsum_col = d_col.replace('_day', '_cumsum')
-            df_final[cumsum_col] = df_final.groupby('tenor_yrs')[accrued_col].cumsum().fillna(0.0)
+            df_final_buffered[cumsum_col] = df_final_buffered.groupby('tenor_yrs')[accrued_col].cumsum().fillna(0.0)
+
+            # --- E. APPLY DRIFT OFFSETS ---
+            # Add the final value of M-1 to the M cumsum to make it continuous
+            if cumsum_col in drift_offsets:
+                # Map offsets to the dataframe
+                offset_series = df_final_buffered['tenor_yrs'].map(drift_offsets[cumsum_col]).fillna(0.0)
+                
+                # However, we only want to apply this offset to the CURRENT month rows, 
+                # because the Buffer rows (from prev month) already had their history.
+                # BUT, since we recalculated CumSum from the start of the Buffer (0), 
+                # the Buffer rows are now effectively 0-indexed relative to buffer start.
+                # So we simply add the M-1 End Value to EVERYTHING in this new set.
+                # This restores the absolute level for the buffer, and continues it for M.
+                df_final_buffered[cumsum_col] += offset_series
+
+    # --- F. SLICE TO CURRENT MONTH ---
+    # Discard the buffer rows, keep only this month's data
+    min_ts_current = df_instant['ts'].min()
+    df_final = df_final_buffered[df_final_buffered['ts'] >= min_ts_current].copy()
 
     # --- 9. MERGE AUCTIONS (Final Step) ---
     print(f"[{_now()}] [MERGE] Integrating Auction Countdowns...")
@@ -772,7 +821,7 @@ def build_month(yymm: str) -> None:
         print(f"[DONE] {yymm} -> {out_path} (Rows: {len(df_final)}, Valid Z: {valid_pct:.1f}%)")
     else:
         print(f"[WARN] {yymm} produced EMPTY output.")
-
+        
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python feature_creation.py 2304")
