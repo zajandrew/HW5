@@ -1,462 +1,409 @@
 """
-strategy_main.py
+strategy_generator.py (v3.0 - Split Models & Full Audit)
 
-The Canonical Execution Engine for the All-Weather RV Strategy.
-Orchestrates Data -> Regime -> Alpha Search -> Position Management.
-
-Research Alignment:
-- PAIRS (Slope/PC2): Momentum-based Entry/Exit. Constrained by 5Y Pivot.
-- FLYS (Curvature/PC3): Mean-Reversion Entry/Exit. Constrained by Half-Life & Gamma.
+1. Splits processing into 'Curves' and 'Flys'.
+2. Generates 'NET' features (Matrix Algebra) AND 'LEG' features (Direct Lookup).
+3. Saves fully enriched datasets ready for XGBoost X/y construction.
 """
 
-import sys
-import numpy as np
 import pandas as pd
+import numpy as np
+import numba
+from itertools import combinations
 from pathlib import Path
-from typing import List, Dict, Optional, Union
-from collections import deque
-
-# --- MODULE IMPORTS ---
+import sys
+import gc
 import config as cr
-import math_core as mc
-import instruments as inst
-from regime_manager import RegimeManager
 
 # ==============================================================================
-# 0. CONFIGURATION PROXIES
+# 1. NUMBA SCANNER (Universal)
 # ==============================================================================
-# We define default split parameters here to align with the research.
-# Ideally, these should be moved to config.py as 'PARAMS_PAIR' and 'PARAMS_FLY'.
+@numba.njit(parallel=True)
+def scan_pnl_audit(
+    entry_rates,       # (Time, Trades) - Net Weighted Entry Rate
+    drift_cumsums,     # (Time, Trades) - Net Weighted Drift CumSum
+    halflife_idxs,     # (Time, Trades) - Holding Period in Buckets
+    price_hurdle,      
+    total_hurdle,      
+    stop_loss          
+):
+    n_time, n_trades = entry_rates.shape
+    
+    # Results
+    out_label = np.zeros((n_time, n_trades), dtype=np.int8)
+    out_price = np.zeros((n_time, n_trades), dtype=np.float32)
+    out_total = np.zeros((n_time, n_trades), dtype=np.float32)
+    
+    # Audit
+    out_exit_idx  = np.zeros((n_time, n_trades), dtype=np.int32)
+    out_exit_rate = np.zeros((n_time, n_trades), dtype=np.float32)
+    
+    for j in numba.prange(n_trades):
+        for i in range(n_time):
+            
+            # Dynamic Horizon
+            steps = int(halflife_idxs[i, j] * 2)
+            if steps < 5: steps = 5        
+            if steps > 24*90: steps = 24*90 
+            
+            end_idx = min(i + steps, n_time)
+            
+            # Entry State
+            rate_in = entry_rates[i, j]
+            drift_in = drift_cumsums[i, j]
+            
+            # Default: Time Limit
+            best_price = 0.0
+            best_total = 0.0
+            final_idx = end_idx - 1
+            
+            won = False
+            stopped = False
+            
+            for k in range(i + 1, end_idx):
+                # 1. Net Price PnL (Includes Direction via weights)
+                curr_price = (rate_in - entry_rates[k, j]) * 100.0
+                
+                # 2. Net Income PnL (Includes Direction via weights)
+                curr_income = drift_cumsums[k, j] - drift_in
+                
+                curr_total = curr_price + curr_income
+                
+                # Check Stop
+                if curr_total <= stop_loss:
+                    out_label[i, j] = 0 
+                    out_price[i, j] = curr_price
+                    out_total[i, j] = curr_total
+                    final_idx = k
+                    stopped = True
+                    break
+                
+                # Check Win
+                if (curr_price >= price_hurdle) and (curr_total >= total_hurdle):
+                    out_label[i, j] = 1 
+                    out_price[i, j] = curr_price
+                    out_total[i, j] = curr_total
+                    final_idx = k
+                    won = True
+                    break
+                
+                # Track latest
+                best_price = curr_price
+                best_total = curr_total
+            
+            if not won and not stopped:
+                out_price[i, j] = best_price
+                out_total[i, j] = best_total
+                
+            out_exit_idx[i, j] = final_idx
+            out_exit_rate[i, j] = entry_rates[final_idx, j]
 
-CFG_PAIR = getattr(cr, "PARAMS_PAIR", {
-    "Z_ENTRY": 0.50,         # Lower bar for entry if trend is strong
-    "Z_EXIT_MOMENTUM": -0.1, # Exit if trend reverses (Momentum < -0.1)
-    "Z_STOP": 3.0,           # Hard Stop
-    "DRIFT_GATE_BPS": 0.0,   # Trend trades just need positive carry
-    "DRIFT_WEIGHT": 0.50,    # High weight on Carry for trend trades
-    "MOMENTUM_WINDOW": 10,   # Longer window for Slope trends
-    "PIVOT_POINT": 5.0       # 5Y Segmentation Constraint
-})
-
-CFG_FLY = getattr(cr, "PARAMS_FLY", {
-    "Z_ENTRY": 1.25,          # High bar for entry (Mean Reversion)
-    "Z_EXIT_REVERSION": 0.25, # Exit when Z reverts to near zero
-    "Z_STOP": 3.0,            # Hard Stop
-    "DRIFT_GATE_BPS": -2.0,   # Can tolerate slight negative drift if Z is huge
-    "DRIFT_WEIGHT": 0.20,     # Lower weight on carry, high on Z
-    "CONVEXITY_PREMIUM_BPS": 2.0, # Gamma Charge
-    "MAX_HALFLIFE_DAYS": 20.0,    # Zombie Filter
-    "FLY_WING_WIDTH": (1.5, 7.0)
-})
+    return out_label, out_price, out_total, out_exit_idx, out_exit_rate
 
 # ==============================================================================
-# 1. UTILITIES & CALCULATIONS
+# 2. HELPER: MATRIX GENERATION
 # ==============================================================================
-
-def get_live_z(
-    tenor: float, 
-    anchor_curve: mc.SplineCurve, 
-    live_curve: mc.SplineCurve,
-    anchor_scale: float
-) -> float:
-    """Projects Live Z-Score using Anchor Model + Live Delta."""
-    z_anchor = anchor_curve.z_scores.get(tenor, 0.0)
-    r_anchor = anchor_curve.get_rate(tenor)
-    r_live = live_curve.get_rate(tenor)
-    valid_scale = max(1e-4, anchor_scale)
-    return z_anchor + ((r_live - r_anchor) / valid_scale)
-
-def calculate_spread_momentum(
-    leg_tenors: List[float],
-    leg_dirs: List[float],
-    z_history: Dict[float, deque],
-    window: int
-) -> float:
-    """
-    Calculates the momentum of the spread package.
-    Mom = Sum( (CurrentZ - OldZ) * Direction )
-    Positive Momentum means the trade is moving IN THE MONEY.
-    """
-    mom_agg = 0.0
-    valid_legs = 0
+def get_pivots(df):
+    """Pivots ALL columns into Time x Tenor matrices."""
+    pivots = {}
     
-    for t, d in zip(leg_tenors, leg_dirs):
-        if t in z_history and len(z_history[t]) >= window:
-            # Momentum = Current Z - Z N-days ago
-            z_curr = z_history[t][-1]
-            z_old = z_history[t][0] # Oldest in deque
-            
-            # If we are Long (+1), we want Z to rise (+).
-            # If we are Short (-1), we want Z to fall (-).
-            # Spread Mom = Delta_Z * Direction
-            mom_agg += (z_curr - z_old) * d
-            valid_legs += 1
-            
-    if valid_legs == 0: return 0.0
-    return mom_agg
-
-def get_position_z(pos: Union[inst.PairPos, inst.FlyPos], curve: mc.SplineCurve) -> float:
-    """Calculates current structural Z-score of an open position."""
-    z_agg = 0.0
-    for leg in pos.legs:
-        z_l = curve.z_scores.get(leg.tenor, 0.0)
-        z_agg += z_l * leg.direction
-    return z_agg
-
-# ==============================================================================
-# 2. ALPHA SCANNER
-# ==============================================================================
-
-def scan_for_alpha(
-    dts: pd.Timestamp,
-    hedge_row: pd.Series, 
-    anchor_curve: mc.SplineCurve, 
-    live_curve: mc.SplineCurve,
-    anchor_scale: float,
-    regime_mgr: RegimeManager,
-    regime_state: Dict,
-    z_history: Dict[float, deque]
-) -> Optional[Union[inst.PairPos, inst.FlyPos]]:
-    """
-    Scans for trades respecting Research Logic:
-    - Pairs: Momentum Entry (Trend), 5Y Pivot.
-    - Flys: Mean Reversion Entry (Value), Gamma Charge, Zombie Filter.
-    """
-    # 1. Parse Hedge (The Pivot)
-    h_tenor = float(hedge_row["tenor_yrs"])
-    h_dv01 = float(hedge_row["dv01"])
-    h_side = str(hedge_row["side"]).upper() 
-    h_id = hedge_row.get("trade_id", -1)
+    # 1. Identify Columns
+    # We want everything in 'df' that is feature-like
+    cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
     
-    # Pivot Direction: To hedge a Receiver, we Pay (-1).
-    pivot_dir = -1.0 if h_side in ["CRCV", "REC", "RECEIVER"] else 1.0
-    
-    # 2. Regime Gating
-    allow_curve = regime_mgr.check_trade_allowed("curve", regime_state)
-    allow_fly = regime_mgr.check_trade_allowed("fly", regime_state)
-    
-    # 3. Live Context
-    pivot_z = get_live_z(h_tenor, anchor_curve, live_curve, anchor_scale)
-    pivot_drift = mc.calc_signal_drift(h_tenor, pivot_dir, live_curve)
-    
-    best_pair, best_pair_score = None, -999.0
-    best_fly, best_fly_score = None, -999.0
-    
-    # ==========================================================================
-    # STRATEGY A: CURVE PAIRS (MOMENTUM)
-    # Research: "Freight Train". Enter when trend aligns.
-    # ==========================================================================
-    if allow_curve:
-        # Dynamic Entry Threshold
-        z_entry_thresh = regime_mgr.get_z_adjustment("curve", regime_state, CFG_PAIR["Z_ENTRY"])
-        pivot_point = CFG_PAIR["PIVOT_POINT"]
-        mom_window = int(CFG_PAIR["MOMENTUM_WINDOW"])
-
-        for t_cand in anchor_curve.z_scores.keys():
-            if abs(t_cand - h_tenor) < getattr(cr, "MIN_TENOR", 0.5): continue
-            
-            # 1. PIVOT POINT CONSTRAINT (5Y)
-            # Cannot cross the 5Y line.
-            if (h_tenor <= pivot_point and t_cand > pivot_point) or \
-               (h_tenor > pivot_point and t_cand <= pivot_point):
-                continue
-            
-            cand_dir = -1.0 * pivot_dir
-            cand_z = get_live_z(t_cand, anchor_curve, live_curve, anchor_scale)
-            
-            # 2. MOMENTUM CHECK (The "Freight Train")
-            # We calculate the momentum of the PROPOSED Pair.
-            # Long Cand / Long Pivot (Directions already set)
-            pair_mom = calculate_spread_momentum(
-                [t_cand, h_tenor], 
-                [cand_dir, pivot_dir], 
-                z_history, mom_window
-            )
-            
-            # Rule: Momentum must be Positive (Trend Alignment)
-            # We allow slight noise (-0.05) but generally we want to ride the wave.
-            if pair_mom < -0.05: continue 
-            
-            # 3. Z-Spread & Drift
-            z_spread = (cand_z * cand_dir) + (pivot_z * pivot_dir)
-            # Note: For Pairs, since we are trend following, we might buy "Expensive" 
-            # if momentum is strong. But we still set a floor Z.
-            if z_spread < z_entry_thresh: continue
-
-            cand_drift = mc.calc_signal_drift(t_cand, cand_dir, live_curve)
-            net_drift = cand_drift + pivot_drift
-            if net_drift < CFG_PAIR["DRIFT_GATE_BPS"]: continue
-            
-            # Score: Weighted heavily towards Drift & Momentum for Curve trades
-            score = z_spread + (net_drift * CFG_PAIR["DRIFT_WEIGHT"]) + (pair_mom * 1.0)
-            
-            if score > best_pair_score:
-                best_pair_score = score
-                best_pair = {
-                    "type": "pair", "cand_tenor": t_cand, 
-                    "cand_rate": live_curve.get_rate(t_cand), 
-                    "cand_dir": cand_dir, "score": score, 
-                    "z_entry_thresh": z_entry_thresh, "net_drift": net_drift,
-                    "trade_z": z_spread, "trade_mom": pair_mom
-                }
-
-    # ==========================================================================
-    # STRATEGY B: FLY (BUTTERFLY) - MEAN REVERSION
-    # Research: "Rubber Band". Enter on dislocation, exit on reversion.
-    # ==========================================================================
-    if allow_fly:
-        z_entry_thresh = regime_mgr.get_z_adjustment("fly", regime_state, CFG_FLY["Z_ENTRY"])
+    print(f"   Pivoting {len(cols)} features...")
+    for c in cols:
+        # FFill is critical for data integrity
+        pivots[c] = df.pivot(index='ts', columns='tenor_yrs', values=c).fillna(method='ffill').astype(np.float32)
         
-        # 1. GAMMA CHARGE & DRIFT
-        gamma_charge = CFG_FLY["CONVEXITY_PREMIUM_BPS"]
-        drift_gate_fly = CFG_FLY["DRIFT_GATE_BPS"] + gamma_charge
+    return pivots
+
+def make_inverse(df, type_tag):
+    """Generates the Inverse (Payer/Short) trades."""
+    df_inv = df.copy()
+    df_inv['trade_id'] += "_INV"
+    
+    # Columns to flip: Targets + Net Directional Features
+    # We do NOT flip Leg Features (L1_z) because the Payer version still sees the same L1 z-score, 
+    # it just interprets it differently via the Net feature.
+    # Actually: If we want the Model to learn "High Z = Buy", then for the Inverse trade, 
+    # we should flip the Net features.
+    
+    cols_to_flip = ['aux_price_pnl', 'aux_total_pnl', 'aux_entry_rate', 'aux_exit_rate']
+    
+    for c in df_inv.columns:
+        if c.startswith('NET_'):
+            # Flip Net Z, Net Drift, etc.
+            if any(x in c for x in ['z', 'drift', 'rate', 'slope', 'accel']):
+                cols_to_flip.append(c)
+                
+    for c in cols_to_flip:
+        df_inv[c] *= -1
         
-        # 2. ZOMBIE FILTER (Pivot)
-        hl_pivot = anchor_curve.halflives.get(h_tenor, 999.0)
-        max_hl = CFG_FLY["MAX_HALFLIFE_DAYS"]
-        
-        if hl_pivot <= max_hl:
-            min_w, max_w = CFG_FLY["FLY_WING_WIDTH"]
-            
-            for w in np.arange(min_w, max_w + 0.5, 0.5):
-                t_left, t_right = h_tenor - w, h_tenor + w
-                if t_left < getattr(cr, "MIN_TENOR", 0.5) or t_right > 30.0: continue
-                if t_left not in anchor_curve.z_scores or t_right not in anchor_curve.z_scores: continue
-                
-                # Zombie Filter (Wings)
-                hl_l = anchor_curve.halflives.get(t_left, 999.0)
-                hl_r = anchor_curve.halflives.get(t_right, 999.0)
-                if hl_l > max_hl or hl_r > max_hl: continue
-
-                # Live Zs
-                z_left = get_live_z(t_left, anchor_curve, live_curve, anchor_scale)
-                z_right = get_live_z(t_right, anchor_curve, live_curve, anchor_scale)
-                
-                # 3. MEAN REVERSION SIGNAL
-                # Fly Z = Belly - Wings.
-                # If Pivot=-1 (Pay Belly), we want High Belly Z.
-                # Trade Z = (Z_Pivot * Dir) + (Z_Left * -Dir) + (Z_Right * -Dir)
-                # Note: Fly structure usually equal weight Z.
-                fly_z_struct = pivot_z - 0.5 * (z_left + z_right)
-                trade_z = fly_z_struct * (-1.0 * pivot_dir) 
-                
-                if trade_z < z_entry_thresh: continue
-                
-                # Drift
-                drift_l = mc.calc_signal_drift(t_left, -pivot_dir, live_curve)
-                drift_r = mc.calc_signal_drift(t_right, -pivot_dir, live_curve)
-                net_drift = pivot_drift + 0.5*(drift_l + drift_r)
-                
-                if net_drift < drift_gate_fly: continue
-                
-                score = trade_z + (net_drift * CFG_FLY["DRIFT_WEIGHT"])
-                
-                if score > best_fly_score:
-                    best_fly_score = score
-                    best_fly = {
-                        "type": "fly", "left_tenor": t_left, "right_tenor": t_right,
-                        "left_rate": live_curve.get_rate(t_left), 
-                        "right_rate": live_curve.get_rate(t_right),
-                        "score": score, "z_entry_thresh": z_entry_thresh, 
-                        "net_drift": net_drift, "trade_z": trade_z
-                    }
-
-    # --- SELECTION ---
-    chosen = None
-    if best_pair and best_fly:
-        # Normalize scores (Drift weighting helps comparison)
-        chosen = best_pair if best_pair_score > best_fly_score else best_fly
-    elif best_pair: chosen = best_pair
-    elif best_fly: chosen = best_fly
-        
-    if not chosen: return None
-
-    # Metadata
-    meta = {
-        "trade_id": h_id, "hedge_side": h_side,
-        "drift_score": chosen["net_drift"], "total_score": chosen["score"],
-        "z_entry_threshold": chosen["z_entry_thresh"], 
-        "regime_state": str(regime_state),
-        "trade_z_entry": chosen["trade_z"],
-        "trade_mom_entry": chosen.get("trade_mom", 0.0) # Only for pairs
-    }
-
-    if chosen["type"] == "pair":
-        return inst.PairPos(
-            ts=dts,
-            leg_i={"tenor": chosen["cand_tenor"], "rate": chosen["cand_rate"], "direction": chosen["cand_dir"]},
-            leg_j={"tenor": h_tenor, "rate": live_curve.get_rate(h_tenor), "direction": pivot_dir},
-            curve=live_curve,
-            target_dv01=h_dv01, regime_meta=meta
-        )
-    else:
-        return inst.FlyPos(
-            ts=dts,
-            belly={"tenor": h_tenor, "rate": live_curve.get_rate(h_tenor), "direction": pivot_dir},
-            left={"tenor": chosen["left_tenor"], "rate": chosen["left_rate"]},
-            right={"tenor": chosen["right_tenor"], "rate": chosen["right_rate"]},
-            curve=live_curve,
-            target_dv01=h_dv01, weight_method=getattr(cr, "FLY_WEIGHT_METHOD", "convexity"), 
-            regime_meta=meta
-        )
+    # Recalculate Label
+    df_inv['target_label'] = (
+        (df_inv['aux_price_pnl'] >= 1.0) & 
+        (df_inv['aux_total_pnl'] >= 2.0)
+    ).astype(np.int8)
+    
+    return df_inv
 
 # ==============================================================================
-# 3. OUTPUT SERIALIZATION
+# 3. BUILDER: CURVES
 # ==============================================================================
-
-def flatten_position(pos: Union[inst.PairPos, inst.FlyPos], state: str) -> Dict:
-    base = {
-        "trade_id": pos.meta.get("trade_id"),
-        "open_ts": pos.open_ts,
-        "state": state,
-        "type": type(pos).__name__,
-        "scale_dv01": pos.scale_dv01,
-        "pnl_total_bps": pos.pnl_bps,
-        "pnl_total_cash": pos.pnl_total,
-        "txn_cost": getattr(pos, "txn_cost_cash", 0.0),
-        "drift_score": pos.meta.get("drift_score"),
-        "z_entry_val": pos.meta.get("trade_z_entry"),
-        "mom_entry_val": pos.meta.get("trade_mom_entry"),
-        "z_threshold": pos.meta.get("z_entry_threshold"),
+def build_curves(pivots, tenors, month_str):
+    print(f"[{month_str}] Building CURVES...")
+    
+    # A. Define Universe (T1, T2)
+    # T1 = Front (Buy/Rec), T2 = Back (Sell/Pay) -> Flattener
+    # Weights: [+1, -1]
+    combos = list(combinations(tenors, 2))
+    n_trades = len(combos)
+    n_time = len(pivots['rate'].index)
+    
+    # B. Metadata Arrays
+    idx_time = np.repeat(pivots['rate'].index, n_trades)
+    
+    # Trade IDs and Attributes
+    ids = []
+    t1_arr = []
+    t2_arr = []
+    dist_arr = []
+    
+    for t1, t2 in combos:
+        ids.append(f"C_{t1:g}_{t2:g}")
+        t1_arr.append(t1)
+        t2_arr.append(t2)
+        dist_arr.append(t2 - t1)
+        
+    # Tile attributes for the DataFrame
+    ids_tiled = np.tile(ids, n_time)
+    t1_tiled = np.tile(t1_arr, n_time)
+    t2_tiled = np.tile(t2_arr, n_time)
+    dist_tiled = np.tile(dist_arr, n_time)
+    
+    # C. Build Weight Matrix W (n_tenors, n_trades)
+    W = np.zeros((len(tenors), n_trades), dtype=np.float32)
+    for j, (t1, t2) in enumerate(combos):
+        i1 = tenors.index(t1)
+        i2 = tenors.index(t2)
+        W[i1, j] = 1.0
+        W[i2, j] = -1.0
+        
+    W_abs = np.abs(W) # For Vol/HalfLife
+    
+    # D. Feature Dictionary
+    data = {
+        'ts': idx_time,
+        'trade_id': ids_tiled,
+        'meta_t1': t1_tiled,
+        'meta_t2': t2_tiled,
+        'meta_dist': dist_tiled
     }
     
-    if state == "closed":
-        base["close_ts"] = pos.last_mark_ts
-        base["exit_reason"] = pos.exit_reason
-    else:
-        base["last_mark_ts"] = pos.last_mark_ts
+    def flat(x): return x.ravel()
     
-    for i, leg in enumerate(pos.legs):
-        pfx = f"leg{i}"
-        base[f"{pfx}_tenor"] = leg.tenor
-        base[f"{pfx}_dir"]   = leg.direction
-        base[f"{pfx}_entry_rate"] = leg.entry_rate
-        base[f"{pfx}_curr_rate"]  = leg.curr_rate
-        base[f"{pfx}_curr_dv01"] = leg.curr_dv01
+    # --- NET FEATURES (Matrix Mult) ---
+    # "What is the Z-score of the spread?"
+    for name, mat in pivots.items():
+        if any(x in name for x in ['halflife', 'exog_', 'cumsum']): continue
+        # Clean name
+        clean = name.replace("z_comb", "z").replace("total_drift_day", "drift")
+        data[f"NET_{clean}"] = flat(mat.values @ W)
         
-    return base
+    # Regime Features (Weighted Avg)
+    if 'halflife' in pivots:
+        data['NET_halflife'] = flat((pivots['halflife'].values @ W_abs) / 2.0)
+    for k in pivots.keys():
+        if 'exog_vol' in k:
+            clean = k.replace("exog_", "")
+            data[f"NET_{clean}"] = flat((pivots[k].values @ W_abs) / 2.0)
+            
+    # --- LEG FEATURES (Direct Indexing) ---
+    # "What is the Z-score of the 2Y leg specifically?"
+    # Since we can't efficiently store 300 leg cols for every trade via matrix,
+    # we construct them by repeating the source tenor columns.
+    # Optimization: Use 'take' or indexing logic.
+    
+    # Extract indices for T1 and T2
+    # This is slightly slow but robust
+    print(f"   Gathering Leg Features...")
+    
+    # Key features to keep per leg (Don't keep everything or RAM explodes)
+    keep_leg_feats = ['rate', 'z_comb', 'total_drift_day', 'z_comb_slope_5b', 'rate_slope_50b']
+    
+    for feat in keep_leg_feats:
+        if feat not in pivots: continue
+        # Matrix: (Time, Tenors)
+        vals = pivots[feat].values 
+        
+        # We need to construct a (Time*Trades) array where each row corresponds to t1 or t2
+        # Vectorized approach: 
+        # 1. Create index map: trade_j -> tenor_idx_1, tenor_idx_2
+        idx_map_1 = [tenors.index(c[0]) for c in combos]
+        idx_map_2 = [tenors.index(c[1]) for c in combos]
+        
+        # 2. Select columns from vals using these indices
+        # Result: (Time, Trades)
+        L1_vals = vals[:, idx_map_1]
+        L2_vals = vals[:, idx_map_2]
+        
+        data[f"L1_{feat}"] = flat(L1_vals)
+        data[f"L2_{feat}"] = flat(L2_vals)
 
-def flatten_mark(pos: Union[inst.PairPos, inst.FlyPos], dts: pd.Timestamp) -> Dict:
-    row = flatten_position(pos, "open")
-    row["mark_ts"] = dts
-    row["regime_state"] = pos.meta.get("regime_state")
-    return row
+    # E. PnL Scan
+    net_rates = pivots['rate'].values @ W
+    net_drift = pivots['total_drift_day_cumsum'].values @ W
+    hl_buckets = data['NET_halflife'] * 24.0
+    hl_reshaped = hl_buckets.reshape(n_time, n_trades)
+    
+    labels, prices, totals, ex_idx, ex_rate = scan_pnl_audit(
+        net_rates, net_drift, hl_reshaped, 
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5
+    )
+    
+    data['target_label'] = flat(labels)
+    data['aux_price_pnl'] = flat(prices)
+    data['aux_total_pnl'] = flat(totals)
+    data['aux_entry_rate'] = flat(net_rates)
+    data['aux_exit_rate'] = flat(ex_rate)
+    data['aux_exit_idx'] = flat(ex_idx)
+    
+    # F. Save
+    df = pd.DataFrame(data)
+    df_inv = make_inverse(df, "Curve")
+    final = pd.concat([df, df_inv], ignore_index=True).dropna()
+    
+    out_p = Path(getattr(cr, "PATH_ENH", ".")) / f"training_curves_{month_str}.parquet"
+    final.to_parquet(out_p, index=False)
+    print(f"   Saved {len(final)} CURVES -> {out_p}")
+    del df, df_inv, final
+    gc.collect()
 
 # ==============================================================================
-# 4. MAIN EXECUTION LOOP
+# 4. BUILDER: FLYS
 # ==============================================================================
-
-def run_strategy(yymms: List[str]):
-    print(f"[INIT] Loading Regime Manager from {cr.PATH_OUT}")
-    regime_mgr = RegimeManager(cr.PATH_OUT / f"regime_multipliers{cr.ENH_SUFFIX}.parquet")
+def build_flys(pivots, tenors, month_str):
+    print(f"[{month_str}] Building FLYS...")
     
-    open_positions = []
-    closed_pos_data, mark_ledger_data = [], []
-    z_history = {} 
-
-    for yymm in yymms:
-        print(f"[EXEC] Processing {yymm}...")
-        enh_path = cr.PATH_ENH / f"{yymm}_enh{cr.ENH_SUFFIX}.parquet"
-        if not enh_path.exists(): continue
-        df_enh = pd.read_parquet(enh_path)
+    # A. Define Universe (T1, T2, T3)
+    # Weights: [+0.5, -1.0, +0.5]
+    combos = list(combinations(tenors, 3))
+    n_trades = len(combos)
+    n_time = len(pivots['rate'].index)
+    
+    idx_time = np.repeat(pivots['rate'].index, n_trades)
+    
+    ids, t1_arr, t2_arr, t3_arr = [], [], [], []
+    
+    for t1, t2, t3 in combos:
+        ids.append(f"F_{t1:g}_{t2:g}_{t3:g}")
+        t1_arr.append(t1)
+        t2_arr.append(t2)
+        t3_arr.append(t3)
         
-        trade_path = cr.BASE_DIR / f"{getattr(cr, 'TRADE_TYPES', 'trades')}.pkl"
-        clean_hedges = mc.clean_hedge_tape(
-            pd.read_pickle(trade_path) if trade_path.exists() else pd.DataFrame(),
-            decision_freq=cr.DECISION_FREQ,
-            bbg_map=cr.BBG_DICT, tenor_map=cr.TENOR_YEARS
-        )
+    ids_tiled = np.tile(ids, n_time)
+    
+    # C. Weight Matrix
+    W = np.zeros((len(tenors), n_trades), dtype=np.float32)
+    for j, (t1, t2, t3) in enumerate(combos):
+        i1, i2, i3 = tenors.index(t1), tenors.index(t2), tenors.index(t3)
+        W[i1, j] = 0.5
+        W[i2, j] = -1.0
+        W[i3, j] = 0.5
         
-        for dts, snap in df_enh.groupby("decision_ts"):
-            
-            # --- A. ANCHOR CURVE ---
-            valid = snap.dropna(subset=["rate", "tenor_yrs"])
-            if valid.empty: continue
-            
-            anchor_curve = mc.SplineCurve(valid["tenor_yrs"].values, valid["rate"].values)
-            anchor_curve.z_scores = dict(zip(valid["tenor_yrs"], valid["z_comb"]))
-            anchor_curve.halflives = dict(zip(valid["tenor_yrs"], valid["halflife"])) if "halflife" in valid.columns else {}
-            anchor_scale = float(snap["scale"].mean()) if "scale" in snap.columns else 0.05
-            
-            # Update Momentum History
-            for t, z in anchor_curve.z_scores.items():
-                if t not in z_history: z_history[t] = deque(maxlen=CFG_PAIR["MOMENTUM_WINDOW"])
-                z_history[t].append(z)
-                
-            regime_state = regime_mgr.get_state(dts)
-            
-            # --- B. MARK & EXIT ---
-            still_open = []
-            for pos in open_positions:
-                pos.mark(anchor_curve, dts)
-                exit_reason = None
-                
-                # 1. HARD STOP (All Types)
-                if pos.pnl_bps <= -CFG_PAIR["Z_STOP"] * 10.0:
-                     exit_reason = "StopLoss_PnL"
+    W_abs = np.abs(W)
+    
+    data = {
+        'ts': idx_time,
+        'trade_id': ids_tiled,
+        'meta_t1': np.tile(t1_arr, n_time),
+        'meta_t2': np.tile(t2_arr, n_time), # Belly
+        'meta_t3': np.tile(t3_arr, n_time)
+    }
+    
+    def flat(x): return x.ravel()
+    
+    # --- NET FEATURES ---
+    for name, mat in pivots.items():
+        if any(x in name for x in ['halflife', 'exog_', 'cumsum']): continue
+        clean = name.replace("z_comb", "z").replace("total_drift_day", "drift")
+        data[f"NET_{clean}"] = flat(mat.values @ W)
 
-                # 2. EXIT LOGIC (Type Specific)
-                current_z = get_position_z(pos, anchor_curve)
-                
-                if isinstance(pos, inst.PairPos):
-                    # CURVE: Momentum Exit
-                    # Calculate current momentum of the position
-                    leg_tenors = [l.tenor for l in pos.legs]
-                    leg_dirs = [l.direction for l in pos.legs]
-                    pos_mom = calculate_spread_momentum(leg_tenors, leg_dirs, z_history, int(CFG_PAIR["MOMENTUM_WINDOW"]))
-                    
-                    # Exit if Momentum flips against us (Trend Exhaustion)
-                    if pos_mom < CFG_PAIR["Z_EXIT_MOMENTUM"]:
-                        exit_reason = "TakeProfit_TrendExhaustion"
-                        
-                elif isinstance(pos, inst.FlyPos):
-                    # FLY: Mean Reversion Exit
-                    # Exit if Z reverts to near zero (Fair Value)
-                    if abs(current_z) <= CFG_FLY["Z_EXIT_REVERSION"]:
-                        exit_reason = "TakeProfit_Reversion"
-                        
-                    # Fly Timeout (Zombie)
-                    if (dts - pos.open_ts).days > CFG_FLY["MAX_HALFLIFE_DAYS"]:
-                        exit_reason = "TimeStop_Zombie"
+    if 'halflife' in pivots:
+        data['NET_halflife'] = flat((pivots['halflife'].values @ W_abs) / 2.0)
+    for k in pivots.keys():
+        if 'exog_vol' in k:
+            clean = k.replace("exog_", "")
+            data[f"NET_{clean}"] = flat((pivots[k].values @ W_abs) / 2.0)
 
-                # Ledger
-                mark_ledger_data.append(flatten_mark(pos, dts))
-                
-                if exit_reason:
-                    pos.closed = True
-                    pos.exit_reason = exit_reason
-                    closed_pos_data.append(flatten_position(pos, "closed"))
-                else:
-                    still_open.append(pos)
-                    
-            open_positions = still_open
-            
-            # --- C. ENTRY SCAN ---
-            if clean_hedges.empty: continue
-            current_hedges = clean_hedges[clean_hedges["decision_ts"] == dts]
-            
-            for _, hedge in current_hedges.iterrows():
-                if len(open_positions) >= getattr(cr, "MAX_CONCURRENT", 50): break
-                
-                live_curve = mc.build_live_curve(hedge, cr.BBG_DICT, cr.TENOR_YEARS)
-                if live_curve is None: live_curve = anchor_curve 
-                
-                new_pos = scan_for_alpha(
-                    dts, hedge, 
-                    anchor_curve, live_curve, anchor_scale, 
-                    regime_mgr, regime_state, z_history
-                )
-                
-                if new_pos:
-                    open_positions.append(new_pos)
-                    mark_ledger_data.append(flatten_mark(new_pos, dts))
+    # --- LEG FEATURES ---
+    print(f"   Gathering Leg Features...")
+    keep_leg_feats = ['rate', 'z_comb', 'total_drift_day'] # Keep leaner for Flys (more trades)
+    
+    idx_map_1 = [tenors.index(c[0]) for c in combos]
+    idx_map_2 = [tenors.index(c[1]) for c in combos]
+    idx_map_3 = [tenors.index(c[2]) for c in combos]
+    
+    for feat in keep_leg_feats:
+        if feat not in pivots: continue
+        vals = pivots[feat].values
+        
+        data[f"L1_{feat}"] = flat(vals[:, idx_map_1])
+        data[f"L2_{feat}"] = flat(vals[:, idx_map_2]) # Belly
+        data[f"L3_{feat}"] = flat(vals[:, idx_map_3])
+        
+    # E. PnL Scan
+    net_rates = pivots['rate'].values @ W
+    net_drift = pivots['total_drift_day_cumsum'].values @ W
+    hl_buckets = data['NET_halflife'] * 24.0
+    hl_reshaped = hl_buckets.reshape(n_time, n_trades)
+    
+    labels, prices, totals, ex_idx, ex_rate = scan_pnl_audit(
+        net_rates, net_drift, hl_reshaped, 
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5
+    )
+    
+    data['target_label'] = flat(labels)
+    data['aux_price_pnl'] = flat(prices)
+    data['aux_total_pnl'] = flat(totals)
+    data['aux_entry_rate'] = flat(net_rates)
+    data['aux_exit_rate'] = flat(ex_rate)
+    
+    df = pd.DataFrame(data)
+    df_inv = make_inverse(df, "Fly")
+    final = pd.concat([df, df_inv], ignore_index=True).dropna()
+    
+    out_p = Path(getattr(cr, "PATH_ENH", ".")) / f"training_flys_{month_str}.parquet"
+    final.to_parquet(out_p, index=False)
+    print(f"   Saved {len(final)} FLYS -> {out_p}")
+    del df, df_inv, final
+    gc.collect()
 
-    # 4. Save
-    print(f"[DONE] Saving outputs to {cr.PATH_OUT}")
-    if closed_pos_data:
-        pd.DataFrame(closed_pos_data).to_parquet(cr.PATH_OUT / f"positions_ledger{cr.OUT_SUFFIX}.parquet")
-    if mark_ledger_data:
-        pd.DataFrame(mark_ledger_data).to_parquet(cr.PATH_OUT / f"marks_ledger{cr.OUT_SUFFIX}.parquet")
+# ==============================================================================
+# 5. ORCHESTRATOR
+# ==============================================================================
+def process_month(month_str):
+    p = Path(getattr(cr, "PATH_ENH", ".")) / f"{month_str}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
+    if not p.exists(): 
+        print(f"[{month_str}] Not found: {p}")
+        return
+
+    print(f"[{month_str}] Loading Features...")
+    df = pd.read_parquet(p)
+    
+    # 1. Prepare Data
+    pivots = get_pivots(df)
+    tenors = sorted(pivots['rate'].columns)
+    
+    # 2. Build Models
+    build_curves(pivots, tenors, month_str)
+    build_flys(pivots, tenors, month_str)
+    
+    print(f"[{month_str}] Done.")
 
 if __name__ == "__main__":
-    run_strategy(sys.argv[1:])
+    if len(sys.argv) < 2:
+        print("Usage: python strategy_generator.py 2304")
+    for m in sys.argv[1:]:
+        process_month(m)
