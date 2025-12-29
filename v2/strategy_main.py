@@ -1,17 +1,17 @@
 """
-strategy_generator.py (v4.0 - Event Physics & Full Leg Detail)
+strategy_generator.py (v5.0 - Research Aligned & Fully Fleshed)
 
 1. Splits processing into 'Curves' and 'Flys'.
 2. Projects Features:
    - Directional (Z, Drift): Net Difference (Signed Weights).
    - Regime (Vol, Scale): Weighted Average (Abs Weights).
    - Events (Auctions): MINIMUM (Proximity).
-3. Outputs Granular Leg Data:
-   - L1/L2/L3 for Rates, Z, Drift, Vol, AND Auctions.
-4. Outputs Derived Physics:
-   - Signal/Noise Ratios.
-   - Convexity Costs.
-   - Event Proximity.
+3. Derived Physics (Research Aligned):
+   - Modified Carry (Sigmoid): Z * (2 / (1 + e^-Drift)). Calculated for NET and ALL LEGS.
+   - Slope Leakage (Convexity): Deviation of 50/50 weights from Slope Neutrality.
+   - Signal/Noise Ratios: Drift/Vol, Z/Vol.
+   - Model Divergence: PCA vs Spline Z-scores.
+4. Output: Fully enriched dataset with Audit Trails.
 """
 
 import pandas as pd
@@ -88,12 +88,11 @@ def scan_pnl_audit(
     return out_label, out_price, out_total, out_exit_idx, out_exit_rate
 
 # ==============================================================================
-# 2. HELPER: FEATURE PROJECTION
+# 2. HELPER: MATH & PROJECTION
 # ==============================================================================
 def get_pivots(df):
     """Pivots ALL columns into Time x Tenor matrices."""
     pivots = {}
-    # Identify all feature columns
     cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
     print(f"   Pivoting {len(cols)} features...")
     for c in cols:
@@ -105,19 +104,16 @@ def project_features(pivots, W, W_abs, trade_names):
     Projects Features based on Type:
     1. Directional (Z, Drift) -> Signed Net.
     2. Regime (Vol, Scale) -> Weighted Avg.
-    3. Events (Auctions) -> SKIPPED here (Handled in Leg Loop for Min/Max logic).
     """
     data = {}
     
-    # Keyword Config
     REGIME_KEYS = ['halflife', 'scale', 'dv01', 'exog_']
-    EVENT_KEYS  = ['hours_to_'] # Skip these in Matrix Mult (we handle manually)
+    EVENT_KEYS  = ['hours_to_'] # Handle manually
     SKIP_KEYS   = ['cumsum']
 
     for name, mat in pivots.items():
         if any(x in name for x in SKIP_KEYS + EVENT_KEYS): continue
         
-        # XGBoost Friendly Name
         clean = name.replace("z_comb", "z").replace("total_drift_day", "drift").replace("rate", "rate")
         clean = clean.replace("exog_", "")
         
@@ -136,8 +132,17 @@ def project_features(pivots, W, W_abs, trade_names):
         data[k] = data[k].ravel()
     return data
 
+def calc_modified_carry(z_arr, drift_arr):
+    """
+    Research Paper Logic: Z * (2 / (1 + exp(-Drift))).
+    Amplifies Z if Drift supports it, dampens if opposed.
+    Assumes Drift is in bps/day. Scaling drift by 2.0 makes the sigmoid steeper.
+    """
+    sigmoid = 2.0 / (1.0 + np.exp(-drift_arr * 2.0))
+    return z_arr * sigmoid
+
 def make_inverse(df):
-    """Generates Inverse trades (Flipping Directional features only)."""
+    """Generates Inverse trades (Flipping Directional features)."""
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
     
@@ -145,9 +150,8 @@ def make_inverse(df):
     
     for c in df_inv.columns:
         if c.startswith('NET_'):
-            # Flip Directional: Z, Drift, Rate, Slope, Accel, Divergence, Ratio
-            # Do NOT flip Regime: Vol, Scale, Halflife, Hours (Events are unsigned proximity)
-            if any(x in c for x in ['z', 'drift', 'rate', 'slope', 'accel', 'divergence', 'ratio']):
+            # Flip Directional: Z, Drift, Rate, Slope, Accel, Divergence, Ratio, ModZ, Leakage
+            if any(x in c for x in ['z', 'drift', 'rate', 'slope', 'accel', 'divergence', 'ratio', 'modified', 'leakage']):
                 cols_to_flip.append(c)
                 
     for c in cols_to_flip:
@@ -188,57 +192,71 @@ def build_curves(pivots, tenors, month_str):
     # --- 1. Project Standard Features ---
     data = project_features(pivots, W, W_abs, ids)
     
-    # --- 2. Leg Features & Event Logic ---
+    # --- 2. Leg Features & Events ---
     print(f"   Gathering Leg Features & Events...")
     
-    # We want these specific features for every leg
-    # Added 'hours_to_auction' and 'exog_' explicitly
-    target_leg_feats = ['rate', 'z_comb', 'total_drift_day', 'z_comb_slope_5b']
+    # Grab all Z types to do Modified Carry on all of them
+    z_types = ['z_comb', 'z_pca', 'z_spline']
+    target_leg_feats = ['rate', 'total_drift_day', 'z_comb_slope_5b'] + z_types
     
-    # Find all columns matching these patterns
     pivot_cols = list(pivots.keys())
     cols_to_grab = []
     
-    # A. Match Core Metrics
     for base in target_leg_feats:
         if base in pivot_cols: cols_to_grab.append(base)
-    
-    # B. Match Event/Context Metrics (Auctions, Vol)
     for c in pivot_cols:
-        if 'hours_to_' in c or 'exog_' in c:
-            cols_to_grab.append(c)
-            
+        if 'hours_to_' in c or 'exog_' in c: cols_to_grab.append(c)
     cols_to_grab = list(set(cols_to_grab))
     
-    # Map indices
     idx_map_1 = [tenors.index(c[0]) for c in combos]
     idx_map_2 = [tenors.index(c[1]) for c in combos]
     
+    # Holders for calculation
+    L1_drift, L2_drift = None, None
+    
+    # First Pass: Get Raw Values
     for feat in cols_to_grab:
         vals = pivots[feat].values
-        l1 = vals[:, idx_map_1] # (Time, Trades)
-        l2 = vals[:, idx_map_2]
+        l1 = vals[:, idx_map_1].ravel()
+        l2 = vals[:, idx_map_2].ravel()
         
-        # 1. Save Leg Values
         clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        data[f"L1_{clean}"] = l1.ravel()
-        data[f"L2_{clean}"] = l2.ravel()
+        data[f"L1_{clean}"] = l1
+        data[f"L2_{clean}"] = l2
         
-        # 2. Event Physics (Min Logic)
+        if feat == 'total_drift_day':
+            L1_drift, L2_drift = l1, l2
+        
         if 'hours_to_' in feat:
-            # For Auctions: Net Feature is MIN (Time to impact)
-            # We don't average; if L1 has auction in 1h and L2 in 100h, Risk is 1h.
-            net_min = np.minimum(l1, l2)
-            data[f"NET_{clean}_min"] = net_min.ravel()
+            data[f"NET_{clean}_min"] = np.minimum(l1, l2)
             
-        # 3. Stress Logic
         if feat == 'z_comb':
-            data['NET_leg_stress'] = np.maximum(np.abs(l1), np.abs(l2)).ravel()
+            data['NET_leg_stress'] = np.maximum(np.abs(l1), np.abs(l2))
 
-    # --- 3. Derived Physics ---
+    # --- 3. Derived Physics (Research Aligned) ---
+    print(f"   Calculating Physics (Modified Carry, Divergence)...")
+    
+    # A. Modified Carry (Drift Adjusted Z) - For NET and LEGS
+    # NET Level
+    if 'NET_drift' in data:
+        for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
+            if z_name in data:
+                data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
+    
+    # LEG Level (Requires L1_drift/L2_drift to be found above)
+    if L1_drift is not None:
+        for z_key in z_types:
+            clean_z = z_key.replace("z_comb", "z")
+            if f"L1_{clean_z}" in data:
+                data[f"L1_{clean_z}_modified"] = calc_modified_carry(data[f"L1_{clean_z}"], L1_drift)
+            if f"L2_{clean_z}" in data:
+                data[f"L2_{clean_z}_modified"] = calc_modified_carry(data[f"L2_{clean_z}"], L2_drift)
+
+    # B. Divergence
     if 'NET_z_pca' in data and 'NET_z_spline' in data:
         data['NET_z_divergence'] = data['NET_z_pca'] - data['NET_z_spline']
         
+    # C. Signal-to-Noise
     vol_col = next((k for k in data if 'vol_implied' in k), None)
     if vol_col:
         safe_vol = np.maximum(data[vol_col], 0.1)
@@ -269,7 +287,6 @@ def build_curves(pivots, tenors, month_str):
     data['aux_exit_rate'] = ex_rate.ravel()
     data['aux_exit_idx'] = ex_idx.ravel()
     
-    # Save
     df = pd.DataFrame(data)
     df_inv = make_inverse(df)
     final = pd.concat([df, df_inv], ignore_index=True).dropna()
@@ -312,7 +329,8 @@ def build_flys(pivots, tenors, month_str):
     # --- 2. Leg Features & Events ---
     print(f"   Gathering Leg Features & Events...")
     
-    target_leg_feats = ['rate', 'z_comb', 'total_drift_day'] 
+    z_types = ['z_comb', 'z_pca', 'z_spline']
+    target_leg_feats = ['rate', 'total_drift_day', 'z_comb_slope_5b'] + z_types
     
     pivot_cols = list(pivots.keys())
     cols_to_grab = []
@@ -326,23 +344,58 @@ def build_flys(pivots, tenors, month_str):
     idx_map_2 = [tenors.index(c[1]) for c in combos]
     idx_map_3 = [tenors.index(c[2]) for c in combos]
     
+    L1_drift, L2_drift, L3_drift = None, None, None
+    
     for feat in cols_to_grab:
         vals = pivots[feat].values
-        l1 = vals[:, idx_map_1]
-        l2 = vals[:, idx_map_2]
-        l3 = vals[:, idx_map_3]
+        l1 = vals[:, idx_map_1].ravel()
+        l2 = vals[:, idx_map_2].ravel()
+        l3 = vals[:, idx_map_3].ravel()
         
         clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        data[f"L1_{clean}"] = l1.ravel()
-        data[f"L2_{clean}"] = l2.ravel()
-        data[f"L3_{clean}"] = l3.ravel()
+        data[f"L1_{clean}"] = l1
+        data[f"L2_{clean}"] = l2
+        data[f"L3_{clean}"] = l3
+        
+        if feat == 'total_drift_day':
+            L1_drift, L2_drift, L3_drift = l1, l2, l3
         
         if 'hours_to_' in feat:
-            # Minimum time to event across 3 legs
-            net_min = np.minimum(np.minimum(l1, l2), l3)
-            data[f"NET_{clean}_min"] = net_min.ravel()
+            data[f"NET_{clean}_min"] = np.minimum(np.minimum(l1, l2), l3)
 
-    # --- 3. Derived Physics ---
+    # --- 3. Derived Physics (Research Aligned) ---
+    print(f"   Calculating Physics (Slope Leakage, Modified Carry)...")
+    
+    # A. Slope Leakage (Convexity Bias)
+    # Calculate Ideal Slope Neutral Weight for Left Wing: (Tr - Tb) / (Tr - Tl)
+    t1 = np.tile(t1_arr, n_time)
+    t2 = np.tile(t2_arr, n_time)
+    t3 = np.tile(t3_arr, n_time)
+    
+    dist_total = t3 - t1
+    dist_total[dist_total == 0] = 1.0 # Safety
+    w_left_ideal = (t3 - t2) / dist_total
+    
+    # Feature: Difference between our 0.5 weight and the ideal slope neutral weight
+    data['NET_slope_leakage'] = 0.5 - w_left_ideal
+    
+    # B. Modified Carry (Drift Adjusted Z)
+    if 'NET_drift' in data:
+        for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
+            if z_name in data:
+                data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
+                
+    if L1_drift is not None:
+        for z_key in z_types:
+            clean_z = z_key.replace("z_comb", "z")
+            if f"L1_{clean_z}" in data:
+                data[f"L1_{clean_z}_modified"] = calc_modified_carry(data[f"L1_{clean_z}"], L1_drift)
+            if f"L2_{clean_z}" in data:
+                data[f"L2_{clean_z}_modified"] = calc_modified_carry(data[f"L2_{clean_z}"], L2_drift)
+            if f"L3_{clean_z}" in data:
+                data[f"L3_{clean_z}_modified"] = calc_modified_carry(data[f"L3_{clean_z}"], L3_drift)
+
+    # C. Divergence & Ratios
     if 'NET_z_pca' in data and 'NET_z_spline' in data:
         data['NET_z_divergence'] = data['NET_z_pca'] - data['NET_z_spline']
         
@@ -352,16 +405,15 @@ def build_flys(pivots, tenors, month_str):
         data['NET_drift_vol_ratio'] = data['NET_drift'] / safe_vol
         data['NET_z_vol_ratio'] = data['NET_z'] / safe_vol
         
-    # Fly Smile (0.5*L + 0.5*R - 1.0*B) using raw Vol
     raw_vol_name = next(c for c in pivots if 'vol_implied' in c and 'exog' in c)
     data['NET_vol_smile'] = (pivots[raw_vol_name].values @ W).ravel()
     
     # --- 4. Metadata & PnL ---
     data['ts'] = idx_time
     data['trade_id'] = np.tile(ids, n_time)
-    data['meta_t1'] = np.tile(t1_arr, n_time)
-    data['meta_t2'] = np.tile(t2_arr, n_time)
-    data['meta_t3'] = np.tile(t3_arr, n_time)
+    data['meta_t1'] = t1
+    data['meta_t2'] = t2
+    data['meta_t3'] = t3
     
     net_rates = pivots['rate'].values @ W
     net_drift = pivots['total_drift_day_cumsum'].values @ W
