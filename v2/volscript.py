@@ -331,8 +331,8 @@ def collect_vols(
 
 def run_all():
     # >>> EDIT THESE <<<
-    ROOT_DIR = r"\\us.bank-dns.com\mspmetro\MN14GL\Derivatives\Mortgage\PolyPathsCSVData"
-    OUT_CSV = r"VolSOFR_1M_concat.csv"
+    ROOT_DIR = "X"
+    OUT_CSV = "X"
 
     # Optional mapping of flattened tickers to your preferred labels
     TICKER_MAP = {
