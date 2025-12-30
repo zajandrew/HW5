@@ -201,43 +201,30 @@ def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], gro
 # 3. EXOGENOUS PROCESSORS (Vol & Auctions)
 # ==============================================================================
 
-def _process_daily_vol_stats(vol_path: Path, tenor_map_rev: Dict[str, float]) -> pd.DataFrame:
+def _process_daily_vol_df(df_vol: pd.DataFrame, tenor_map_rev: Dict[str, float]) -> pd.DataFrame:
     """
-    Loads Daily Vol CSV, Maps Tickers, Calcs Kitchen Sink Stats.
+    Takes the dataframe from volscript.run_all(), maps tickers, calcs stats.
     """
-    if not vol_path.exists():
-        print(f"[{_now()}] [WARN] Vol file not found: {vol_path}. Skipping Vol features.")
-        return pd.DataFrame()
-        
-    try:
-        df = pd.read_csv(vol_path)
-    except Exception as e:
-        print(f"[{_now()}] [ERR] Failed reading Vol CSV: {e}")
-        return pd.DataFrame()
+    if df_vol.empty: return pd.DataFrame()
     
-    # 1. Parse Timestamp (file_modified is usually 6pm NY time in UTC)
-    if 'file_modified' not in df.columns:
-        # Fallback if manual file
-        if 'Date' in df.columns: df['ts_vol'] = pd.to_datetime(df['Date'], utc=True)
-        else: return pd.DataFrame()
+    # 1. Parse Timestamp (file_modified is the reference time)
+    # Ensure UTC
+    if 'file_modified' in df_vol.columns:
+        df_vol['ts_vol'] = pd.to_datetime(df_vol['file_modified'], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
     else:
-        df['ts_vol'] = pd.to_datetime(df['file_modified'], utc=True)
+        return pd.DataFrame() # Can't process without time
     
-    # 2. Map Tickers to Floats
-    df['tenor_yrs'] = df['ticker'].map(tenor_map_rev)
-    df = df.dropna(subset=['tenor_yrs']).sort_values(['tenor_yrs', 'ts_vol'])
+    # 2. Map Tickers
+    df_vol['tenor_yrs'] = df_vol['ticker'].map(tenor_map_rev)
+    df = df_vol.dropna(subset=['tenor_yrs']).sort_values(['tenor_yrs', 'ts_vol'])
     
-    # 3. Rename columns
-    # Assumes CSV has 'Implied Vol' and 'Skew'
+    # 3. Rename
     if 'Implied Vol' in df.columns: df = df.rename(columns={'Implied Vol': 'vol_implied'})
     if 'Skew' in df.columns: df = df.rename(columns={'Skew': 'vol_skew'})
     
-    # 4. Calculate Kitchen Sink Stats (Daily Windows)
-    # 5d (Week), 20d (Month), 60d (Quarter)
+    # 4. Kitchen Sink (Daily Windows)
     vol_windows = [5, 20, 60] 
-    
     features = []
-    # Pass raw levels through
     base_cols = ['ts_vol', 'tenor_yrs', 'vol_implied', 'vol_skew']
     features.append(df[[c for c in base_cols if c in df.columns]])
     
@@ -248,58 +235,85 @@ def _process_daily_vol_stats(vol_path: Path, tenor_map_rev: Dict[str, float]) ->
         
     df_processed = pd.concat(features, axis=1)
     
-    # 5. Add Prefix to all feature columns (except keys)
+    # 5. Prefix
     keys = ['ts_vol', 'tenor_yrs']
     new_cols = {c: f"exog_{c}" for c in df_processed.columns if c not in keys}
     df_processed = df_processed.rename(columns=new_cols)
     
     return df_processed.sort_values('ts_vol')
 
-def _enrich_with_auctions(df_hourly: pd.DataFrame, auc_path: Path, tenor_map_rev: Dict[str, float]) -> pd.DataFrame:
+def _enrich_with_auctions(df_hourly: pd.DataFrame, df_auc: pd.DataFrame, tenor_map_rev: Dict[str, float]) -> pd.DataFrame:
     """
-    Calculates 'hours_to_auction' using merge_asof forward.
+    Calculates 'hours_to_auction' (Tenor Specific).
     """
-    if not auc_path.exists() or df_hourly.empty:
-        df_hourly['hours_to_auction'] = 999.0
-        return df_hourly
-        
-    try:
-        df_auc = pd.read_csv(auc_path)
-    except:
+    if df_auc.empty or df_hourly.empty:
         df_hourly['hours_to_auction'] = 999.0
         return df_hourly
 
-    # Ensure correct column names
-    ts_col = 'Date Time' if 'Date Time' in df_auc.columns else 'timestamp'
-    type_col = 'event_type'
+    # Prep Auction Data
+    ts_col = 'Date Time'
+    type_col = 'event_type' # Contains ticker
     
-    if ts_col not in df_auc.columns: 
-        return df_hourly
+    if ts_col not in df_auc.columns: return df_hourly
 
-    df_auc[ts_col] = pd.to_datetime(df_auc[ts_col], utc=True)
+    # Convert to matching timezone-naive UTC
+    auc_ts = pd.to_datetime(df_auc[ts_col], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    df_auc['ts_auc'] = auc_ts
     
-    # Map auction tickers to floats
+    # Map Tickers
     df_auc['tenor_yrs'] = df_auc[type_col].map(tenor_map_rev)
-    df_auc = df_auc.dropna(subset=['tenor_yrs']).sort_values(ts_col)
+    df_auc = df_auc.dropna(subset=['tenor_yrs']).sort_values('ts_auc')
     
     df_hourly = df_hourly.sort_values('ts')
     
-    # Use merge_asof with 'by' (Exact match on tenor, Nearest Forward match on Time)
+    # Merge Asof (Forward) matching on Tenor
     merged = pd.merge_asof(
         df_hourly,
-        df_auc[[ts_col, 'tenor_yrs']], 
+        df_auc[['ts_auc', 'tenor_yrs']], 
         left_on='ts',
-        right_on=ts_col,
+        right_on='ts_auc',
         by='tenor_yrs',
         direction='forward',
         tolerance=pd.Timedelta(days=30),
         suffixes=('', '_auc')
     )
     
-    # Calculate hours
-    diff = (merged[ts_col] - merged['ts']).dt.total_seconds() / 3600.0
+    diff = (merged['ts_auc'] - merged['ts']).dt.total_seconds() / 3600.0
     df_hourly['hours_to_auction'] = diff.fillna(999.0).values
+    return df_hourly
+
+def _enrich_with_econ(df_hourly: pd.DataFrame, df_eco: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates 'hours_to_econ' (Market Wide / Systemic).
+    Does NOT match on tenor (Econ affects everyone).
+    """
+    if df_eco.empty or df_hourly.empty:
+        df_hourly['hours_to_econ'] = 999.0
+        return df_hourly
+        
+    ts_col = 'Date Time'
+    if ts_col not in df_eco.columns: return df_hourly
     
+    # Prep Eco Data
+    eco_ts = pd.to_datetime(df_eco[ts_col], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    # We only need the timestamps, sorted
+    eco_events = pd.DataFrame({'ts_eco': eco_ts}).sort_values('ts_eco').dropna()
+    
+    df_hourly = df_hourly.sort_values('ts')
+    
+    # Merge Asof (Forward) - No 'by' clause because it's global
+    merged = pd.merge_asof(
+        df_hourly,
+        eco_events,
+        left_on='ts',
+        right_on='ts_eco',
+        direction='forward',
+        tolerance=pd.Timedelta(days=14), # 2 week lookahead max
+        suffixes=('', '_eco')
+    )
+    
+    diff = (merged['ts_eco'] - merged['ts']).dt.total_seconds() / 3600.0
+    df_hourly['hours_to_econ'] = diff.fillna(999.0).values
     return df_hourly
 
 # ==============================================================================
@@ -536,10 +550,8 @@ def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Seri
 # ==============================================================================
 
 def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
-    """
-    PHASE 1: Compute Instantaneous features (Snapshot only).
-    Spline, PCA, Physics.
-    """
+    """PHASE 1: Compute Instantaneous features (Snapshot only)."""
+    # Ensure History has 'ts' column
     if "ts" not in df_history_daily.columns and df_history_daily.index.name == "ts":
         df_history_daily = df_history_daily.reset_index()
 
@@ -556,7 +568,9 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
     halflife_map = {}
     
     out["z_pca"] = pca_z
-    if pca_config['enable']:
+    
+    # Only run PCA if we have history
+    if pca_config['enable'] and not hist_window.empty:
         cols = sorted(out["tenor_yrs"].unique().tolist())
         model = _pca_fit_panel_robust(hist_window, cols, pca_config['n_comps'])
         
@@ -595,6 +609,7 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
     if halflife_map: out["halflife"] = out["tenor_yrs"].map(halflife_map)
     else: out["halflife"] = 999.0 
     
+    # Robust Scale Logic
     raw_scale = 0.01
     if np.isfinite(pca_scale) and pca_scale > 1e-6:
         raw_scale = pca_scale
@@ -613,19 +628,27 @@ def build_month(yymm: str) -> None:
 
     # --- 1. CONFIG & EXOG SETUP ---
     tenor_dict = getattr(cr, "TENOR_YEARS", {})
-    # Map for Vol/Auctions (String -> Float)
     tenor_map_rev = {k: float(v) for k, v in tenor_dict.items()}
-    # Fallback map for common tickers if config differs
-    for t_str in ["2Y", "5Y", "10Y", "30Y"]:
-        if t_str not in tenor_map_rev:
-             pass
 
-    # --- 2. PREP EXOG DATA (Context) ---
-    print(f"[{_now()}] [PREP] Processing Volatility & Auctions...")
-    path_vol = Path("VolSOFR_1M_concat.csv") 
-    path_auc = Path("auc_data.csv")
+    # --- 2. GENERATE EXTERNAL DATA (Live) ---
+    print(f"[{_now()}] [PREP] Running Volatility & Eco Generators...")
     
-    df_vol_daily = _process_daily_vol_stats(path_vol, tenor_map_rev)
+    df_vol_daily = pd.DataFrame()
+    df_eco_raw = pd.DataFrame()
+    df_auc_raw = pd.DataFrame()
+
+    try:
+        # Run Vol Script
+        df_vol_raw = volscript.run_all() 
+        df_vol_daily = _process_daily_vol_df(df_vol_raw, tenor_map_rev)
+    except Exception as e:
+        print(f"[WARN] Volatility Generation Failed: {e}")
+
+    try:
+        # Run Eco Script (Returns Tuple: Eco, Auc)
+        df_eco_raw, df_auc_raw = ecoscript.run_all()
+    except Exception as e:
+        print(f"[WARN] Eco/Auction Generation Failed: {e}")
 
     # --- 3. LOAD RATES ---
     in_path = path_data / f"{yymm}.parquet"
@@ -655,11 +678,10 @@ def build_month(yymm: str) -> None:
     # --- 5. MERGE VOLATILITY (Look-Back Safety) ---
     if not df_vol_daily.empty:
         print(f"[{_now()}] [MERGE] Integrating Volatility (Backward Asof)...")
-        # Ensure Types match
         df_hourly['tenor_yrs'] = df_hourly['tenor_yrs'].astype(float)
         df_vol_daily['tenor_yrs'] = df_vol_daily['tenor_yrs'].astype(float)
         
-        # Backward merge: Finds the last available Close <= Hourly Time
+        # Merge Asof: Matches hourly TS to the most recent previous Vol Close
         df_hourly = pd.merge_asof(
             df_hourly.sort_values('ts'),
             df_vol_daily.sort_values('ts_vol'),
@@ -670,7 +692,7 @@ def build_month(yymm: str) -> None:
             tolerance=pd.Timedelta(days=7) 
         ).drop(columns=['ts_vol'])
 
-    # --- 6. HISTORY CONTEXT (For Phase 1 PCA/Hurst) ---
+    # --- 6. HISTORY CONTEXT (For Phase 1 PCA) ---
     df_past_history = pd.DataFrame()
     try:
         prev_dt = datetime.datetime.strptime(yymm, "%y%m") - relativedelta(months=1)
@@ -707,13 +729,11 @@ def build_month(yymm: str) -> None:
 
     df_instant = pd.concat(parts, ignore_index=True).sort_values(['ts','tenor_yrs'])
 
-    # --- 8. PHASE 2: HOURLY REGIME & DRIFT ACCRUAL (Vectorized + Warm Start) ---
-    print(f"[{_now()}] [PHASE 2] Calculating Hourly Rolling Stats & Accruals...")
+    # --- 8. PHASE 2: ROLLING STATS (With Warm Start) ---
+    print(f"[{_now()}] [PHASE 2] Calculating Rolling Stats & Accruals...")
     
-    # --- A. WARM START LOGIC ---
-    # Load tail of previous month to ensure rolling stats (e.g. 50h avg) and Drift CumSum 
-    # don't start at 0/NaN on the 1st of the month.
-    MAX_LOOKBACK_HRS = 120  # 5 Day Buffer (Covers 50h window + weekend)
+    # A. WARM START BUFFER
+    MAX_LOOKBACK_HRS = 120 # 5 Days
     df_prev_tail = pd.DataFrame()
     drift_offsets = {}
     
@@ -724,41 +744,38 @@ def build_month(yymm: str) -> None:
         prev_enh_path = path_enh / f"{prev_yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
 
         if prev_enh_path.exists():
-            # Load Previous Month
             df_prev = pd.read_parquet(prev_enh_path)
             
-            # 1. Capture Drift Offsets (The Final Value of the previous month)
-            # We will add this to the current month's accumulated drift
+            # 1. Capture Drift Offsets
             for d_col in ['total_drift_day', 'carry_bps_day', 'roll_bps_day']:
                 cs_col = d_col.replace('_day', '_cumsum')
                 if cs_col in df_prev.columns:
-                    # Get the last valid cumulative value for each tenor
                     drift_offsets[cs_col] = df_prev.groupby('tenor_yrs')[cs_col].last().to_dict()
 
-            # 2. Slice Tail for Rolling Stats
+            # 2. Slice Tail
             last_ts = df_prev['ts'].max()
             start_buffer = last_ts - pd.Timedelta(hours=MAX_LOOKBACK_HRS)
-            # Only keep columns present in current instant to avoid mismatch
             common_cols = [c for c in df_instant.columns if c in df_prev.columns]
             df_prev_tail = df_prev[df_prev['ts'] > start_buffer][common_cols].copy()
-            
-    except Exception as e:
-        print(f"[{_now()}] [WARN] Warm Start Load Failed: {e}")
+    except: pass
 
-    # --- B. CONCATENATE BUFFER ---
+    # B. CONCAT
     if not df_prev_tail.empty:
-        # Stitch Past Tail + Current Month
         df_full_hourly = pd.concat([df_prev_tail, df_instant], ignore_index=True)
     else:
         df_full_hourly = df_instant.copy()
-    
     df_full_hourly = df_full_hourly.sort_values(['tenor_yrs', 'ts'])
 
-    # --- C. CALCULATE FEATURES (Kitchen Sink) ---
+    # C. KITCHEN SINK (Including Rate!)
+    # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
     target_cols = ['rate', 'z_comb', 'z_pca', 'z_spline', 'total_drift_day', 'dv01']
-    hourly_windows = [5, 10, 50] 
+    
+    # Also include Vol/Skew if they exist
+    if 'exog_vol_implied' in df_full_hourly.columns: target_cols.append('exog_vol_implied')
+    if 'exog_vol_skew' in df_full_hourly.columns: target_cols.append('exog_vol_skew')
     
     features = [df_full_hourly]
+    hourly_windows = [5, 10, 50]
     
     for col in target_cols:
         if col in df_full_hourly.columns:
@@ -766,45 +783,39 @@ def build_month(yymm: str) -> None:
             features.append(stats)
             
     df_final_buffered = pd.concat(features, axis=1)
+    # Remove duplicate columns
     df_final_buffered = df_final_buffered.loc[:, ~df_final_buffered.columns.duplicated()]
-    
-    # --- D. DRIFT ACCRUAL ---
-    # Calc Time Elapsed
+
+    # D. DRIFT ACCRUAL & OFFSET
     df_final_buffered['hours_elapsed'] = df_final_buffered.groupby('tenor_yrs')['ts'].diff().dt.total_seconds() / 3600.0
     df_final_buffered['hours_elapsed'] = df_final_buffered['hours_elapsed'].fillna(1.0)
     
     for d_col in ['carry_bps_day', 'roll_bps_day', 'total_drift_day']:
         if d_col in df_final_buffered.columns:
-            # Accrued
             accrued_col = d_col.replace('_day', '_accrued')
-            df_final_buffered[accrued_col] = (df_final_buffered[d_col] / 24.0) * df_final_buffered['hours_elapsed']
-            
-            # CumSum (Resetting at start of buffer)
             cumsum_col = d_col.replace('_day', '_cumsum')
+            
+            df_final_buffered[accrued_col] = (df_final_buffered[d_col] / 24.0) * df_final_buffered['hours_elapsed']
             df_final_buffered[cumsum_col] = df_final_buffered.groupby('tenor_yrs')[accrued_col].cumsum().fillna(0.0)
-
-            # --- E. APPLY DRIFT OFFSETS ---
-            # Add the final value of M-1 to the M cumsum to make it continuous
+            
+            # Apply Offset from Prev Month
             if cumsum_col in drift_offsets:
-                # Map offsets to the dataframe
                 offset_series = df_final_buffered['tenor_yrs'].map(drift_offsets[cumsum_col]).fillna(0.0)
-                
-                # However, we only want to apply this offset to the CURRENT month rows, 
-                # because the Buffer rows (from prev month) already had their history.
-                # BUT, since we recalculated CumSum from the start of the Buffer (0), 
-                # the Buffer rows are now effectively 0-indexed relative to buffer start.
-                # So we simply add the M-1 End Value to EVERYTHING in this new set.
-                # This restores the absolute level for the buffer, and continues it for M.
                 df_final_buffered[cumsum_col] += offset_series
 
-    # --- F. SLICE TO CURRENT MONTH ---
-    # Discard the buffer rows, keep only this month's data
+    # E. SLICE TO CURRENT MONTH
     min_ts_current = df_instant['ts'].min()
     df_final = df_final_buffered[df_final_buffered['ts'] >= min_ts_current].copy()
 
-    # --- 9. MERGE AUCTIONS (Final Step) ---
-    print(f"[{_now()}] [MERGE] Integrating Auction Countdowns...")
-    df_final = _enrich_with_auctions(df_final, path_auc, tenor_map_rev)
+    # --- 9. MERGE EVENTS (Events & Econ) ---
+    print(f"[{_now()}] [MERGE] Integrating Events (Auctions & Econ)...")
+    
+    # A. Auctions (Tenor Specific)
+    df_final = _enrich_with_auctions(df_final, df_auc_raw, tenor_map_rev)
+    
+    # B. Econ (Market Wide)
+    # Note: df_eco_raw comes from ecoscript.run_all()
+    df_final = _enrich_with_econ(df_final, df_eco_raw)
 
     # --- 10. SAVE ---
     out_name = f"{yymm}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
@@ -812,8 +823,6 @@ def build_month(yymm: str) -> None:
     
     if not df_final.empty and 'z_comb' in df_final.columns:
         df_final.to_parquet(out_path, index=False)
-        
-        # Save Daily Summary for next month's history
         df_daily.to_parquet(path_enh / f"{yymm}_summary_D.parquet", index=False)
         
         zr = pd.to_numeric(df_final['z_comb'], errors='coerce')
@@ -821,10 +830,9 @@ def build_month(yymm: str) -> None:
         print(f"[DONE] {yymm} -> {out_path} (Rows: {len(df_final)}, Valid Z: {valid_pct:.1f}%)")
     else:
         print(f"[WARN] {yymm} produced EMPTY output.")
-        
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python feature_creation.py 2304")
-        sys.exit(1)
     for m in sys.argv[1:]:
         build_month(m)
