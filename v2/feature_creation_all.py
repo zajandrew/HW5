@@ -396,8 +396,9 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
 
 def _calc_hurst_rs(series: np.ndarray, min_chunk: int = 8) -> float:
     """
-    Hurst Exponent (R/S Analysis).
-    H < 0.5: Mean Reverting. H > 0.5: Trending.
+    Hurst Exponent (Rescaled Range Analysis).
+    0.0 < H < 0.5: Mean Reverting.
+    0.5 < H < 1.0: Trending.
     """
     series = np.array(series)
     N = len(series)
@@ -433,8 +434,8 @@ def _calc_hurst_rs(series: np.ndarray, min_chunk: int = 8) -> float:
 
 def _calc_ou_halflife(series: np.ndarray) -> Tuple[float, float]:
     """
-    Ornstein-Uhlenbeck Half-Life.
-    Returns (HalfLife_Days, R_Squared).
+    Ornstein-Uhlenbeck Half-Life via Regression.
+    Returns: (HalfLife_Days, R_Squared)
     """
     if len(series) < 10: return (np.nan, 0.0)
     
@@ -450,8 +451,9 @@ def _calc_ou_halflife(series: np.ndarray) -> Tuple[float, float]:
     if denominator == 0: return (np.nan, 0.0)
     
     beta = numerator / denominator
-    alpha = y_mean - beta * x_mean
     
+    # Calculate R2
+    alpha = y_mean - beta * x_mean
     y_pred = alpha + beta * x
     ss_res = np.sum((y - y_pred)**2)
     ss_tot = np.sum((y - y_mean)**2)
