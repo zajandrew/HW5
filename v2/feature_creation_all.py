@@ -235,8 +235,12 @@ def _process_daily_vol_df(df_vol: pd.DataFrame, tenor_map_rev: Dict[str, float])
     df = df_vol.dropna(subset=['tenor_yrs']).sort_values(['tenor_yrs', 'ts_vol'])
     
     # 3. Rename
-    if 'Implied Vol' in df.columns: df = df.rename(columns={'Implied Vol': 'vol_implied'})
-    if 'Skew' in df.columns: df = df.rename(columns={'Skew': 'vol_skew'})
+    if 'Implied Vol' in df.columns: 
+        df = df.rename(columns={'Implied Vol': 'vol_implied'})
+        df['vol_implied'] = pd.to_numeric(df['vol_implied'], errors='coerce')
+    if 'Skew' in df.columns: 
+        df = df.rename(columns={'Skew': 'vol_skew'})
+        df['vol_skew'] = pd.to_numeric(df['vol_skew'], errors='coerce')
     
     # 4. Kitchen Sink (Daily Windows)
     vol_windows = [5, 20, 60] 
