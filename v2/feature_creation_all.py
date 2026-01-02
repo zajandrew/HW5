@@ -530,21 +530,24 @@ def _pca_fit_panel_robust(panel_long: pd.DataFrame, cols_ordered: List[float], n
         "hist_resid_z": resid_z 
     }
 
-def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Series, float]:
+def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Series, float, Dict[str, Any]]:
     """
-    Applies PCA using LIVE SHOCK (Current - Prev Close).
+    Applies PCA and extracts Regime (Vol/Drift) and State (Factors/Error) features.
     """
     out = pd.Series(index=df_hourly.index, dtype=float)
     scale = np.nan
+    extras = {} # New container for meta features
     
-    if not pca_model or df_hourly.empty: return out, scale
+    if not pca_model or df_hourly.empty: return out, scale, extras
 
     cols = pca_model["cols"]
+    # Reindex ensures we align with the model's structure
     snap = df_hourly.set_index("tenor_yrs")["rate"].reindex(cols)
-    if snap.isnull().any(): return out, scale 
+    if snap.isnull().any(): return out, scale, extras 
 
     current_level = snap.values.astype(float)
     
+    # 1. Calculate Core Signal
     live_diff = current_level - pca_model["last_level"]
     live_z_input = (live_diff - pca_model["mean_diff"]) / pca_model["sigma_diff"]
     
@@ -552,14 +555,35 @@ def _pca_apply_hybrid(df_hourly: pd.DataFrame, pca_model: dict) -> Tuple[pd.Seri
     recon_z_move = pca_model["components"].T @ factors
     resid_z = live_z_input - recon_z_move
     
+    # 2. Robust Scaling (Existing Logic)
     med = np.median(resid_z)
     mad = np.median(np.abs(resid_z - med))
     scale = (1.4826 * mad) if mad > 0 else np.std(resid_z, ddof=1)
     if scale < 1e-4: scale = 0.01
     
     final_z = (resid_z - resid_z.mean()) / scale
+    out_series = df_hourly["tenor_yrs"].map(dict(zip(cols, final_z)))
+
+    # --- NEW: Extract Meta Features ---
     
-    return df_hourly["tenor_yrs"].map(dict(zip(cols, final_z))), scale
+    # A. Regime Features (Vector Mapped to Tenor)
+    # These tell the model "What is normal volatility/drift for THIS tenor?"
+    # We map the model arrays back to the dataframe index
+    extras["pca_vol_regime"] = df_hourly["tenor_yrs"].map(dict(zip(cols, pca_model["sigma_diff"])))
+    extras["pca_drift_regime"] = df_hourly["tenor_yrs"].map(dict(zip(cols, pca_model["mean_diff"])))
+
+    # B. State Features (Scalars applied to entire timestamp)
+    # Factor Scores (Level, Slope, Curve)
+    for i, score in enumerate(factors):
+        extras[f"pca_factor_{i}"] = float(score)
+        
+    # Reconstruction Error (Q-Statistic / "Weirdness")
+    extras["pca_error_norm"] = float(np.linalg.norm(resid_z))
+    
+    # Confidence (Explained Variance)
+    extras["pca_evr_sum"] = float(np.sum(pca_model["evr"]))
+
+    return out_series, scale, extras
 
 # ==============================================================================
 # 5. ORCHESTRATORS (The Build Process)
@@ -592,8 +616,13 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
         
         if model:
             # A. Live PCA Signal
-            pca_z, pca_scale = _pca_apply_hybrid(out, model)
+            pca_z, pca_scale, pca_extras = _pca_apply_hybrid(out, model)
             out["z_pca"] = pca_z
+            
+            # Loop through extras and assign to DataFrame
+            # Scalars (Factors) will broadcast automatically; Series (Regime) will align
+            for k, v in pca_extras.items():
+                out[k] = v
             
             # B. Hurst/OU on Historical Residuals
             resid_hist = model["hist_resid_z"]
