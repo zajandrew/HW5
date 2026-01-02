@@ -140,66 +140,72 @@ def _make_decision_buckets(df_long: pd.DataFrame, freq: str, mode: str = 'head')
 def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], group_col: str = 'tenor_yrs') -> pd.DataFrame:
     """
     Applies rolling stats. 
-    ROBUSTNESS UPDATE: Uses an internal index reset + .values assignment to guarantees
-    no 'incompatible index' crashes regardless of input dataframe state.
+    Robust implementation: Decouples math from index to prevent alignment errors.
     """
-    # 1. Create Output Container (Retains Original Index)
+    # 1. Setup Output with Original Index
     res = pd.DataFrame(index=df.index)
     
-    # 2. Create Internal Calculation Frame (Clean 0..N Index)
-    # This prevents pandas form trying to align mismatched indices during calc.
-    local_df = df.copy().reset_index(drop=True)
-    grp = local_df.groupby(group_col)[col]
+    # 2. Internal Working Frame (RangeIndex 0..N)
+    # We use this for all groupby/shift operations to guarantee alignment
+    work_df = df[[col, group_col]].copy().reset_index(drop=True)
+    grp = work_df.groupby(group_col)[col]
+    
+    # Pre-extract numpy array for raw values to avoid Series overhead/alignment issues
+    raw_values = work_df[col].values
     
     for w in windows:
         suffix = f"{w}d" if "exog" in col else f"{w}b" 
         
         # --- A. KINETICS ---
+        # Note: grp.shift(w) returns a Series aligned to work_df.index (RangeIndex)
         shift_w = grp.shift(w)
         
         # Slope: (Current - Old) / Window
-        col_slope = f"{col}_slope_{suffix}"
-        # Calculations happen on clean 'local_df' indices
-        slope_series = (local_df[col] - shift_w) / w
+        # We use .values on shift_w to ensure numpy subtraction (safe)
+        slope_arr = (raw_values - shift_w.values) / w
         
         # Accel: Slope - Slope_Old
-        shift_w_half = slope_series.groupby(local_df[group_col]).shift(w // 2)
-        accel_series = slope_series - shift_w_half
+        # We need to wrap slope in a Series (with work_df's grouping) to shift it correctly
+        slope_series = pd.Series(slope_arr, index=work_df.index)
+        shift_w_half = slope_series.groupby(work_df[group_col]).shift(w // 2)
+        accel_arr = slope_arr - shift_w_half.values
 
         # --- B. DISTRIBUTION ---
         roll = grp.rolling(w)
         
-        mean_val = roll.mean()
-        std_val  = roll.std()
-        max_val  = roll.max()
-        min_val  = roll.min()
+        mean_val = roll.mean().values
+        std_val  = roll.std().values
+        max_val  = roll.max().values
+        min_val  = roll.min().values
         
-        # --- C. DERIVED ---
+        # --- C. DERIVED (Numpy Math) ---
         max_abs = np.maximum(np.abs(max_val), np.abs(min_val))
-        z_local = (local_df[col] - mean_val) / (std_val + 1e-8)
-        rng_pos = (local_df[col] - min_val) / ((max_val - min_val) + 1e-8)
+        z_local = (raw_values - mean_val) / (std_val + 1e-8)
+        rng_pos = (raw_values - min_val) / ((max_val - min_val) + 1e-8)
         
         # --- D. QUANTILES ---
-        q25 = roll.quantile(0.25)
-        q75 = roll.quantile(0.75)
+        q25 = roll.quantile(0.25).values
+        q75 = roll.quantile(0.75).values
 
-        # --- ASSIGNMENT (THE FIX) ---
-        # We assign using .values to force alignment by position.
-        # Since local_df is just df with reset index, rows align 1-to-1.
-        res[col_slope] = slope_series.values
-        res[f"{col}_accel_{suffix}"] = accel_series.values
+        # --- ASSIGNMENT ---
+        # Direct numpy assignment to the result DataFrame
+        # Since res has same length as work_df, this aligns by position
+        # and ignores any index mismatches.
+        col_slope = f"{col}_slope_{suffix}"
+        res[col_slope] = slope_arr
+        res[f"{col}_accel_{suffix}"] = accel_arr
         
-        res[f"{col}_mean_{suffix}"] = mean_val.values
-        res[f"{col}_std_{suffix}"]  = std_val.values
-        res[f"{col}_max_{suffix}"]  = max_val.values
-        res[f"{col}_min_{suffix}"]  = min_val.values
+        res[f"{col}_mean_{suffix}"] = mean_val
+        res[f"{col}_std_{suffix}"]  = std_val
+        res[f"{col}_max_{suffix}"]  = max_val
+        res[f"{col}_min_{suffix}"]  = min_val
         
-        res[f"{col}_max_abs_{suffix}"] = max_abs.values
-        res[f"{col}_zlocal_{suffix}"] = z_local.values
-        res[f"{col}_rng_pos_{suffix}"] = rng_pos.values
+        res[f"{col}_max_abs_{suffix}"] = max_abs
+        res[f"{col}_zlocal_{suffix}"] = z_local
+        res[f"{col}_rng_pos_{suffix}"] = rng_pos
         
-        res[f"{col}_q25_{suffix}"] = q25.values
-        res[f"{col}_q75_{suffix}"] = q75.values
+        res[f"{col}_q25_{suffix}"] = q25
+        res[f"{col}_q75_{suffix}"] = q75
         
     return res
 
