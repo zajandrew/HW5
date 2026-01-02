@@ -380,26 +380,31 @@ def _calc_physics_features(snap_df: pd.DataFrame) -> pd.DataFrame:
         
     return pd.DataFrame(results)
 
-def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
+def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, pd.Series, float]:
     """
-    SIGNAL ENGINE: Fits a SMOOTHING spline (UnivariateSpline).
-    Returns Residuals (Z-Scores) and Scale.
+    SIGNAL ENGINE: Fits a SMOOTHING spline.
+    Returns: Z-Scores, Curvature (Wiggle), and Scale.
     """
-    out = pd.Series(np.nan, index=snap_long.index, dtype=float)
+    out_z = pd.Series(np.nan, index=snap_long.index, dtype=float)
+    out_curv = pd.Series(0.0, index=snap_long.index, dtype=float) # Default 0 curvature
     DEFAULT_SCALE = 0.05 
 
     snap_long_temp = snap_long[["tenor_yrs", "rate"]]
     s_fit = snap_long_temp[snap_long_temp["tenor_yrs"] >= 0.0].dropna().sort_values("tenor_yrs")
-    if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
+    if s_fit.shape[0] < 5: return out_z, out_curv, DEFAULT_SCALE
 
     x = s_fit["tenor_yrs"].values.astype(float)
     y = s_fit["rate"].values.astype(float)
     
     try:
-        # s=1e-2 preserves local microstructure ("wiggles") for RV trading
+        # s=1e-2 preserves local microstructure
         spl = UnivariateSpline(x, y, k=3, s=1e-2)
         fit = spl(x)
         resid = y - fit
+        
+        # --- CALC CURVATURE (Wiggle Detector) ---
+        # 2nd Derivative at each tenor point
+        d2 = [spl.derivatives(t)[2] for t in x]
         
         # Robust MAD Scale
         med = np.median(resid)
@@ -409,11 +414,17 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
         
         # Z-score
         z = (resid - resid.mean()) / scale
-        m = {ten: val for ten, val in zip(x, z)}
-        out.loc[s_fit.index] = s_fit["tenor_yrs"].map(m).values
-        return out, scale
+        
+        # Map back to Series
+        m_z = {ten: val for ten, val in zip(x, z)}
+        m_c = {ten: val for ten, val in zip(x, d2)}
+        
+        out_z.loc[s_fit.index] = s_fit["tenor_yrs"].map(m_z).values
+        out_curv.loc[s_fit.index] = s_fit["tenor_yrs"].map(m_c).values
+        
+        return out_z, out_curv, scale
     except:
-        return out, DEFAULT_SCALE
+        return out_z, out_curv, DEFAULT_SCALE
 
 def _calc_hurst_rs(series: np.ndarray, min_chunk: int = 8) -> float:
     """
@@ -641,8 +652,10 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
                     halflife_map[tenor] = hl
 
     # 3. Spline (Intraday)
-    z_spline, spline_scale = _spline_fit_safe(out)
+    # Updated to unpack curvature
+    z_spline, spline_curv, spline_scale = _spline_fit_safe(out)
     out["z_spline"] = z_spline
+    out["spline_curvature"] = spline_curv
     
     # 4. Physics (Drift)
     df_phys = _calc_physics_features(out)
@@ -665,6 +678,30 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
     out["spline_scale"] = spline_scale
     out["scale"] = out[["pca_scale", "spline_scale"]].mean(axis=1)
     out["z_comb"] = out[["z_pca", "z_spline"]].mean(axis=1)
+
+    # 1. Define the targets
+    z_targets = ['z_comb', 'z_pca', 'z_spline']
+    
+    # 2. Pre-calculate Carry (fill NaNs once)
+    _c = out['carry_bps_day'].fillna(0.0)
+    
+    # 3. Vectorized Sigmoid Helper
+    def get_sigmoid_signal(z_series):
+        # Clip to prevent overflow, though numpy handles it well
+        z_safe = np.clip(z_series.fillna(0.0), -10, 10)
+        return 2.0 / (1.0 + np.exp(-z_safe))
+
+    for z_col in z_targets:
+        if z_col in out.columns:
+            # A. Modified Carry: Carry * Sigmoid(Z)
+            # "How much carry do I get, weighted by how much the model likes the trade?"
+            sig_val = get_sigmoid_signal(out[z_col])
+            out[f'{z_col}_mod_drift'] = _c * sig_val
+            
+            # B. Conflict Flag: Sign(Carry) * Sign(Z)
+            # +1.0 = Tailwind (Paid to take the trade)
+            # -1.0 = Headwind (Paying to take the trade / "Negative Carry Convergence")
+            out[f'{z_col}_conflict'] = np.sign(_c) * np.sign(out[z_col].fillna(0.0))
     
     return out
 
@@ -815,9 +852,16 @@ def build_month(yymm: str) -> None:
 
     # C. KITCHEN SINK (Including Rate!)
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
-    target_cols = ['rate', 'z_comb', 'z_pca', 'z_spline', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
-                  'pca_vol_regime', 'pca_drift_regime', 'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm',
-                  'hurst', 'halflife', 'pca_scale', 'spline_scale', 'scale']
+   base_targets = ['rate', 'z_comb', 'z_pca', 'z_spline', 
+                   'spline_curvature', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
+                   'pca_vol_regime', 'pca_drift_regime', 
+                   'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm',
+                   'hurst', 'halflife', 'pca_scale', 'spline_scale', 'scale']
+
+    derived_targets = [c for c in df_full_hourly.columns 
+                       if '_mod_drift' in c or '_conflict' in c]
+                       
+    target_cols = base_targets + derived_targets
     
     features = [df_full_hourly]
     hourly_windows = [2, 5, 10, 50]
