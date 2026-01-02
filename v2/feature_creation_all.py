@@ -243,7 +243,7 @@ def _process_daily_vol_df(df_vol: pd.DataFrame, tenor_map_rev: Dict[str, float])
         df['vol_skew'] = pd.to_numeric(df['vol_skew'], errors='coerce')
     
     # 4. Kitchen Sink (Daily Windows)
-    vol_windows = [5, 20, 60] 
+    vol_windows = [2, 5, 20, 60] 
     features = []
     base_cols = ['ts_vol', 'tenor_yrs', 'vol_implied', 'vol_skew']
     features.append(df[[c for c in base_cols if c in df.columns]])
@@ -872,9 +872,7 @@ def build_month(yymm: str) -> None:
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
    base_targets = ['rate', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
                    'spline_curvature', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
-                   'pca_vol_regime', 'pca_drift_regime', 
-                   'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm',
-                   'hurst', 'halflife', 'pca_scale', 'spline_scale', 'scale']
+                   'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm', 'pca_scale', 'spline_scale', 'scale']
 
     derived_targets = [c for c in df_full_hourly.columns 
                        if '_mod_drift' in c or '_conflict' in c]
