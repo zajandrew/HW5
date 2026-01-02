@@ -139,17 +139,19 @@ def _make_decision_buckets(df_long: pd.DataFrame, freq: str, mode: str = 'head')
 
 def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], group_col: str = 'tenor_yrs') -> pd.DataFrame:
     """
-    Applies the "Kitchen Sink" rolling stats to any feature column.
-    Generates: Slope, Accel, Mean, Std, Max, Min, MaxAbs, ZLocal, RangePos, Quantiles.
+    Applies rolling stats. 
+    ROBUSTNESS UPDATE: Uses an internal index reset + .values assignment to guarantees
+    no 'incompatible index' crashes regardless of input dataframe state.
     """
-    # Create a holder for results to avoid fragmentation
+    # 1. Create Output Container (Retains Original Index)
     res = pd.DataFrame(index=df.index)
     
-    # Pre-calculate GroupBy object for speed
-    grp = df.groupby(group_col)[col]
+    # 2. Create Internal Calculation Frame (Clean 0..N Index)
+    # This prevents pandas form trying to align mismatched indices during calc.
+    local_df = df.copy().reset_index(drop=True)
+    grp = local_df.groupby(group_col)[col]
     
     for w in windows:
-        # 'd' suffix for Daily Vol, 'b' suffix for Hourly Buckets
         suffix = f"{w}d" if "exog" in col else f"{w}b" 
         
         # --- A. KINETICS ---
@@ -157,12 +159,12 @@ def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], gro
         
         # Slope: (Current - Old) / Window
         col_slope = f"{col}_slope_{suffix}"
-        res[col_slope] = (df[col] - shift_w) / w
+        # Calculations happen on clean 'local_df' indices
+        slope_series = (local_df[col] - shift_w) / w
         
-        # Accel: Slope - Slope_Old (Half window shift)
-        slope_series = (df[col] - shift_w) / w
-        shift_w_half = slope_series.groupby(df[group_col]).shift(w // 2)
-        res[f"{col}_accel_{suffix}"] = slope_series - shift_w_half
+        # Accel: Slope - Slope_Old
+        shift_w_half = slope_series.groupby(local_df[group_col]).shift(w // 2)
+        accel_series = slope_series - shift_w_half
 
         # --- B. DISTRIBUTION ---
         roll = grp.rolling(w)
@@ -172,28 +174,32 @@ def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], gro
         max_val  = roll.max()
         min_val  = roll.min()
         
+        # --- C. DERIVED ---
+        max_abs = np.maximum(np.abs(max_val), np.abs(min_val))
+        z_local = (local_df[col] - mean_val) / (std_val + 1e-8)
+        rng_pos = (local_df[col] - min_val) / ((max_val - min_val) + 1e-8)
+        
+        # --- D. QUANTILES ---
+        q25 = roll.quantile(0.25)
+        q75 = roll.quantile(0.75)
+
+        # --- ASSIGNMENT (THE FIX) ---
+        # We assign using .values to force alignment by position.
+        # Since local_df is just df with reset index, rows align 1-to-1.
+        res[col_slope] = slope_series.values
+        res[f"{col}_accel_{suffix}"] = accel_series.values
+        
         res[f"{col}_mean_{suffix}"] = mean_val.values
         res[f"{col}_std_{suffix}"]  = std_val.values
         res[f"{col}_max_{suffix}"]  = max_val.values
         res[f"{col}_min_{suffix}"]  = min_val.values
         
-        # --- C. DERIVED METRICS ---
+        res[f"{col}_max_abs_{suffix}"] = max_abs.values
+        res[f"{col}_zlocal_{suffix}"] = z_local.values
+        res[f"{col}_rng_pos_{suffix}"] = rng_pos.values
         
-        # 1. Max Abs (Stress Detector: How far from 0 did we get?)
-        res[f"{col}_max_abs_{suffix}"] = np.maximum(np.abs(max_val), np.abs(min_val))
-        
-        # 2. Local Z-Score (Regime Normalization)
-        # (Current - RollingMean) / RollingStd
-        res[f"{col}_zlocal_{suffix}"] = (df[col] - mean_val) / (std_val + 1e-8)
-        
-        # 3. Range Position (Stochastic Oscillator 0-1)
-        rng = max_val - min_val
-        res[f"{col}_rng_pos_{suffix}"] = (df[col] - min_val) / (rng + 1e-8)
-
-        # --- D. QUANTILES ---
-        # Critical for defining regimes (e.g., Top Quartile Volatility)
-        res[f"{col}_q25_{suffix}"] = roll.quantile(0.25).values
-        res[f"{col}_q75_{suffix}"] = roll.quantile(0.75).values
+        res[f"{col}_q25_{suffix}"] = q25.values
+        res[f"{col}_q75_{suffix}"] = q75.values
         
     return res
 
