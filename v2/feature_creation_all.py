@@ -387,8 +387,9 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     """
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
-    
-    s_fit = snap_long[snap_long["tenor_yrs"] >= 0.0].dropna().sort_values("tenor_yrs")
+
+    snap_long_temp = snap_long[["tenor_yrs", "rate"]]
+    s_fit = snap_long_temp[snap_long_temp["tenor_yrs"] >= 0.0].dropna().sort_values("tenor_yrs")
     if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
 
     x = s_fit["tenor_yrs"].values.astype(float)
@@ -660,14 +661,9 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
     if halflife_map: out["halflife"] = out["tenor_yrs"].map(halflife_map)
     else: out["halflife"] = 999.0 
     
-    # Robust Scale Logic
-    raw_scale = 0.01
-    if np.isfinite(pca_scale) and pca_scale > 1e-6:
-        raw_scale = pca_scale
-    elif np.isfinite(spline_scale):
-        raw_scale = spline_scale
-        
-    out["scale"] = raw_scale
+    out["pca_scale"] = pca_scale
+    out["spline_scale"] = spline_scale
+    out["scale"] = out[["pca_scale", "spline_scale"]].mean(axis=1)
     out["z_comb"] = out[["z_pca", "z_spline"]].mean(axis=1)
     
     return out
@@ -819,14 +815,12 @@ def build_month(yymm: str) -> None:
 
     # C. KITCHEN SINK (Including Rate!)
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
-    target_cols = ['rate', 'z_comb', 'z_pca', 'z_spline', 'total_drift_day', 'dv01']
-    
-    # Also include Vol/Skew if they exist
-    if 'exog_vol_implied' in df_full_hourly.columns: target_cols.append('exog_vol_implied')
-    if 'exog_vol_skew' in df_full_hourly.columns: target_cols.append('exog_vol_skew')
+    target_cols = ['rate', 'z_comb', 'z_pca', 'z_spline', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
+                  'pca_vol_regime', 'pca_drift_regime', 'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm',
+                  'hurst', 'halflife', 'pca_scale', 'spline_scale', 'scale']
     
     features = [df_full_hourly]
-    hourly_windows = [5, 10, 50]
+    hourly_windows = [2, 5, 10, 50]
     
     for col in target_cols:
         if col in df_full_hourly.columns:
@@ -873,6 +867,7 @@ def build_month(yymm: str) -> None:
     out_path = path_enh / out_name
     
     if not df_final.empty and 'z_comb' in df_final.columns:
+        df_final = df_final.fillna(0.0)
         df_final.to_parquet(out_path, index=False)
         df_daily.to_parquet(path_enh / f"{yymm}_summary_D.parquet", index=False)
         
