@@ -662,7 +662,7 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
         raw_scale = spline_scale
         
     out["scale"] = raw_scale
-    out["z_comb"] = out[["z_pca", "z_spline"]].mean(axis=1).fillna(0.0)
+    out["z_comb"] = out[["z_pca", "z_spline"]].mean(axis=1)
     
     return out
 
