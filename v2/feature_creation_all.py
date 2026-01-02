@@ -29,6 +29,8 @@ import QuantLib as ql
 # --- CUSTOM IMPORTS ---
 import config as cr
 import math_core as mc  # Physics Core
+import volscript as vs
+import ecoscript as ec
 
 # ==============================================================================
 # 1. UTILITIES & CLEANING
@@ -684,14 +686,14 @@ def build_month(yymm: str) -> None:
 
     try:
         # Run Vol Script
-        df_vol_raw = volscript.run_all() 
+        df_vol_raw = vs.run_all() 
         df_vol_daily = _process_daily_vol_df(df_vol_raw, tenor_map_rev)
     except Exception as e:
         print(f"[WARN] Volatility Generation Failed: {e}")
 
     try:
         # Run Eco Script (Returns Tuple: Eco, Auc)
-        df_eco_raw, df_auc_raw = ecoscript.run_all()
+        df_eco_raw, df_auc_raw = ec.run_all()
     except Exception as e:
         print(f"[WARN] Eco/Auction Generation Failed: {e}")
 
