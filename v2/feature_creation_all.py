@@ -927,7 +927,7 @@ def build_month(yymm: str) -> None:
     out_path = path_enh / out_name
     
     if not df_final.empty and 'z_comb' in df_final.columns:
-        df_final = df_final.fillna(0.0)
+        df_final = df_final.dropna(subset=['z_pca'])
         df_final.to_parquet(out_path, index=False)
         df_daily.to_parquet(path_enh / f"{yymm}_summary_D.parquet", index=False)
         
