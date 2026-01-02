@@ -340,7 +340,7 @@ def _calc_physics_features(snap_df: pd.DataFrame) -> pd.DataFrame:
     """
     if snap_df.empty: return pd.DataFrame()
 
-    valid = snap_df[snap_df["tenor_yrs"] >= 0.25].dropna()
+    valid = snap_df[snap_df["tenor_yrs"] >= 0.0].dropna()
     if valid.shape[0] < 3: return pd.DataFrame()
     
     tenors = valid["tenor_yrs"].values
@@ -382,7 +382,7 @@ def _spline_fit_safe(snap_long: pd.DataFrame) -> Tuple[pd.Series, float]:
     out = pd.Series(np.nan, index=snap_long.index, dtype=float)
     DEFAULT_SCALE = 0.05 
     
-    s_fit = snap_long[snap_long["tenor_yrs"] >= 2.0].dropna().sort_values("tenor_yrs")
+    s_fit = snap_long[snap_long["tenor_yrs"] >= 0.0].dropna().sort_values("tenor_yrs")
     if s_fit.shape[0] < 5: return out, DEFAULT_SCALE
 
     x = s_fit["tenor_yrs"].values.astype(float)
