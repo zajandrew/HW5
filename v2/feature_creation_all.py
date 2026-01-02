@@ -850,9 +850,27 @@ def build_month(yymm: str) -> None:
         df_full_hourly = df_instant.copy()
     df_full_hourly = df_full_hourly.sort_values(['tenor_yrs', 'ts'])
 
+    if 'exog_vol_implied' in df_full_hourly.columns:
+            # Input: Normal Vol in bps (e.g., 85.5, 120.0)
+            # We de-annualize to match the 'total_drift_day' timeframe.
+            # Vol_Daily = Vol_Annual / sqrt(252) approx Vol_Annual / 16.0
+            
+            _vol_daily_bps = df_full_hourly['exog_vol_implied'].abs() / 16.0
+            
+            # Safety: If vol is missing/zero, imply a floor (e.g., 1bp daily) to avoid inf
+            _vol_daily_bps = _vol_daily_bps.replace(0.0, 1.0) 
+            
+            # Ratio: (Bps per Day) / (Bps per Day) = Unitless Signal Strength
+            df_full_hourly['signal_sharpe'] = df_full_hourly['total_drift_day'] / _vol_daily_bps
+            
+            # --- NEW: Vol-Adjusted Z-Score (Regime Normalization) ---
+            # A 2-sigma move in low vol is different than 2-sigma in high vol for PnL sizing
+            # This helps XGBoost size positions based on actual dollar risk
+            df_full_hourly['z_pca_vol_adj'] = df_full_hourly['z_pca'] * (10.0 / _vol_daily_bps)
+
     # C. KITCHEN SINK (Including Rate!)
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
-   base_targets = ['rate', 'z_comb', 'z_pca', 'z_spline', 
+   base_targets = ['rate', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
                    'spline_curvature', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
                    'pca_vol_regime', 'pca_drift_regime', 
                    'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm',
