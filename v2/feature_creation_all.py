@@ -40,7 +40,8 @@ def _now():
 def _to_ts_index(df: pd.DataFrame) -> pd.DataFrame:
     if "ts" not in df.columns:
         if df.index.name in ("ts", "sec"):
-            df = df.reset_index().rename(columns={df.columns[0]: "ts"})
+            df = df.reset_index()
+            df = df.rename(columns={df.columns[0]: "ts"})
         else:
             raise KeyError("No 'ts' column found.")
     df = df.copy()
@@ -52,6 +53,7 @@ def _get_ql_calendar():
     if not getattr(cr, "USE_QL_CALENDAR", False): 
         return None
     try:
+        import QuantLib as ql
         market = str(getattr(cr, "QL_US_MARKET", "FederalReserve"))
         direct = getattr(ql.UnitedStates, market, None)
         if direct is not None: return ql.UnitedStates(direct)
