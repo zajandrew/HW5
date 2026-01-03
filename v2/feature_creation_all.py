@@ -705,7 +705,7 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
     
     return out
 
-def build_month(yymm: str) -> None:
+def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame, df_auc_raw: pd.DataFrame) -> None:
     path_data = Path(getattr(cr, "PATH_DATA", "."))
     path_enh  = Path(getattr(cr, "PATH_ENH", "."))
     path_enh.mkdir(parents=True, exist_ok=True)
@@ -776,16 +776,40 @@ def build_month(yymm: str) -> None:
             tolerance=pd.Timedelta(days=7) 
         ).drop(columns=['ts_vol'])
 
-    # --- 6. HISTORY CONTEXT (For Phase 1 PCA) ---
-    df_past_history = pd.DataFrame()
-    try:
-        prev_dt = datetime.datetime.strptime(yymm, "%y%m") - relativedelta(months=1)
-        prev_yymm = prev_dt.strftime("%y%m")
-        prev_path = path_enh / f"{prev_yymm}_summary_D.parquet"
-        if prev_path.exists():
-            df_past_history = pd.read_parquet(prev_path)
-    except: pass
+    # --- 6. HISTORY CONTEXT (The 126-Day Lookback) ---
+    # We load the previous 6 months (~126 trading days)
+    # This provides enough depth for stable PCA and Hurst > 100 days.
     
+    LOOKBACK_MONTHS = 6 
+    history_dfs = []
+    
+    current_dt = datetime.datetime.strptime(yymm, "%y%m")
+    
+    # Loop backwards 1 to 6 months
+    for i in range(1, LOOKBACK_MONTHS + 1):
+        prev_dt = current_dt - relativedelta(months=i)
+        prev_str = prev_dt.strftime("%y%m")
+        prev_path = path_enh / f"{prev_str}_summary_D.parquet"
+        
+        if prev_path.exists():
+            try:
+                # Load only necessary columns to save memory
+                tmp = pd.read_parquet(prev_path)
+                history_dfs.append(tmp)
+            except: pass
+            
+    if history_dfs:
+        df_past_history = pd.concat(history_dfs, ignore_index=True)
+        # Sort and Drop Duplicates to be safe
+        df_past_history = df_past_history.drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values('ts')
+    else:
+        df_past_history = pd.DataFrame()
+        
+    # Validation Print
+    days_loaded = df_past_history['ts'].nunique() if not df_past_history.empty else 0
+    print(f"[{_now()}] [CTX] Loaded {days_loaded} days of history (Target: ~126)")
+
+    # Combine with current month daily data for the full context
     df_full_context = pd.concat([df_past_history, df_daily], ignore_index=True)
     df_full_context = df_full_context.drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values('ts')
 
@@ -938,7 +962,27 @@ def build_month(yymm: str) -> None:
         print(f"[WARN] {yymm} produced EMPTY output.")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python feature_creation.py 2304")
-    for m in sys.argv[1:]:
-        build_month(m)
+    
+    # A. Volatility
+    try:
+        tenor_dict = getattr(cr, "TENOR_YEARS", {})
+        tenor_map_rev = {k: float(v) for k, v in tenor_dict.items()}
+        
+        df_vol_raw = vs.run_all() 
+        df_vol_daily = _process_daily_vol_df(df_vol_raw, tenor_map_rev)
+        print(f"   -> Volatility Loaded: {len(df_vol_daily)} rows")
+    except Exception as e:
+        print(f"   [WARN] Volatility Failed: {e}")
+        df_vol_daily = pd.DataFrame()
+
+    # B. Econ / Auctions
+    try:
+        df_eco_raw, df_auc_raw = ec.run_all()
+        print(f"   -> Econ Loaded: {len(df_eco_raw)} events")
+    except Exception as e:
+        print(f"   [WARN] Econ Failed: {e}")
+        df_eco_raw = pd.DataFrame()
+        df_auc_raw = pd.DataFrame()
+    months = []
+    for month in months:
+        build_month(month, df_vol_daily, df_eco_raw, df_auc_raw)
