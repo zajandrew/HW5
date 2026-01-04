@@ -894,7 +894,7 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
 
     # C. KITCHEN SINK (Including Rate!)
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
-   base_targets = ['z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
+    base_targets = ['z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
                    'spline_curvature', 'total_drift_day',
                    'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm', 'scale']
 
