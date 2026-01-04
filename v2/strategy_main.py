@@ -171,6 +171,46 @@ def make_inverse(df):
         if c in df_inv.columns: df_inv[c] *= -1
     df_inv['target_label'] = ((df_inv['aux_price_pnl'] >= 1.0) & (df_inv['aux_total_pnl'] >= 2.0)).astype(np.int8)
     return df_inv
+    
+def save_by_month_incremental(data, idx_time, prefix):
+    """
+    Slices the massive numpy arrays by month and saves incrementally.
+    Prevents holding a 20M+ row DataFrame in RAM.
+    """
+    path_enh = Path(getattr(cr, "PATH_ENH", "."))
+    
+    # 1. Identify Months from the Timestamp Array
+    # idx_time corresponds 1:1 with the rows in 'data'
+    ts_series = pd.to_datetime(idx_time)
+    months = ts_series.strftime("%y%m")
+    unique_months = np.unique(months)
+    
+    print(f"   Streaming {len(unique_months)} months to disk...")
+    
+    for m in unique_months:
+        # 2. Boolean Mask (Fast)
+        mask = (months == m)
+        if not np.any(mask): continue
+        
+        # 3. Slice Dictionary (Cheap)
+        # We only materialize the DataFrame for this specific month
+        batch_data = {k: v[mask] for k, v in data.items()}
+        
+        # 4. Create & Save Small DataFrame
+        try:
+            df_chunk = pd.DataFrame(batch_data)
+            df_inv = make_inverse(df_chunk)
+            final = pd.concat([df_chunk, df_inv], ignore_index=True)
+            
+            out_p = path_enh / f"training_{prefix}_{m}.parquet"
+            final.to_parquet(out_p, index=False)
+            print(f"      -> {out_p.name} ({len(final)} rows)")
+        except Exception as e:
+            print(f"      [ERR] Failed to save {m}: {e}")
+        
+        # 5. Immediate Cleanup
+        del df_chunk, df_inv, final, batch_data
+        gc.collect()
 
 # ==============================================================================
 # 3. BUILDER: CURVES
@@ -191,6 +231,7 @@ def build_curves(pivots, tenors):
         W[i1, j] = 1.0; W[i2, j] = -1.0
     W_abs = np.abs(W)
     
+    # 1. Full History Calculations (Fast in Numpy)
     data = project_standard_features(pivots, W, W_abs, ids)
     
     idx_map_1 = [tenors.index(c[0]) for c in combos]
@@ -225,11 +266,12 @@ def build_curves(pivots, tenors):
          if 'L2_z' in data: data['L2_z_modified'] = calc_modified_carry(data['L2_z'], L2_drift)
 
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_dist'] = np.tile(dist_arr, n_time)
+    
     drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
     if drift_key not in pivots: raise KeyError("Missing Drift Column")
     
     net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
-    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 # Convert Days to Hours
+    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
     
     labels, prices, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, hl_buckets.reshape(n_time, n_trades), 
@@ -245,7 +287,12 @@ def build_curves(pivots, tenors):
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
     data['aux_exit_idx'] = ex_idx.ravel()
     
-    return pd.DataFrame(data)
+    # 2. STREAMING SAVE (Memory Fix)
+    save_by_month_incremental(data, idx_time, "curves")
+    
+    # Clear Memory
+    del data, net_rates, net_drift, labels, prices, carries, totals
+    gc.collect()
 
 # ==============================================================================
 # 4. BUILDER: FLYS
@@ -319,7 +366,12 @@ def build_flys(pivots, tenors):
     data['aux_carry_pnl'] = carries.ravel(); data['aux_total_pnl'] = totals.ravel()
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
     data['aux_exit_idx'] = ex_idx.ravel()
-    return pd.DataFrame(data)
+    
+    # 2. STREAMING SAVE
+    save_by_month_incremental(data, idx_time, "flys")
+    
+    del data, net_rates, net_drift, labels, prices, carries, totals
+    gc.collect()
 
 # ==============================================================================
 # 5. ORCHESTRATOR (Full History Stitch)
@@ -345,27 +397,10 @@ def process_full_history():
     pivots = get_pivots(df_full)
     tenors = sorted(pivots['rate'].columns)
     
-    # 1. Generate All Trades on Full Timeline
-    df_curves = build_curves(pivots, tenors)
-    df_flys   = build_flys(pivots, tenors)
+    # The builders now handle saving internally to manage memory
+    build_curves(pivots, tenors)
+    build_flys(pivots, tenors)
     
-    # 2. Slice and Save by Month
-    print("Slicing and Saving by Month...")
-    
-    for df_type, df_big in [("curves", df_curves), ("flys", df_flys)]:
-        # Create inverse trades before saving
-        df_inv = make_inverse(df_big)
-        df_final = pd.concat([df_big, df_inv], ignore_index=True)
-        
-        # Group by Month and Save
-        df_final['month'] = df_final['ts'].dt.strftime("%y%m")
-        for m, group in df_final.groupby('month'):
-            out_p = path_enh / f"training_{df_type}_{m}.parquet"
-            # Drop the helper month column and NA rows
-            save_df = group.drop(columns=['month']).dropna()
-            save_df.to_parquet(out_p, index=False)
-            print(f"   -> {out_p.name} ({len(save_df)} rows)")
-
     print("Done.")
 
 if __name__ == "__main__":
