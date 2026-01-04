@@ -197,19 +197,19 @@ def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], gro
         # and ignores any index mismatches.
         col_slope = f"{col}_slope_{suffix}"
         res[col_slope] = slope_arr
-        res[f"{col}_accel_{suffix}"] = accel_arr
+        #res[f"{col}_accel_{suffix}"] = accel_arr
         
-        res[f"{col}_mean_{suffix}"] = mean_val
-        res[f"{col}_std_{suffix}"]  = std_val
-        res[f"{col}_max_{suffix}"]  = max_val
-        res[f"{col}_min_{suffix}"]  = min_val
+        #res[f"{col}_mean_{suffix}"] = mean_val
+        #res[f"{col}_std_{suffix}"]  = std_val
+        #res[f"{col}_max_{suffix}"]  = max_val
+        #res[f"{col}_min_{suffix}"]  = min_val
         
-        res[f"{col}_max_abs_{suffix}"] = max_abs
+        #res[f"{col}_max_abs_{suffix}"] = max_abs
         res[f"{col}_zlocal_{suffix}"] = z_local
         res[f"{col}_rng_pos_{suffix}"] = rng_pos
         
-        res[f"{col}_q25_{suffix}"] = q25
-        res[f"{col}_q75_{suffix}"] = q75
+        #res[f"{col}_q25_{suffix}"] = q25
+        #res[f"{col}_q75_{suffix}"] = q75
         
     return res
 
@@ -894,12 +894,12 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
 
     # C. KITCHEN SINK (Including Rate!)
     # We include 'rate' so XGBoost can see Rate Velocity (Slope) and Acceleration.
-   base_targets = ['rate', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
-                   'spline_curvature', 'total_drift_day', 'carry_bps_day', 'roll_bps_day', 'dv01',
-                   'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm', 'pca_scale', 'spline_scale', 'scale']
+   base_targets = ['z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj',
+                   'spline_curvature', 'total_drift_day',
+                   'pca_factor_0', 'pca_factor_1', 'pca_factor_2', 'pca_error_norm', 'scale']
 
     derived_targets = [c for c in df_full_hourly.columns 
-                       if '_mod_drift' in c or '_conflict' in c]
+                       if '_mod_drift' in c]
                        
     target_cols = base_targets + derived_targets
     
@@ -983,6 +983,8 @@ if __name__ == "__main__":
         print(f"   [WARN] Econ Failed: {e}")
         df_eco_raw = pd.DataFrame()
         df_auc_raw = pd.DataFrame()
-    months = []
+    months = ["2304", "2305", "2306", "2307", "2308", "2309", "2310", "2311", "2312", "2401", "2402", "2403", "2404",
+             "2405", "2406", "2407", "2408", "2409", "2410", "2411", "2412", "2501", "2502", "2503", "2504", "2505",
+             "2506", "2507", "2508", "2509", "2510", "2511"]
     for month in months:
         build_month(month, df_vol_daily, df_eco_raw, df_auc_raw)
