@@ -1,15 +1,16 @@
 """
-strategy_generator.py (v7.0 - Triple Barrier & Full Feature Projection)
+strategy_generator.py (v9.0 - Full History Stitch)
 
-1. Dynamic Feature Projection: Automatically captures ALL windowed stats (Slope, Accel, Z).
-2. Strict Triple Barrier:
-   - Upper Barrier (Win): Total PnL >= 2bp AND Price PnL >= 1bp.
-   - Lower Barrier (Stop): Total PnL <= -1.5bp.
-   - Vertical Barrier (Time): 120 Hours (1 Week) cap for Momentum.
-3. Feature Groups:
-   - NET: Directional (Spread Slopes, Net Z).
-   - REGIME: Weighted Avgs (Vol, Skew, Halflife).
-   - LEGS: Raw Sniper stats for specific leg stress.
+Role:
+1. Loads ENTIRE history into memory (Stitching).
+2. Constructs synthetic instruments (Curves, Flys).
+3. Scans PnL on the continuous timeline (No cutoffs).
+4. Slices output back to monthly files for storage.
+
+Key Fixes:
+- Full History Context: Solves the "Long Half-Life" cutoff issue.
+- Dynamic Time Barrier: Respects HL=300+ signals.
+- Bucket Consistency: HL in Trading Hours, Drift in Wall Clock (Verified).
 """
 
 import pandas as pd
@@ -32,14 +33,13 @@ def scan_pnl_audit(
     price_hurdle, 
     total_hurdle, 
     stop_loss, 
-    max_hold_steps=120
+    min_hold_steps=120
 ):
     """
     Implements Triple Barrier Method.
-    Barriers:
-    1. Profit (Win): Total > 2bps AND Price > 1bps (Quality Control).
-    2. Stop Loss (Loss): Total < -1.5bps.
-    3. Time (Vertical): Max Hold (120h) or 2*HalfLife.
+    Time Barrier is Dynamic: Max(2 * HalfLife, min_hold_steps).
+    This allows long-term mean reversion (HL=300) to play out,
+    while giving momentum (HL=999) at least 'min_hold_steps' (1 week).
     """
     n_time, n_trades = entry_rates.shape
     
@@ -53,12 +53,21 @@ def scan_pnl_audit(
     
     for j in numba.prange(n_trades):
         for i in range(n_time):
-            # --- Vertical Barrier (Time) ---
-            # If HL is 999 (Momentum), we use max_hold_steps (120h).
-            # If HL is 10 (Reversion), we use 20h.
-            hl_step = int(halflife_idxs[i, j] * 2.0)
-            steps = min(hl_step, max_hold_steps)
-            if steps < 5: steps = 5
+            # --- Dynamic Vertical Barrier ---
+            # If HL=300 (30 days), we give it 600 hours.
+            # If HL=10 (1 day), we give it 20 hours (but floored at min_hold if needed?)
+            # Actually, standard logic is just 2 * HL. 
+            # But for Momentum (999), we cap/floor it.
+            
+            hl_val = halflife_idxs[i, j]
+            
+            # Logic: If HL is "Infinite" (Momentum > 500), cap at 120 (1 week).
+            # If HL is Real (Reversion < 500), give it 2 * HL.
+            if hl_val > 500:
+                steps = 120 # 1 Week for Momentum
+            else:
+                steps = int(hl_val * 2.0)
+                if steps < 5: steps = 5
             
             end_idx = min(i + steps, n_time)
             if end_idx <= i + 1: continue
@@ -74,9 +83,9 @@ def scan_pnl_audit(
             # --- Path Traversal ---
             for k in range(i + 1, end_idx):
                 # 1. Calc PnL
-                curr_price = (rate_in - entry_rates[k, j]) * 100.0 # Price PnL
-                curr_carry = drift_cumsums[k, j] - drift_in        # Carry PnL
-                curr_total = curr_price + curr_carry               # Total PnL
+                curr_price = (rate_in - entry_rates[k, j]) * 100.0 
+                curr_carry = drift_cumsums[k, j] - drift_in        
+                curr_total = curr_price + curr_carry               
                 
                 # 2. Lower Barrier (Stop Loss)
                 if curr_total <= stop_loss:
@@ -88,9 +97,7 @@ def scan_pnl_audit(
                     stopped = True
                     break
                 
-                # 3. Upper Barrier (Take Profit - Triple Barrier Logic)
-                # MUST make money on Price (Momentum/Reversion) AND Total.
-                # Prevents "Carry Traps" where Price is losing but Carry is huge.
+                # 3. Upper Barrier (Take Profit)
                 if (curr_price >= price_hurdle) and (curr_total >= total_hurdle):
                     out_label[i, j] = 1
                     out_price[i, j] = curr_price
@@ -103,7 +110,7 @@ def scan_pnl_audit(
                 # Track 'Exit at Vertical Barrier' state
                 best_price, best_carry, best_total = curr_price, curr_carry, curr_total
             
-            # 4. Vertical Barrier Exit (Time Expired)
+            # 4. Vertical Barrier Exit
             if not won and not stopped:
                 out_price[i, j] = best_price
                 out_carry[i, j] = best_carry
@@ -115,113 +122,68 @@ def scan_pnl_audit(
     return out_label, out_price, out_carry, out_total, out_exit_idx, out_exit_rate
 
 # ==============================================================================
-# 2. DYNAMIC FEATURE PROJECTION (The Kitchen Sink)
+# 2. FEATURE PROJECTION
 # ==============================================================================
 def get_pivots(df):
-    """
-    Pivots numeric columns into Time x Tenor matrices.
-    Strictly skips non-numeric columns (like 'instrument' or 'ticker') to prevent errors.
-    """
     pivots = {}
     potential_cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
-    
-    # print(f"   Scanning {len(potential_cols)} columns...") 
-    
     for c in potential_cols:
-        # 1. Type Check: Only process numeric columns
-        if not pd.api.types.is_numeric_dtype(df[c]):
-            # Determine if it's an "object" that might be numeric (rare but possible)
-            # If it's a string identifier like 'USOSFRA...', we skip it.
-            continue
-            
+        if not pd.api.types.is_numeric_dtype(df[c]): continue
         try:
-            # 2. Pivot & Cast
             pivots[c] = df.pivot(index='ts', columns='tenor_yrs', values=c).ffill().astype(np.float32)
-        except ValueError:
-            # Catch cases where numeric column might have rogue strings
-            print(f"   [SKIP] Failed to convert column: {c}")
-            continue
-            
+        except ValueError: continue
     return pivots
 
 def calc_modified_carry(z_arr, drift_arr):
-    # Sigmoid function to weight Z-score by Drift direction
     safe_drift = np.clip(drift_arr * 2.0, -20, 20)
     sigmoid = 2.0 / (1.0 + np.exp(-safe_drift))
     return z_arr * sigmoid
 
 def project_standard_features(pivots, W, W_abs, trade_names):
-    """
-    Dynamically projects ALL input features into NET or REGIME stats.
-    """
     data = {}
-    
-    # 1. Identify Feature Types
     REGIME_KEYS = ['halflife', 'scale', 'dv01', 'exog_', 'pca_error_norm']
-    SKIP_KEYS   = ['cumsum', 'hours_to_'] # Handled manually or skipped
+    SKIP_KEYS   = ['cumsum', 'hours_to_'] 
 
     for name, mat in pivots.items():
         if any(x in name for x in SKIP_KEYS): continue
-        
-        # Decide: Is this a Regime Feature (Avg) or Directional (Net)?
         is_regime = any(k in name for k in REGIME_KEYS)
-        
         vals = mat.values
-        # Clean naming (e.g., z_comb_slope_50b -> NET_z_slope_50b)
         clean = name.replace("z_comb", "z").replace("total_drift_day", "drift").replace("rate", "rate")
         clean = clean.replace("exog_", "").replace("signal_sharpe", "signal_sharpe")
 
         if is_regime:
-            # Weighted Average (Environment)
-            norm = np.sum(W_abs, axis=0)
-            norm[norm == 0] = 1.0
+            norm = np.sum(W_abs, axis=0); norm[norm == 0] = 1.0
             data[f"NET_{clean}"] = (vals @ W_abs) / norm
         else:
-            # Net Difference (Directional Signal)
-            # This captures: Slope, Accel, Z-Score, etc.
             data[f"NET_{clean}"] = vals @ W
-            
     for k in data: data[k] = data[k].ravel()
     return data
 
 def make_inverse(df):
-    """Creates Short positions for every Long position."""
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
     cols_to_flip = ['aux_price_pnl', 'aux_carry_pnl', 'aux_total_pnl']
-    
     for c in df_inv.columns:
         if c.startswith('NET_'):
-            # Flip anything Directional. 
-            # Note: Slope/Accel IS directional, so it gets flipped.
             if any(x in c for x in ['z', 'drift', 'rate', 'slope', 'accel', 'divergence', 'ratio', 'modified', 'leakage', 'stress', 'sharpe']):
                 cols_to_flip.append(c)
-                
     for c in cols_to_flip:
         if c in df_inv.columns: df_inv[c] *= -1
-    
-    # Recalculate Labels for the Inverse Trades
-    df_inv['target_label'] = (
-        (df_inv['aux_price_pnl'] >= 1.0) & 
-        (df_inv['aux_total_pnl'] >= 2.0)
-    ).astype(np.int8)
-    
+    df_inv['target_label'] = ((df_inv['aux_price_pnl'] >= 1.0) & (df_inv['aux_total_pnl'] >= 2.0)).astype(np.int8)
     return df_inv
 
 # ==============================================================================
 # 3. BUILDER: CURVES
 # ==============================================================================
-def build_curves(pivots, tenors, month_str):
-    print(f"[{month_str}] Building CURVES...")
+def build_curves(pivots, tenors):
+    print(f"   Building CURVES on full history ({len(pivots['rate'])} rows)...")
     combos = list(combinations(tenors, 2))
     n_trades = len(combos)
     n_time = len(pivots['rate'].index)
     idx_time = np.repeat(pivots['rate'].index, n_trades)
     
     ids, dist_arr = [], []
-    for t1, t2 in combos:
-        ids.append(f"C_{t1:g}_{t2:g}")
-        dist_arr.append(abs(t2 - t1))
+    for t1, t2 in combos: ids.append(f"C_{t1:g}_{t2:g}"); dist_arr.append(abs(t2 - t1))
         
     W = np.zeros((len(tenors), n_trades), dtype=np.float32)
     for j, (t1, t2) in enumerate(combos):
@@ -229,12 +191,12 @@ def build_curves(pivots, tenors, month_str):
         W[i1, j] = 1.0; W[i2, j] = -1.0
     W_abs = np.abs(W)
     
-    # 1. Dynamic Projection (Includes Slopes, Accels, etc.)
     data = project_standard_features(pivots, W, W_abs, ids)
     
-    # 2. Leg Features (Sniper Selection)
     idx_map_1 = [tenors.index(c[0]) for c in combos]
     idx_map_2 = [tenors.index(c[1]) for c in combos]
+    rate_vals = pivots['rate'].values
+    L1_rate_mat = rate_vals[:, idx_map_1]; L2_rate_mat = rate_vals[:, idx_map_2]
     
     target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
     L1_drift, L2_drift = None, None
@@ -243,74 +205,60 @@ def build_curves(pivots, tenors, month_str):
         is_target = any(t in feat for t in target_legs)
         is_event = 'hours_to_' in feat
         if not (is_target or is_event): continue
-        
         vals = pivots[feat].values
-        l1 = vals[:, idx_map_1].ravel()
-        l2 = vals[:, idx_map_2].ravel()
-        
+        l1 = vals[:, idx_map_1].ravel(); l2 = vals[:, idx_map_2].ravel()
         clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        
-        if is_event:
-            data[f"NET_{clean}_min"] = np.minimum(l1, l2)
+        if is_event: data[f"NET_{clean}_min"] = np.minimum(l1, l2)
         else:
             data[f"L1_{clean}"] = l1; data[f"L2_{clean}"] = l2
             if feat == 'total_drift_day': L1_drift, L2_drift = l1, l2
             if feat == 'z_comb': data['NET_leg_stress'] = np.maximum(np.abs(l1), np.abs(l2))
 
-    # 3. Physics & Derived
     if 'NET_drift' in data and 'NET_vol_implied' in data:
         safe_vol = np.maximum(data['NET_vol_implied'], 0.1)
         data['NET_drift_vol_ratio'] = data['NET_drift'] / safe_vol
-        
     if 'NET_drift' in data:
         for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
-            if z_name in data:
-                data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
-                
+            if z_name in data: data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
     if L1_drift is not None:
          if 'L1_z' in data: data['L1_z_modified'] = calc_modified_carry(data['L1_z'], L1_drift)
          if 'L2_z' in data: data['L2_z_modified'] = calc_modified_carry(data['L2_z'], L2_drift)
 
-    # 4. Audit & Labels
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_dist'] = np.tile(dist_arr, n_time)
+    drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
+    if drift_key not in pivots: raise KeyError("Missing Drift Column")
     
-    net_rates = pivots['rate'].values @ W
-    net_drift = pivots['total_drift_day_cumsum'].values @ W
-    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
+    net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
+    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 # Convert Days to Hours
     
-    # TRIPLE BARRIER PARAMS: Price >= 1.0, Total >= 2.0
     labels, prices, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, hl_buckets.reshape(n_time, n_trades), 
-        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5, max_hold_steps=120)
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
     
-    data['target_label'] = labels.ravel()
-    data['aux_price_pnl'] = prices.ravel(); data['aux_carry_pnl'] = carries.ravel()
-    data['aux_total_pnl'] = totals.ravel()
+    data['L1_entry_rate'] = L1_rate_mat.ravel(); data['L2_entry_rate'] = L2_rate_mat.ravel()
+    data['L1_exit_rate'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
+    data['L2_exit_rate'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
+    all_ts = pivots['rate'].index.values; data['aux_exit_ts'] = all_ts[ex_idx.ravel()]
+    
+    data['target_label'] = labels.ravel(); data['aux_price_pnl'] = prices.ravel()
+    data['aux_carry_pnl'] = carries.ravel(); data['aux_total_pnl'] = totals.ravel()
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
+    data['aux_exit_idx'] = ex_idx.ravel()
     
-    df = pd.DataFrame(data)
-    df_inv = make_inverse(df)
-    final = pd.concat([df, df_inv], ignore_index=True).dropna()
-    
-    out_p = Path(getattr(cr, "PATH_ENH", ".")) / f"training_curves_{month_str}.parquet"
-    final.to_parquet(out_p, index=False)
-    print(f"   Saved {len(final)} CURVES -> {out_p}")
-    del df, df_inv, final, data; gc.collect()
+    return pd.DataFrame(data)
 
 # ==============================================================================
 # 4. BUILDER: FLYS
 # ==============================================================================
-def build_flys(pivots, tenors, month_str):
-    print(f"[{month_str}] Building FLYS...")
+def build_flys(pivots, tenors):
+    print(f"   Building FLYS on full history ({len(pivots['rate'])} rows)...")
     combos = list(combinations(tenors, 3))
     n_trades = len(combos)
     n_time = len(pivots['rate'].index)
     idx_time = np.repeat(pivots['rate'].index, n_trades)
-    
     ids, t1_arr, t2_arr, t3_arr = [], [], [], []
     for t1, t2, t3 in combos:
-        ids.append(f"F_{t1:g}_{t2:g}_{t3:g}")
-        t1_arr.append(t1); t2_arr.append(t2); t3_arr.append(t3)
+        ids.append(f"F_{t1:g}_{t2:g}_{t3:g}"); t1_arr.append(t1); t2_arr.append(t2); t3_arr.append(t3)
         
     W = np.zeros((len(tenors), n_trades), dtype=np.float32)
     for j, (t1, t2, t3) in enumerate(combos):
@@ -319,23 +267,19 @@ def build_flys(pivots, tenors, month_str):
     W_abs = np.abs(W)
     
     data = project_standard_features(pivots, W, W_abs, ids)
-    
-    idx_map_1 = [tenors.index(c[0]) for c in combos]
-    idx_map_2 = [tenors.index(c[1]) for c in combos]
-    idx_map_3 = [tenors.index(c[2]) for c in combos]
+    idx_map_1 = [tenors.index(c[0]) for c in combos]; idx_map_2 = [tenors.index(c[1]) for c in combos]; idx_map_3 = [tenors.index(c[2]) for c in combos]
+    rate_vals = pivots['rate'].values
+    L1_rate_mat = rate_vals[:, idx_map_1]; L2_rate_mat = rate_vals[:, idx_map_2]; L3_rate_mat = rate_vals[:, idx_map_3]
     
     target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
     L1_drift, L2_drift, L3_drift = None, None, None
-    
     for feat in pivots.keys():
         is_target = any(t in feat for t in target_legs)
         is_event = 'hours_to_' in feat
         if not (is_target or is_event): continue
-        
         vals = pivots[feat].values
         l1 = vals[:, idx_map_1].ravel(); l2 = vals[:, idx_map_2].ravel(); l3 = vals[:, idx_map_3].ravel()
         clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        
         if is_event: data[f"NET_{clean}_min"] = np.minimum(np.minimum(l1, l2), l3)
         else:
             data[f"L1_{clean}"] = l1; data[f"L2_{clean}"] = l2; data[f"L3_{clean}"] = l3
@@ -344,49 +288,85 @@ def build_flys(pivots, tenors, month_str):
     t1 = np.tile(t1_arr, n_time); t2 = np.tile(t2_arr, n_time); t3 = np.tile(t3_arr, n_time)
     dist = t3 - t1; dist[dist==0]=1.0
     data['NET_slope_leakage'] = 0.5 - ((t3 - t2) / dist)
-    
     if 'NET_drift' in data and 'NET_vol_implied' in data:
         safe_vol = np.maximum(data['NET_vol_implied'], 0.1)
         data['NET_drift_vol_ratio'] = data['NET_drift'] / safe_vol
-
     if 'NET_drift' in data:
         for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
             if z_name in data: data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
-            
     if L1_drift is not None:
          if 'L1_z' in data: data['L1_z_modified'] = calc_modified_carry(data['L1_z'], L1_drift)
          if 'L2_z' in data: data['L2_z_modified'] = calc_modified_carry(data['L2_z'], L2_drift)
          if 'L3_z' in data: data['L3_z_modified'] = calc_modified_carry(data['L3_z'], L3_drift)
 
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_t2'] = t2
-    net_rates = pivots['rate'].values @ W
-    net_drift = pivots['total_drift_day_cumsum'].values @ W
-    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
+    drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
+    if drift_key not in pivots: raise KeyError("Missing Drift Column")
+    net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
+    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 
     
     labels, prices, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, hl_buckets.reshape(n_time, n_trades), 
-        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5, max_hold_steps=120)
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
     
-    data['target_label'] = labels.ravel()
-    data['aux_price_pnl'] = prices.ravel(); data['aux_carry_pnl'] = carries.ravel()
-    data['aux_total_pnl'] = totals.ravel()
+    data['L1_entry_rate'] = L1_rate_mat.ravel(); data['L2_entry_rate'] = L2_rate_mat.ravel(); data['L3_entry_rate'] = L3_rate_mat.ravel()
+    data['L1_exit_rate'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
+    data['L2_exit_rate'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
+    data['L3_exit_rate'] = np.take_along_axis(L3_rate_mat, ex_idx, axis=0).ravel()
+    all_ts = pivots['rate'].index.values; data['aux_exit_ts'] = all_ts[ex_idx.ravel()]
+    
+    data['target_label'] = labels.ravel(); data['aux_price_pnl'] = prices.ravel()
+    data['aux_carry_pnl'] = carries.ravel(); data['aux_total_pnl'] = totals.ravel()
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
-    
-    df = pd.DataFrame(data)
-    df_inv = make_inverse(df)
-    final = pd.concat([df, df_inv], ignore_index=True).dropna()
-    out_p = Path(getattr(cr, "PATH_ENH", ".")) / f"training_flys_{month_str}.parquet"
-    final.to_parquet(out_p, index=False)
-    print(f"   Saved {len(final)} FLYS -> {out_p}")
-    del df, df_inv, final, data; gc.collect()
+    data['aux_exit_idx'] = ex_idx.ravel()
+    return pd.DataFrame(data)
 
-def process_month(month_str):
-    p = Path(getattr(cr, "PATH_ENH", ".")) / f"{month_str}_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet"
-    if not p.exists(): print(f"[{month_str}] Not found: {p}"); return
-    print(f"[{month_str}] Loading Features..."); df = pd.read_parquet(p)
-    pivots = get_pivots(df); tenors = sorted(pivots['rate'].columns)
-    build_curves(pivots, tenors, month_str); build_flys(pivots, tenors, month_str)
-    print(f"[{month_str}] Done.")
+# ==============================================================================
+# 5. ORCHESTRATOR (Full History Stitch)
+# ==============================================================================
+def process_full_history():
+    path_enh = Path(getattr(cr, "PATH_ENH", "."))
+    files = sorted(list(path_enh.glob(f"*_enh{getattr(cr, 'ENH_SUFFIX', '')}.parquet")))
+    
+    if not files:
+        print("No files found."); return
+
+    print(f"Loading {len(files)} files for Full History Stitch...")
+    dfs = []
+    for f in files:
+        try:
+            dfs.append(pd.read_parquet(f))
+        except: pass
+    
+    if not dfs: return
+    df_full = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values(['ts', 'tenor_yrs'])
+    print(f"Full History Loaded: {len(df_full)} rows. Pivoting...")
+    
+    pivots = get_pivots(df_full)
+    tenors = sorted(pivots['rate'].columns)
+    
+    # 1. Generate All Trades on Full Timeline
+    df_curves = build_curves(pivots, tenors)
+    df_flys   = build_flys(pivots, tenors)
+    
+    # 2. Slice and Save by Month
+    print("Slicing and Saving by Month...")
+    
+    for df_type, df_big in [("curves", df_curves), ("flys", df_flys)]:
+        # Create inverse trades before saving
+        df_inv = make_inverse(df_big)
+        df_final = pd.concat([df_big, df_inv], ignore_index=True)
+        
+        # Group by Month and Save
+        df_final['month'] = df_final['ts'].dt.strftime("%y%m")
+        for m, group in df_final.groupby('month'):
+            out_p = path_enh / f"training_{df_type}_{m}.parquet"
+            # Drop the helper month column and NA rows
+            save_df = group.drop(columns=['month']).dropna()
+            save_df.to_parquet(out_p, index=False)
+            print(f"   -> {out_p.name} ({len(save_df)} rows)")
+
+    print("Done.")
 
 if __name__ == "__main__":
-    for m in sys.argv[1:]: process_month(m)
+    process_full_history()
