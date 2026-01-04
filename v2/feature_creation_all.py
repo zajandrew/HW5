@@ -643,12 +643,19 @@ def _process_instantaneous_bucket(dts, df_bucket, df_history_daily, pca_config):
                 out[k] = v
             
             # B. Hurst/OU on Historical Residuals
-            resid_hist = model["hist_resid_z"]
+            resid_hist = model["hist_resid_z"] # These are SHOCKS (Daily changes)
+            
             for i, tenor in enumerate(model["cols"]):
                 if i < resid_hist.shape[1]:
+                    # 1. HURST: Needs SHOCKS (Standard R/S Analysis)
+                    # The function internally integrates these to check the path.
                     h_val = _calc_hurst_rs(resid_hist[:, i])
                     hurst_map[tenor] = h_val
-                    hl, _ = _calc_ou_halflife(resid_hist[:, i])
+                    
+                    # 2. HALF-LIFE: Needs LEVELS (Ornstein-Uhlenbeck)
+                    # We must manually integrate shocks to get the "Rich/Cheap" Path.
+                    level_path = np.cumsum(resid_hist[:, i])
+                    hl, _ = _calc_ou_halflife(level_path)
                     halflife_map[tenor] = hl
 
     # 3. Spline (Intraday)
