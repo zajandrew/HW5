@@ -197,6 +197,8 @@ def _calc_kitchen_sink_stats(df: pd.DataFrame, col: str, windows: List[int], gro
         # and ignores any index mismatches.
         col_slope = f"{col}_slope_{suffix}"
         res[col_slope] = slope_arr
+        if w == 2:
+            continue
         #res[f"{col}_accel_{suffix}"] = accel_arr
         
         #res[f"{col}_mean_{suffix}"] = mean_val
