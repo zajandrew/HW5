@@ -827,8 +827,11 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
     # --- 8. PHASE 2: ROLLING STATS (With Warm Start) ---
     print(f"[{_now()}] [PHASE 2] Calculating Rolling Stats & Accruals...")
     
-    # A. WARM START BUFFER
-    MAX_LOOKBACK_HRS = 120 # 5 Days
+    # A. WARM START BUFFER (Row-Based Fix)
+    # We need at least 50 rows for the window. Let's grab 100 for safety.
+    # This guarantees we bridge weekends/holidays without losing count.
+    MIN_LOOKBACK_ROWS = 100 
+    
     df_prev_tail = pd.DataFrame()
     drift_offsets = {}
     
@@ -841,18 +844,24 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
         if prev_enh_path.exists():
             df_prev = pd.read_parquet(prev_enh_path)
             
-            # 1. Capture Drift Offsets
+            # 1. Capture Drift Offsets (Keep existing logic)
             for d_col in ['total_drift_day', 'carry_bps_day', 'roll_bps_day']:
                 cs_col = d_col.replace('_day', '_cumsum')
                 if cs_col in df_prev.columns:
                     drift_offsets[cs_col] = df_prev.groupby('tenor_yrs')[cs_col].last().to_dict()
 
-            # 2. Slice Tail
-            last_ts = df_prev['ts'].max()
-            start_buffer = last_ts - pd.Timedelta(hours=MAX_LOOKBACK_HRS)
+            # 2. Slice Tail by ROWS (The Fix)
+            # Instead of filtering by time, we group by tenor and take the last N rows.
             common_cols = [c for c in df_instant.columns if c in df_prev.columns]
-            df_prev_tail = df_prev[df_prev['ts'] > start_buffer][common_cols].copy()
-    except: pass
+            
+            # Sort is crucial before tail()
+            df_prev_sorted = df_prev[common_cols].sort_values(['tenor_yrs', 'ts'])
+            
+            # Grab last 100 buckets per tenor
+            df_prev_tail = df_prev_sorted.groupby('tenor_yrs').tail(MIN_LOOKBACK_ROWS)
+            
+    except Exception as e:
+        print(f"[WARN] Warm Start Failed: {e}")
 
     # B. CONCAT
     if not df_prev_tail.empty:
