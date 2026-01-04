@@ -721,26 +721,6 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
     tenor_dict = getattr(cr, "TENOR_YEARS", {})
     tenor_map_rev = {k: float(v) for k, v in tenor_dict.items()}
 
-    # --- 2. GENERATE EXTERNAL DATA (Live) ---
-    print(f"[{_now()}] [PREP] Running Volatility & Eco Generators...")
-    
-    df_vol_daily = pd.DataFrame()
-    df_eco_raw = pd.DataFrame()
-    df_auc_raw = pd.DataFrame()
-
-    try:
-        # Run Vol Script
-        df_vol_raw = vs.run_all() 
-        df_vol_daily = _process_daily_vol_df(df_vol_raw, tenor_map_rev)
-    except Exception as e:
-        print(f"[WARN] Volatility Generation Failed: {e}")
-
-    try:
-        # Run Eco Script (Returns Tuple: Eco, Auc)
-        df_eco_raw, df_auc_raw = ec.run_all()
-    except Exception as e:
-        print(f"[WARN] Eco/Auction Generation Failed: {e}")
-
     # --- 3. LOAD RATES ---
     in_path = path_data / f"{yymm}.parquet"
     if not in_path.exists(): raise FileNotFoundError(f"Missing {in_path}")
