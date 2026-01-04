@@ -119,13 +119,29 @@ def scan_pnl_audit(
 # ==============================================================================
 def get_pivots(df):
     """
-    Pivots EVERY column found in the input DataFrame.
-    This ensures slopes, accels, and z-locals are all captured automatically.
+    Pivots numeric columns into Time x Tenor matrices.
+    Strictly skips non-numeric columns (like 'instrument' or 'ticker') to prevent errors.
     """
     pivots = {}
-    cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
-    for c in cols:
-        pivots[c] = df.pivot(index='ts', columns='tenor_yrs', values=c).ffill().astype(np.float32)
+    potential_cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
+    
+    # print(f"   Scanning {len(potential_cols)} columns...") 
+    
+    for c in potential_cols:
+        # 1. Type Check: Only process numeric columns
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            # Determine if it's an "object" that might be numeric (rare but possible)
+            # If it's a string identifier like 'USOSFRA...', we skip it.
+            continue
+            
+        try:
+            # 2. Pivot & Cast
+            pivots[c] = df.pivot(index='ts', columns='tenor_yrs', values=c).ffill().astype(np.float32)
+        except ValueError:
+            # Catch cases where numeric column might have rogue strings
+            print(f"   [SKIP] Failed to convert column: {c}")
+            continue
+            
     return pivots
 
 def calc_modified_carry(z_arr, drift_arr):
