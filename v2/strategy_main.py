@@ -1,16 +1,16 @@
 """
-strategy_generator.py (v9.0 - Full History Stitch)
+strategy_generator.py (v10.0 - Production Golden Copy)
 
 Role:
-1. Loads ENTIRE history into memory (Stitching).
+1. Ingests full history of atomic features to prevent lookahead/cutoff bias.
 2. Constructs synthetic instruments (Curves, Flys).
-3. Scans PnL on the continuous timeline (No cutoffs).
-4. Slices output back to monthly files for storage.
+3. Projects features dynamically (Net vs. Legs vs. Regime).
+4. Simulates execution via Triple Barrier with specific "Quality PnL" logic.
+   - Curves: Quality = Price PnL.
+   - Flys:   Quality = Price PnL + Rolldown PnL.
+5. Slices output to monthly files for efficient storage.
 
-Key Fixes:
-- Full History Context: Solves the "Long Half-Life" cutoff issue.
-- Dynamic Time Barrier: Respects HL=300+ signals.
-- Bucket Consistency: HL in Trading Hours, Drift in Wall Clock (Verified).
+Outputs: training_curves_YYMM.parquet, training_flys_YYMM.parquet
 """
 
 import pandas as pd
@@ -23,12 +23,13 @@ import gc
 import config as cr
 
 # ==============================================================================
-# 1. NUMBA SCANNER (Triple Barrier Audit)
+# 1. NUMBA SCANNER (Triple Barrier with Quality PnL)
 # ==============================================================================
 @numba.njit(parallel=True)
 def scan_pnl_audit(
     entry_rates, 
     drift_cumsums, 
+    roll_cumsums,     # <--- NEW: Explicit Rolldown Input
     halflife_idxs, 
     price_hurdle, 
     total_hurdle, 
@@ -36,17 +37,21 @@ def scan_pnl_audit(
     min_hold_steps=120
 ):
     """
-    Implements Triple Barrier Method.
-    Time Barrier is Dynamic: Max(2 * HalfLife, min_hold_steps).
-    This allows long-term mean reversion (HL=300) to play out,
-    while giving momentum (HL=999) at least 'min_hold_steps' (1 week).
+    Triple Barrier Method with 'Quality PnL' Logic.
+    
+    Definitions:
+    - Total PnL = Price PnL + Total Drift (Carry + Roll).
+    - Quality PnL = Price PnL + Rolldown PnL (for Flys) OR Price PnL (for Curves).
+    
+    Win Condition: 
+    - Total PnL >= total_hurdle (2bps) AND Quality PnL >= price_hurdle (1bp).
     """
     n_time, n_trades = entry_rates.shape
     
     # Audit Containers
     out_label = np.zeros((n_time, n_trades), dtype=np.int8)
     out_price = np.zeros((n_time, n_trades), dtype=np.float32)
-    out_carry = np.zeros((n_time, n_trades), dtype=np.float32)
+    out_drift = np.zeros((n_time, n_trades), dtype=np.float32) # Capture Total Drift PnL
     out_total = np.zeros((n_time, n_trades), dtype=np.float32)
     out_exit_idx  = np.zeros((n_time, n_trades), dtype=np.int32)
     out_exit_rate = np.zeros((n_time, n_trades), dtype=np.float32)
@@ -54,17 +59,11 @@ def scan_pnl_audit(
     for j in numba.prange(n_trades):
         for i in range(n_time):
             # --- Dynamic Vertical Barrier ---
-            # If HL=300 (30 days), we give it 600 hours.
-            # If HL=10 (1 day), we give it 20 hours (but floored at min_hold if needed?)
-            # Actually, standard logic is just 2 * HL. 
-            # But for Momentum (999), we cap/floor it.
-            
             hl_val = halflife_idxs[i, j]
-            
-            # Logic: If HL is "Infinite" (Momentum > 500), cap at 120 (1 week).
-            # If HL is Real (Reversion < 500), give it 2 * HL.
+            # If HL is "Infinite" (Momentum > 500), cap at 1 week (120h).
+            # If HL is Real (Reversion < 500), use 2 * HL.
             if hl_val > 500:
-                steps = 120 # 1 Week for Momentum
+                steps = 120 
             else:
                 steps = int(hl_val * 2.0)
                 if steps < 5: steps = 5
@@ -75,56 +74,59 @@ def scan_pnl_audit(
             # Entry State
             rate_in = entry_rates[i, j]
             drift_in = drift_cumsums[i, j]
+            roll_in = roll_cumsums[i, j]
             
-            best_price, best_carry, best_total = 0.0, 0.0, -999.0
+            best_price, best_drift, best_total = 0.0, 0.0, -999.0
             final_idx = end_idx - 1
             won, stopped = False, False
             
             # --- Path Traversal ---
             for k in range(i + 1, end_idx):
-                # 1. Calc PnL
-                curr_price = (rate_in - entry_rates[k, j]) * 100.0 
-                curr_carry = drift_cumsums[k, j] - drift_in        
-                curr_total = curr_price + curr_carry               
+                # 1. Calculate Standard PnL Components
+                curr_price = (rate_in - entry_rates[k, j]) * 100.0
+                curr_drift = drift_cumsums[k, j] - drift_in # Drift = Carry + Roll
+                curr_total = curr_price + curr_drift        # Total = Price + Drift
                 
-                # 2. Lower Barrier (Stop Loss)
+                # 2. Calculate Quality PnL
+                # For Curves: roll_cumsums is passed as Zeros, so Quality = Price
+                # For Flys: roll_cumsums is passed as Actual, so Quality = Price + Roll
+                curr_roll = roll_cumsums[k, j] - roll_in
+                curr_quality = curr_price + curr_roll
+                
+                # Lower Barrier (Stop Loss)
                 if curr_total <= stop_loss:
                     out_label[i, j] = 0
-                    out_price[i, j] = curr_price
-                    out_carry[i, j] = curr_carry
-                    out_total[i, j] = curr_total
-                    final_idx = k
-                    stopped = True
+                    out_price[i, j] = curr_price; out_drift[i, j] = curr_drift
+                    out_total[i, j] = curr_total; final_idx = k; stopped = True
                     break
                 
-                # 3. Upper Barrier (Take Profit)
-                if (curr_price >= price_hurdle) and (curr_total >= total_hurdle):
+                # Upper Barrier (Win)
+                # Must satisfy BOTH Total and Quality thresholds
+                if (curr_quality >= price_hurdle) and (curr_total >= total_hurdle):
                     out_label[i, j] = 1
-                    out_price[i, j] = curr_price
-                    out_carry[i, j] = curr_carry
-                    out_total[i, j] = curr_total
-                    final_idx = k
-                    won = True
+                    out_price[i, j] = curr_price; out_drift[i, j] = curr_drift
+                    out_total[i, j] = curr_total; final_idx = k; won = True
                     break
                 
-                # Track 'Exit at Vertical Barrier' state
-                best_price, best_carry, best_total = curr_price, curr_carry, curr_total
+                best_price, best_drift, best_total = curr_price, curr_drift, curr_total
             
             # 4. Vertical Barrier Exit
             if not won and not stopped:
-                out_price[i, j] = best_price
-                out_carry[i, j] = best_carry
+                out_price[i, j] = best_price; out_drift[i, j] = best_drift
                 out_total[i, j] = best_total
                 
             out_exit_idx[i, j] = final_idx
             out_exit_rate[i, j] = entry_rates[final_idx, j]
 
-    return out_label, out_price, out_carry, out_total, out_exit_idx, out_exit_rate
+    return out_label, out_price, out_drift, out_total, out_exit_idx, out_exit_rate
 
 # ==============================================================================
-# 2. FEATURE PROJECTION
+# 2. HELPER FUNCTIONS
 # ==============================================================================
 def get_pivots(df):
+    """
+    Pivots numeric columns only. Skips strings to prevent ValueError.
+    """
     pivots = {}
     potential_cols = [c for c in df.columns if c not in ['ts', 'tenor_yrs']]
     for c in potential_cols:
@@ -171,49 +173,35 @@ def make_inverse(df):
         if c in df_inv.columns: df_inv[c] *= -1
     df_inv['target_label'] = ((df_inv['aux_price_pnl'] >= 1.0) & (df_inv['aux_total_pnl'] >= 2.0)).astype(np.int8)
     return df_inv
-    
+
 def save_by_month_incremental(data, idx_time, prefix):
     """
-    Slices the massive numpy arrays by month and saves incrementally.
-    Prevents holding a 20M+ row DataFrame in RAM.
+    Slices arrays by month and saves incrementally to manage memory.
     """
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
-    
-    # 1. Identify Months from the Timestamp Array
-    # idx_time corresponds 1:1 with the rows in 'data'
     ts_series = pd.to_datetime(idx_time)
     months = ts_series.strftime("%y%m")
     unique_months = np.unique(months)
     
     print(f"   Streaming {len(unique_months)} months to disk...")
-    
     for m in unique_months:
-        # 2. Boolean Mask (Fast)
         mask = (months == m)
         if not np.any(mask): continue
-        
-        # 3. Slice Dictionary (Cheap)
-        # We only materialize the DataFrame for this specific month
         batch_data = {k: v[mask] for k, v in data.items()}
-        
-        # 4. Create & Save Small DataFrame
         try:
             df_chunk = pd.DataFrame(batch_data)
             df_inv = make_inverse(df_chunk)
             final = pd.concat([df_chunk, df_inv], ignore_index=True)
-            
             out_p = path_enh / f"training_{prefix}_{m}.parquet"
             final.to_parquet(out_p, index=False)
             print(f"      -> {out_p.name} ({len(final)} rows)")
         except Exception as e:
             print(f"      [ERR] Failed to save {m}: {e}")
-        
-        # 5. Immediate Cleanup
         del df_chunk, df_inv, final, batch_data
         gc.collect()
 
 # ==============================================================================
-# 3. BUILDER: CURVES
+# 3. BUILDER: CURVES (Net Roll = 0)
 # ==============================================================================
 def build_curves(pivots, tenors):
     print(f"   Building CURVES on full history ({len(pivots['rate'])} rows)...")
@@ -231,7 +219,6 @@ def build_curves(pivots, tenors):
         W[i1, j] = 1.0; W[i2, j] = -1.0
     W_abs = np.abs(W)
     
-    # 1. Full History Calculations (Fast in Numpy)
     data = project_standard_features(pivots, W, W_abs, ids)
     
     idx_map_1 = [tenors.index(c[0]) for c in combos]
@@ -241,7 +228,6 @@ def build_curves(pivots, tenors):
     
     target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
     L1_drift, L2_drift = None, None
-    
     for feat in pivots.keys():
         is_target = any(t in feat for t in target_legs)
         is_event = 'hours_to_' in feat
@@ -267,35 +253,39 @@ def build_curves(pivots, tenors):
 
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_dist'] = np.tile(dist_arr, n_time)
     
+    # Drift Logic
     drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
     if drift_key not in pivots: raise KeyError("Missing Drift Column")
+    net_rates = rate_vals @ W
+    net_drift = pivots[drift_key].values @ W
     
-    net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
+    # --- CURVE SPECIFIC: Net Roll = 0 (Strict Price Hurdle) ---
+    net_roll = np.zeros_like(net_drift)
+    
     hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
     
-    labels, prices, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
-        net_rates, net_drift, hl_buckets.reshape(n_time, n_trades), 
+    labels, prices, drifts, totals, ex_idx, ex_rate = scan_pnl_audit(
+        net_rates, net_drift, net_roll, # Pass Zeros
+        hl_buckets.reshape(n_time, n_trades), 
         price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
     
+    # Audit Columns
     data['L1_entry_rate'] = L1_rate_mat.ravel(); data['L2_entry_rate'] = L2_rate_mat.ravel()
     data['L1_exit_rate'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
     data['L2_exit_rate'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
     all_ts = pivots['rate'].index.values; data['aux_exit_ts'] = all_ts[ex_idx.ravel()]
     
     data['target_label'] = labels.ravel(); data['aux_price_pnl'] = prices.ravel()
-    data['aux_carry_pnl'] = carries.ravel(); data['aux_total_pnl'] = totals.ravel()
+    data['aux_carry_pnl'] = drifts.ravel(); data['aux_total_pnl'] = totals.ravel()
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
     data['aux_exit_idx'] = ex_idx.ravel()
     
-    # 2. STREAMING SAVE (Memory Fix)
     save_by_month_incremental(data, idx_time, "curves")
-    
-    # Clear Memory
-    del data, net_rates, net_drift, labels, prices, carries, totals
+    del data, net_rates, net_drift, net_roll, labels, prices, drifts, totals
     gc.collect()
 
 # ==============================================================================
-# 4. BUILDER: FLYS
+# 4. BUILDER: FLYS (Net Roll = Actual)
 # ==============================================================================
 def build_flys(pivots, tenors):
     print(f"   Building FLYS on full history ({len(pivots['rate'])} rows)...")
@@ -350,10 +340,19 @@ def build_flys(pivots, tenors):
     drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
     if drift_key not in pivots: raise KeyError("Missing Drift Column")
     net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
+    
+    # --- FLY SPECIFIC: Use Actual Rolldown ---
+    roll_key = 'roll_bps_day_cumsum' if 'roll_bps_day_cumsum' in pivots else 'roll_bps_cumsum'
+    if roll_key in pivots:
+        net_roll = pivots[roll_key].values @ W
+    else:
+        net_roll = np.zeros_like(net_drift) # Fallback
+
     hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 
     
-    labels, prices, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
-        net_rates, net_drift, hl_buckets.reshape(n_time, n_trades), 
+    labels, prices, drifts, totals, ex_idx, ex_rate = scan_pnl_audit(
+        net_rates, net_drift, net_roll, # Pass Actual Roll
+        hl_buckets.reshape(n_time, n_trades), 
         price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
     
     data['L1_entry_rate'] = L1_rate_mat.ravel(); data['L2_entry_rate'] = L2_rate_mat.ravel(); data['L3_entry_rate'] = L3_rate_mat.ravel()
@@ -363,18 +362,16 @@ def build_flys(pivots, tenors):
     all_ts = pivots['rate'].index.values; data['aux_exit_ts'] = all_ts[ex_idx.ravel()]
     
     data['target_label'] = labels.ravel(); data['aux_price_pnl'] = prices.ravel()
-    data['aux_carry_pnl'] = carries.ravel(); data['aux_total_pnl'] = totals.ravel()
+    data['aux_carry_pnl'] = drifts.ravel(); data['aux_total_pnl'] = totals.ravel()
     data['aux_entry_rate'] = net_rates.ravel(); data['aux_exit_rate'] = ex_rate.ravel()
     data['aux_exit_idx'] = ex_idx.ravel()
     
-    # 2. STREAMING SAVE
     save_by_month_incremental(data, idx_time, "flys")
-    
-    del data, net_rates, net_drift, labels, prices, carries, totals
+    del data, net_rates, net_drift, net_roll, labels, prices, drifts, totals
     gc.collect()
 
 # ==============================================================================
-# 5. ORCHESTRATOR (Full History Stitch)
+# 5. ORCHESTRATOR
 # ==============================================================================
 def process_full_history():
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
@@ -397,7 +394,6 @@ def process_full_history():
     pivots = get_pivots(df_full)
     tenors = sorted(pivots['rate'].columns)
     
-    # The builders now handle saving internally to manage memory
     build_curves(pivots, tenors)
     build_flys(pivots, tenors)
     
