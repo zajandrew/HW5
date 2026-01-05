@@ -1,13 +1,12 @@
 """
-strategy_generator.py (v12.0 - Strict Feature Hygiene)
+strategy_generator.py (v13.0 - Audit Precision & PnL Breakdown)
 
 Role:
 1. Ingests full history.
 2. Constructs synthetic instruments.
-3. Implements strict naming convention:
-   - FEATURES: 'NET_*', 'meta_*' (e.g., meta_fly_width)
-   - DROP/AUDIT: '*_drop' (e.g., audit_pnl_drop, L1_rate_raw_drop)
-4. Simulates execution via Triple Barrier.
+3. Implements strict naming convention (Features vs. _drop).
+4. Simulates execution via Triple Barrier with explicit PnL breakdown.
+   - Separate columns for Price, Roll, and Pure Carry PnL.
 5. Slices output to monthly files.
 """
 
@@ -26,24 +25,33 @@ import config as cr
 @numba.njit(parallel=True)
 def scan_pnl_audit(
     entry_rates, 
-    drift_cumsums, 
-    roll_cumsums, 
+    drift_cumsums,    # Total Drift (Carry + Roll)
+    roll_cumsums,     # Rolldown Component
     halflife_idxs, 
     price_hurdle, 
     total_hurdle, 
     stop_loss, 
+    use_roll_in_quality, # <--- NEW: Logic Flag (True for Flys, False for Curves)
     min_hold_steps=120
 ):
     """
-    Triple Barrier Method (Standard).
-    Returns arrays corresponding to the *Exit Event* (Future Data).
+    Triple Barrier Method with Granular Audit.
+    
+    Logic:
+    1. Total PnL   = Price + Total Drift
+    2. Roll PnL    = Roll_Exit - Roll_Entry
+    3. Carry PnL   = Total_Drift_PnL - Roll_PnL (Derived Pure Carry)
+    4. Quality PnL = Price + (Roll if use_roll_in_quality else 0)
+    
+    Win Condition: Total >= 2bps AND Quality >= 1bp
     """
     n_time, n_trades = entry_rates.shape
     
     # Audit Containers
     out_label = np.zeros((n_time, n_trades), dtype=np.int8)
     out_price = np.zeros((n_time, n_trades), dtype=np.float32)
-    out_drift = np.zeros((n_time, n_trades), dtype=np.float32)
+    out_roll  = np.zeros((n_time, n_trades), dtype=np.float32) # Explicit Roll
+    out_carry = np.zeros((n_time, n_trades), dtype=np.float32) # Explicit Pure Carry
     out_total = np.zeros((n_time, n_trades), dtype=np.float32)
     out_exit_idx  = np.zeros((n_time, n_trades), dtype=np.int32)
     out_exit_rate = np.zeros((n_time, n_trades), dtype=np.float32)
@@ -60,47 +68,59 @@ def scan_pnl_audit(
             end_idx = min(i + steps, n_time)
             if end_idx <= i + 1: continue
 
-            # Entry
-            rate_in = entry_rates[i, j]
+            # Entry State
+            rate_in  = entry_rates[i, j]
             drift_in = drift_cumsums[i, j]
-            roll_in = roll_cumsums[i, j]
+            roll_in  = roll_cumsums[i, j]
             
-            best_price, best_drift, best_total = 0.0, 0.0, -999.0
+            best_price, best_roll, best_carry, best_total = 0.0, 0.0, 0.0, -999.0
             final_idx = end_idx - 1
             won, stopped = False, False
             
             # Path Traversal
             for k in range(i + 1, end_idx):
+                # 1. Component Calculation
                 curr_price = (rate_in - entry_rates[k, j]) * 100.0
-                curr_drift = drift_cumsums[k, j] - drift_in
-                curr_total = curr_price + curr_drift
                 
-                # Quality Check (Curves: Roll=0, Flys: Roll=Actual)
-                curr_roll = roll_cumsums[k, j] - roll_in
-                curr_quality = curr_price + curr_roll
+                # Accruals
+                total_drift_pnl = drift_cumsums[k, j] - drift_in
+                curr_roll       = roll_cumsums[k, j] - roll_in
+                curr_carry      = total_drift_pnl - curr_roll # Pure Carry
                 
+                curr_total = curr_price + total_drift_pnl
+                
+                # 2. Quality Logic (Strategy Specific)
+                if use_roll_in_quality:
+                    curr_quality = curr_price + curr_roll # Flys
+                else:
+                    curr_quality = curr_price # Curves
+                
+                # 3. Stop Loss
                 if curr_total <= stop_loss:
                     out_label[i, j] = 0
-                    out_price[i, j] = curr_price; out_drift[i, j] = curr_drift
-                    out_total[i, j] = curr_total; final_idx = k; stopped = True
+                    out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
+                    out_carry[i, j] = curr_carry; out_total[i, j] = curr_total
+                    final_idx = k; stopped = True
                     break
                 
+                # 4. Take Profit (Win)
                 if (curr_quality >= price_hurdle) and (curr_total >= total_hurdle):
                     out_label[i, j] = 1
-                    out_price[i, j] = curr_price; out_drift[i, j] = curr_drift
-                    out_total[i, j] = curr_total; final_idx = k; won = True
+                    out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
+                    out_carry[i, j] = curr_carry; out_total[i, j] = curr_total
+                    final_idx = k; won = True
                     break
                 
-                best_price, best_drift, best_total = curr_price, curr_drift, curr_total
+                best_price, best_roll, best_carry, best_total = curr_price, curr_roll, curr_carry, curr_total
             
             if not won and not stopped:
-                out_price[i, j] = best_price; out_drift[i, j] = best_drift
-                out_total[i, j] = best_total
+                out_price[i, j] = best_price; out_roll[i, j] = best_roll
+                out_carry[i, j] = best_carry; out_total[i, j] = best_total
                 
             out_exit_idx[i, j] = final_idx
             out_exit_rate[i, j] = entry_rates[final_idx, j]
 
-    return out_label, out_price, out_drift, out_total, out_exit_idx, out_exit_rate
+    return out_label, out_price, out_roll, out_carry, out_total, out_exit_idx, out_exit_rate
 
 # ==============================================================================
 # 2. HELPER FUNCTIONS
@@ -123,10 +143,12 @@ def calc_modified_carry(z_arr, drift_arr):
 def project_standard_features(pivots, W, W_abs, trade_names):
     data = {}
     REGIME_KEYS = ['halflife', 'scale', 'dv01', 'exog_', 'pca_error_norm']
-    SKIP_KEYS   = ['cumsum', 'hours_to_'] 
+    # Explicitly drop 'hours_elapsed', 'accrued', 'cumsum' from FEATURES
+    # We will grab cumsum later specifically for PnL, but they shouldn't be features.
+    DROP_KEYWORDS = ['cumsum', 'hours_to_', 'hours_elapsed', 'accrued'] 
 
     for name, mat in pivots.items():
-        if any(x in name for x in SKIP_KEYS): continue
+        if any(x in name for x in DROP_KEYWORDS): continue
         is_regime = any(k in name for k in REGIME_KEYS)
         vals = mat.values
         
@@ -144,9 +166,7 @@ def project_standard_features(pivots, W, W_abs, trade_names):
 def make_inverse(df):
     """
     Creates Inverse trades.
-    Only flips:
-    1. Features with directional keywords (NET_z, NET_drift).
-    2. Audit PnL columns (ending in _drop).
+    Strictly flips Features AND Audit PnL columns.
     """
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
@@ -166,7 +186,7 @@ def make_inverse(df):
     # 2. Flip Audit PnL (Future Data)
     # We look for '_drop' columns that imply PnL
     for c in df_inv.columns:
-        if c.endswith('_drop') and any(x in c for x in ['pnl', 'drift']):
+        if c.endswith('_drop') and any(x in c for x in ['pnl', 'drift', 'roll', 'carry']):
             cols_to_flip.append(c)
 
     for c in cols_to_flip:
@@ -219,11 +239,9 @@ def build_curves(pivots, tenors):
         W[i1, j] = 1.0; W[i2, j] = -1.0
     W_abs = np.abs(W)
     
-    # 1. Base Features
     data = project_standard_features(pivots, W, W_abs, ids)
     data['meta_direction'] = np.ones(n_time * n_trades, dtype=np.float32)
     
-    # 2. Leg Logic (With Strict Dropping)
     idx_map_1 = [tenors.index(c[0]) for c in combos]
     idx_map_2 = [tenors.index(c[1]) for c in combos]
     rate_vals = pivots['rate'].values
@@ -231,7 +249,6 @@ def build_curves(pivots, tenors):
     
     target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
     L1_drift, L2_drift = None, None
-    
     for feat in pivots.keys():
         is_target = any(t in feat for t in target_legs)
         is_event = 'hours_to_' in feat
@@ -244,13 +261,9 @@ def build_curves(pivots, tenors):
             data[f"NET_{clean}_min"] = np.minimum(l1, l2)
         else:
             if feat == 'rate':
-                # RAW RATES are dropped from features
-                data[f"L1_{clean}_raw_drop"] = l1
-                data[f"L2_{clean}_raw_drop"] = l2
+                data[f"L1_{clean}_raw_drop"] = l1; data[f"L2_{clean}_raw_drop"] = l2
             else:
-                # Other leg stats (Drift, Z) are kept as features
                 data[f"L1_{clean}"] = l1; data[f"L2_{clean}"] = l2
-                
             if feat == 'total_drift_day': L1_drift, L2_drift = l1, l2
             if feat == 'z_comb': data['NET_leg_stress'] = np.maximum(np.abs(l1), np.abs(l2))
 
@@ -266,20 +279,30 @@ def build_curves(pivots, tenors):
 
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_dist'] = np.tile(dist_arr, n_time)
     
+    # Calculate Net PnL Vectors
     drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
     if drift_key not in pivots: raise KeyError("Missing Drift Column")
-    net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
     
-    # --- CURVES: Net Roll = 0 ---
-    net_roll = np.zeros_like(net_drift)
+    roll_key = 'roll_bps_day_cumsum' if 'roll_bps_day_cumsum' in pivots else 'roll_bps_cumsum'
+    # Fallback to zero if roll not found, but it should be there for correct audit
+    if roll_key in pivots:
+        net_roll = pivots[roll_key].values @ W
+    else:
+        net_roll = np.zeros((n_time, n_trades), dtype=np.float32)
+
+    net_rates = rate_vals @ W
+    net_drift = pivots[drift_key].values @ W
     hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
     
-    labels, prices, drifts, totals, ex_idx, ex_rate = scan_pnl_audit(
+    # --- CURVES: Pass True Roll, but use_roll_in_quality=False ---
+    labels, prices, rolls, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, net_roll,
         hl_buckets.reshape(n_time, n_trades), 
-        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5,
+        use_roll_in_quality=False # Strict Price Check
+    )
     
-    # Audit Columns (All end with _drop)
+    # Audit Columns (Strict _drop)
     data['audit_L1_entry_rate_drop'] = L1_rate_mat.ravel()
     data['audit_L2_entry_rate_drop'] = L2_rate_mat.ravel()
     data['audit_L1_exit_rate_drop'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
@@ -290,14 +313,15 @@ def build_curves(pivots, tenors):
     
     data['target_label'] = labels.ravel()
     data['audit_price_pnl_drop'] = prices.ravel()
-    data['audit_carry_pnl_drop'] = drifts.ravel()
+    data['audit_roll_pnl_drop']  = rolls.ravel()  # NEW
+    data['audit_carry_pnl_drop'] = carries.ravel()
     data['audit_total_pnl_drop'] = totals.ravel()
     data['audit_entry_rate_drop'] = net_rates.ravel()
     data['audit_exit_rate_drop'] = ex_rate.ravel()
     data['audit_exit_idx_drop'] = ex_idx.ravel()
     
     save_by_month_incremental(data, idx_time, "curves")
-    del data, net_rates, net_drift, net_roll, labels, prices, drifts, totals
+    del data, net_rates, net_drift, net_roll, labels, prices, rolls, carries, totals
     gc.collect()
 
 # ==============================================================================
@@ -370,50 +394,49 @@ def build_flys(pivots, tenors):
          if 'L3_z' in data: data['L3_z_modified'] = calc_modified_carry(data['L3_z'], L3_drift)
 
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_t2'] = t2
-    
-    # NEW METADATA
     data['meta_fly_width']  = np.tile(fly_width_arr, n_time)
     data['meta_belly_ratio'] = np.tile(belly_ratio_arr, n_time)
     
     drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
     if drift_key not in pivots: raise KeyError("Missing Drift Column")
-    net_rates = rate_vals @ W; net_drift = pivots[drift_key].values @ W
     
-    # --- FLYS: Use Actual Rolldown ---
     roll_key = 'roll_bps_day_cumsum' if 'roll_bps_day_cumsum' in pivots else 'roll_bps_cumsum'
     if roll_key in pivots:
         net_roll = pivots[roll_key].values @ W
     else:
-        net_roll = np.zeros_like(net_drift)
+        net_roll = np.zeros((n_time, n_trades), dtype=np.float32)
 
+    net_rates = rate_vals @ W
+    net_drift = pivots[drift_key].values @ W
     hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 
     
-    labels, prices, drifts, totals, ex_idx, ex_rate = scan_pnl_audit(
+    # --- FLYS: Pass True Roll, use_roll_in_quality=True ---
+    labels, prices, rolls, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, net_roll,
         hl_buckets.reshape(n_time, n_trades), 
-        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5)
+        price_hurdle=1.0, total_hurdle=2.0, stop_loss=-1.5,
+        use_roll_in_quality=True # Price + Roll Check
+    )
     
-    # Audit Columns (All end with _drop)
     data['audit_L1_entry_rate_drop'] = L1_rate_mat.ravel()
     data['audit_L2_entry_rate_drop'] = L2_rate_mat.ravel()
     data['audit_L3_entry_rate_drop'] = L3_rate_mat.ravel()
     data['audit_L1_exit_rate_drop'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
     data['audit_L2_exit_rate_drop'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
     data['audit_L3_exit_rate_drop'] = np.take_along_axis(L3_rate_mat, ex_idx, axis=0).ravel()
-    
-    all_ts = pivots['rate'].index.values
-    data['audit_exit_ts_drop'] = all_ts[ex_idx.ravel()]
+    all_ts = pivots['rate'].index.values; data['audit_exit_ts_drop'] = all_ts[ex_idx.ravel()]
     
     data['target_label'] = labels.ravel()
     data['audit_price_pnl_drop'] = prices.ravel()
-    data['audit_carry_pnl_drop'] = drifts.ravel()
+    data['audit_roll_pnl_drop']  = rolls.ravel()
+    data['audit_carry_pnl_drop'] = carries.ravel()
     data['audit_total_pnl_drop'] = totals.ravel()
     data['audit_entry_rate_drop'] = net_rates.ravel()
     data['audit_exit_rate_drop'] = ex_rate.ravel()
     data['audit_exit_idx_drop'] = ex_idx.ravel()
     
     save_by_month_incremental(data, idx_time, "flys")
-    del data, net_rates, net_drift, net_roll, labels, prices, drifts, totals
+    del data, net_rates, net_drift, net_roll, labels, prices, rolls, carries, totals
     gc.collect()
 
 # ==============================================================================
