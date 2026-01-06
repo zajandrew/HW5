@@ -174,12 +174,16 @@ def project_standard_features(pivots, W, W_abs, trade_names):
 
 def make_inverse(df):
     """
-    Creates Inverse trades.
-    Handles Multiclass Inversion:
-      Long Class 2 (Alpha Win) -> Short Class 0 (Loss)
-      Long Class 0 (Loss) -> Short Class 2 (Alpha Win) -- IF PnL flips favorably
-    Because PnL is non-linear (stops/targets), we re-calculate label 
-    based on the flipped Audit PnL columns.
+    Creates Inverse trades (Shorts).
+    
+    Logic Update:
+    1. Flips signs of directional features and Audit PnL columns.
+    2. Re-calculates 'target_multiclass' and 'target_binary' using the 
+       new 50% Quality Ratio logic on the FLIPPED PnL.
+       
+    Quality Definition:
+    - Flys: Quality = Price PnL + Roll PnL
+    - Curves: Quality = Price PnL only
     """
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
@@ -187,7 +191,7 @@ def make_inverse(df):
     
     cols_to_flip = []
     
-    # 1. Features
+    # 1. Flip Directional Features
     directional_keywords = [
         'z', 'drift', 'rate', 'slope', 'accel', 'divergence', 'ratio', 
         'modified', 'leakage', 'stress', 'sharpe', 'roll', 'carry'
@@ -196,7 +200,7 @@ def make_inverse(df):
         if c.startswith('NET_') and any(x in c for x in directional_keywords):
             cols_to_flip.append(c)
             
-    # 2. Audit PnL (Future Data)
+    # 2. Flip Audit PnL (Future Data)
     for c in df_inv.columns:
         if c.endswith('_drop') and any(x in c for x in ['pnl', 'drift', 'roll', 'carry']):
             cols_to_flip.append(c)
@@ -204,36 +208,46 @@ def make_inverse(df):
     for c in cols_to_flip:
         if c in df_inv.columns: df_inv[c] *= -1
     
-    # --- RE-CALCULATE LABELS FROM FLIPPED PNL ---
-    # Note: We can't perfectly reconstruct the Barrier Logic without re-running 
-    # the loop, but using the end-state PnL is the standard approximation for inverses.
-    # Strict reconstruction would require re-running scan_pnl_audit on inverted rates.
-    # For now, we approximate using the flipped final PnL.
+    # --- RE-CALCULATE LABELS (Ratio Logic) ---
     
-    pnl = df_inv['audit_total_pnl_drop']
-    # Quality logic depends on strategy, but we can infer from columns
-    # We need to know if it's Fly (roll included) or Curve (roll excluded).
-    # Since we don't pass that flag here, we check if 'audit_roll_pnl_drop' is all 0.
-    
-    # Heuristic: If Roll PnL is exactly 0 everywhere, it's likely a Curve.
-    is_fly = np.any(df_inv['audit_roll_pnl_drop'] != 0)
-    
+    # A. Define Components
+    pnl   = df_inv['audit_total_pnl_drop']
     price = df_inv['audit_price_pnl_drop']
     roll  = df_inv['audit_roll_pnl_drop']
-    quality = (price + roll) if is_fly else price
     
-    # Vectorized Class Logic
-    # Default 0
+    # B. Define Quality based on Instrument Type
+    # We check for 'meta_fly_width' which is only present in Flys.
+    if 'meta_fly_width' in df_inv.columns:
+        # Fly Logic: Quality includes Roll
+        quality = price + roll
+    else:
+        # Curve Logic: Quality is Price only
+        quality = price
+    
+    # C. Vectorized Classification
     new_labels = np.zeros(len(df_inv), dtype=np.int8)
     
-    # Class 2 (Alpha): Total >= 2.0 AND Quality >= 1.0
-    mask_2 = (pnl >= 2.0) & (quality >= 1.0)
+    # Viability Floor (Must clear 2.0 bps)
+    is_viable = (pnl >= 2.0)
+    
+    # Ratio Check (Quality must be >= 50% of Total)
+    # Handle Division by Zero safely (if pnl is 0, ratio is 0)
+    ratio = np.zeros_like(pnl)
+    nonzero = (pnl != 0)
+    ratio[nonzero] = quality[nonzero] / pnl[nonzero]
+    
+    is_quality = (ratio >= 0.50)
+    
+    # Class 2 (Alpha): Viable AND Quality
+    mask_2 = is_viable & is_quality
     new_labels[mask_2] = 2
     
-    # Class 1 (Weak): (Total >= 2.0 & Quality < 1.0) OR (Total > 0 & Total < 2.0)
-    # Simplified: Total > 0 AND not Class 2
+    # Class 1 (Weak): Positive PnL but failed Class 2 requirements
+    # (Either < 2.0bps profit OR < 50% Quality)
     mask_1 = (pnl > 0) & (~mask_2)
     new_labels[mask_1] = 1
+    
+    # Class 0 is default (0 or negative PnL)
     
     df_inv['target_multiclass'] = new_labels
     df_inv['target_binary'] = (new_labels == 2).astype(np.int8)
