@@ -36,11 +36,11 @@ def scan_pnl_audit(
     min_hold_steps=120
 ):
     """
-    Triple Barrier Method with Multiclass Output.
+    Triple Barrier Method with 50% Quality Ratio Logic.
     
     Classes:
-    2 = Alpha Win (Total >= Hurdle AND Quality >= Hurdle)
-    1 = Weak Win  (Total >= Hurdle but Quality Failed OR Time Exit > 0)
+    2 = Alpha Win (Total >= Hurdle AND Quality Ratio >= 50%)
+    1 = Weak Win  (Total >= Hurdle but Quality Ratio < 50% OR Drifted Positive)
     0 = Loss      (Stop Loss or Time Exit <= 0)
     """
     n_time, n_trades = entry_rates.shape
@@ -97,9 +97,12 @@ def scan_pnl_audit(
                     final_idx = k; stopped = True
                     break
                 
-                # 2. Profit Target Hit
+                # 2. Profit Target Hit (Viability Floor)
                 if curr_total >= total_hurdle:
-                    if curr_quality >= price_hurdle:
+                    # Calculate Ratio (Avoid Div/0)
+                    ratio = curr_quality / curr_total if curr_total > 0 else 0.0
+                    
+                    if ratio >= 0.50:
                         # Alpha Win (Class 2)
                         out_multi[i, j] = 2
                     else:
@@ -118,8 +121,10 @@ def scan_pnl_audit(
                 out_price[i, j] = best_price; out_roll[i, j] = best_roll
                 out_carry[i, j] = best_carry; out_total[i, j] = best_total
                 
+                # If drifted positive at exit, mark as Weak Win (Class 1)
+                # This ensures we don't accidentally train on these as 'Alpha'
                 if best_total > 0.0:
-                    out_multi[i, j] = 1 # Weak Win (Drifted Green)
+                    out_multi[i, j] = 1 
                 else:
                     out_multi[i, j] = 0 # Loss
                 
@@ -127,7 +132,7 @@ def scan_pnl_audit(
             out_exit_rate[i, j] = entry_rates[final_idx, j]
 
     return out_multi, out_price, out_roll, out_carry, out_total, out_exit_idx, out_exit_rate
-
+   
 # ==============================================================================
 # 2. HELPER FUNCTIONS
 # ==============================================================================
