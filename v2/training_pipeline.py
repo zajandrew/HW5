@@ -1,10 +1,11 @@
 """
-training_pipeline.py (v19.0 - Simple Iterator with Feature Diet)
+training_pipeline.py (v19.0 - Robust Walk-Forward with Feature Diet)
 
 Role:
-1. Reverts to simple ParquetIterator (No PyArrow Streaming/Dask).
-2. Implements "Feature Diet": Drops L1/L2/L3 raw columns at load time.
-3. Supports 18-Month Walk-Forward & Purge/Standard Modes.
+1. Implements "Rich Net / Lean Legs" loading logic (Filters columns on read).
+2. Uses Robust "Financial" XGBoost settings (Depth 4, Min Child 250).
+3. Dynamically calculates Class Imbalance (scale_pos_weight) for each window.
+4. Supports Purge Mode (removing weak wins from training).
 
 Usage:
     python training_pipeline.py
@@ -25,55 +26,71 @@ import config as cr
 # CONFIGURATION
 # ==============================================================================
 
-# Windows GPU DLL Fix (Kept silent to prevent import crashes)
+# Windows GPU DLL Fix
 try:
     ctypes.WinDLL("nvrtc-builtins64_129.dll")
 except: pass
 
-XGB_PARAMS = {
+# ROBUST FINANCIAL SETTINGS
+# High min_child_weight and low max_depth prevent overfitting specific noise events.
+BASE_XGB_PARAMS = {
     'booster': 'gbtree',
     'objective': 'binary:logistic',
-    'eval_metric': 'logloss',
+    'eval_metric': 'auc',          # AUC is better for ranking quality than logloss
     'tree_method': 'hist',
-    'device': 'cuda',  # XGBoost will find your A4000 automatically
+    'device': 'cuda',
     'max_bin': 256,
-    'learning_rate': 0.01,
-    'max_depth': 6,
-    'min_child_weight': 1,
-    'gamma': 0.0,
+    
+    # --- ROBUSTNESS ---
+    'learning_rate': 0.05,         # Higher than 0.01 for faster research iteration
+    'max_depth': 4,                # Shallow trees force broad theme learning
+    'min_child_weight': 250,       # CRITICAL: Requires ~250 samples to make a decision rule
+    
+    # --- RANDOMNESS ---
+    'gamma': 0.1,
     'subsample': 0.70,
-    'colsample_bytree': 0.50,
-    'reg_lambda': 1.0,
-    'scale_pos_weight': 1.0
+    'colsample_bytree': 0.40,      # Force model to look at diverse features
+    
+    # --- REGULARIZATION ---
+    'reg_lambda': 1.0,             # L2
+    'reg_alpha': 0.5,              # L1 (Lasso) helps zero out bad features
+    
+    # 'scale_pos_weight': SET DYNAMICALLY IN LOOP
 }
 
 TRAIN_WINDOW_MONTHS = 18
-NUM_ROUNDS = 5000
-EARLY_STOPPING = 200
+NUM_ROUNDS = 1000                  # Lowered to match LR 0.05
+EARLY_STOPPING = 50
 
 # ==============================================================================
-# 1. SIMPLE DATA ITERATOR (With Column Pruning)
+# 1. SMART ITERATOR (With Feature Diet)
 # ==============================================================================
 class ParquetIterator(xgb.DataIter):
     """
-    Standard Iterator (Loads 1 file at a time) but with aggressive column pruning.
+    Loads Parquet files one-by-one with "Rich Net / Lean Legs" filtering.
     """
     def __init__(self, file_paths, purge_mode):
         self.file_paths = file_paths
         self.purge_mode = purge_mode
         self.it = 0
         
-        # --- FEATURE DIET ---
-        # We determine which columns to load ONCE.
-        # This prevents loading 'L1_', 'audit_', etc. into RAM.
+        # --- FEATURE DIET LOGIC ---
+        # We determine the "Safe" columns once.
+        # Rule: Keep all NET/MACRO. Drop noisy variations of L1/L2/L3.
+        
+        # Blocklist: Leg-level features we don't need (Redundant/Noisy)
+        # We keep 'z_comb' and 'total_drift' as the "Anchors" for the legs.
+        LEG_BLOCKLIST = ['slope', 'accel', 'z_pca', 'z_spline', 'carry', 'roll', 
+                         'z_local', 'rng_pos', 'audit']
+
         try:
-            # Read schema only (instant)
+            # Read schema from first file
             schema = pq.read_schema(file_paths[0])
             all_cols = schema.names
             
             self.load_cols = []
             for c in all_cols:
-                # 1. Always keep Label
+                # 1. Always keep Target
                 if c == 'target_multiclass':
                     self.load_cols.append(c)
                     continue
@@ -82,13 +99,16 @@ class ParquetIterator(xgb.DataIter):
                 if c.endswith('_drop') or c.startswith('target_') or c in ['ts', 'trade_id']:
                     continue
                 
-                # 3. Drop Raw Legs (L1, L2, L3) -> Keep only NET_ features
+                # 3. LEAN LEGS FILTER
+                # If column belongs to a Leg (L1/L2/L3)
                 if c.startswith(('L1_', 'L2_', 'L3_')):
-                    continue
+                    # If it contains a blocked keyword, skip it
+                    if any(b in c for b in LEG_BLOCKLIST):
+                        continue
                     
                 self.load_cols.append(c)
                 
-            # print(f"   [Diet] Loading {len(self.load_cols)} columns (dropped {len(all_cols) - len(self.load_cols)})")
+            # print(f"   [Diet] Selected {len(self.load_cols)} columns (dropped {len(all_cols) - len(self.load_cols)})")
             
         except Exception as e:
             print(f"   [Warn] Schema read failed, loading all: {e}")
@@ -104,21 +124,18 @@ class ParquetIterator(xgb.DataIter):
         self.it += 1
         
         try:
-            # Load specific columns only (The optimization)
             df = pd.read_parquet(file, columns=self.load_cols)
             
             # --- PURGE LOGIC ---
             if self.purge_mode:
-                # Remove Class 1 (Weak Wins)
+                # Remove Class 1 (Weak/Drift Wins)
                 df = df[df['target_multiclass'] != 1]
             
-            # Create Binary Target (2 = Win, Else = Loss)
+            # Binary Target (2 = Alpha Win, Else = 0)
             y = (df['target_multiclass'] == 2).values.astype(np.float32)
             
-            # Drop Target from Features
             X = df.drop(columns=['target_multiclass'])
             
-            # Pass to XGBoost
             input_data(data=X.values.astype(np.float32), 
                        label=y,
                        feature_names=X.columns.tolist(),
@@ -128,7 +145,7 @@ class ParquetIterator(xgb.DataIter):
             
         except Exception as e:
             print(f"Error reading {file}: {e}")
-            return 1 # Skip file but keep going
+            return 1 
 
     def reset(self):
         self.it = 0
@@ -140,12 +157,41 @@ def get_file_list(strategy_type):
     return files
 
 # ==============================================================================
-# 2. WALK-FORWARD ENGINE
+# 2. HELPER: DYNAMIC BALANCE CALC
+# ==============================================================================
+def get_window_balance(files, purge_mode):
+    """
+    Quickly scans the targets of the training window to calculate scale_pos_weight.
+    Avoids lookahead bias by only scanning the current 'train_files'.
+    """
+    total_pos = 0
+    total_neg = 0
+    
+    # We only need the target column, very fast load
+    for f in files:
+        try:
+            df = pd.read_parquet(f, columns=['target_multiclass'])
+            if purge_mode:
+                df = df[df['target_multiclass'] != 1]
+            
+            n_pos = (df['target_multiclass'] == 2).sum()
+            n_total = len(df)
+            n_neg = n_total - n_pos
+            
+            total_pos += n_pos
+            total_neg += n_neg
+        except: pass
+        
+    if total_pos == 0: return 1.0
+    return total_neg / total_pos
+
+# ==============================================================================
+# 3. WALK-FORWARD ENGINE
 # ==============================================================================
 def run_walk_forward(strategy_type, purge_mode):
     files = get_file_list(strategy_type)
     if len(files) < (TRAIN_WINDOW_MONTHS + 1):
-        print(f"[{strategy_type}] Not enough data.")
+        print(f"[{strategy_type}] Not enough data (Need {TRAIN_WINDOW_MONTHS}+ months).")
         return
 
     mode_name = "PURGED" if purge_mode else "STANDARD"
@@ -161,17 +207,22 @@ def run_walk_forward(strategy_type, purge_mode):
         test_month = test_file.stem.split('_')[-1]
         train_months = [f.stem.split('_')[-1] for f in train_files]
         
-        print(f"[{mode_name}] Round {i}: Train {train_months[0]}-{train_months[-1]} -> Test {test_month}")
+        # 1. Calculate Dynamic Balance for THIS window
+        # This ensures we adapt if the market gets harder/easier over time
+        balance_ratio = get_window_balance(train_files, purge_mode)
         
-        # 1. Train Iterator (18 months)
+        current_params = BASE_XGB_PARAMS.copy()
+        current_params['scale_pos_weight'] = balance_ratio
+        
+        print(f"[{mode_name}] Round {i}: Train {train_months[0]}-{train_months[-1]} -> Test {test_month} (Ratio: {balance_ratio:.1f})")
+        
+        # 2. Iterators
         dtrain = xgb.QuantileDMatrix(ParquetIterator(train_files, purge_mode))
-        
-        # 2. Test Iterator (1 month)
         dtest  = xgb.QuantileDMatrix(ParquetIterator([test_file], purge_mode))
         
         # 3. Train
         model = xgb.train(
-            params=XGB_PARAMS,
+            params=current_params,
             dtrain=dtrain,
             num_boost_round=NUM_ROUNDS,
             evals=[(dtrain, 'train'), (dtest, 'eval')],
@@ -180,16 +231,15 @@ def run_walk_forward(strategy_type, purge_mode):
         )
         
         # 4. Score
-        # Minimal load for audit
         df_audit = pd.read_parquet(test_file, columns=['target_multiclass'])
-        
         if purge_mode:
              df_audit = df_audit[df_audit['target_multiclass'] != 1]
 
         y_true = (df_audit['target_multiclass'] == 2).values.astype(int)
         y_prob = model.predict(dtest)
         
-        y_pred = (y_prob > 0.52).astype(int)
+        # Simple threshold check (Can optimize this later)
+        y_pred = (y_prob > 0.50).astype(int)
         
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec  = recall_score(y_true, y_pred, zero_division=0)
@@ -205,12 +255,11 @@ def run_walk_forward(strategy_type, purge_mode):
         
         results.append({
             'test_month': test_month,
-            'train_start': train_months[0],
-            'train_end': train_months[-1],
             'auc': auc,
             'precision': prec,
             'recall': rec,
-            'best_iter': model.best_iteration
+            'best_iter': model.best_iteration,
+            'pos_ratio': balance_ratio
         })
         
         del dtrain, dtest, model, df_audit, y_true, y_prob
@@ -220,17 +269,16 @@ def run_walk_forward(strategy_type, purge_mode):
     pd.DataFrame(results).to_csv(out_csv, index=False)
 
 # ==============================================================================
-# 3. ORCHESTRATOR
+# 4. ORCHESTRATOR
 # ==============================================================================
 def run_both_modes():
     try:
-        # Curves
+        # Run Curves
         run_walk_forward("curves", purge_mode=True)
-        run_walk_forward("curves", purge_mode=False)
+        # run_walk_forward("curves", purge_mode=False) # Optional: Run standard if needed
         
-        # Flys (With column pruning, should handle 18m memory load)
+        # Run Flys
         run_walk_forward("flys", purge_mode=True)
-        run_walk_forward("flys", purge_mode=False)
         
     except KeyboardInterrupt:
         print("\nRun cancelled by user.")
