@@ -917,18 +917,24 @@ def build_month(yymm: str, df_vol_daily: pd.DataFrame, df_eco_raw: pd.DataFrame,
     df_final_buffered['hours_elapsed'] = df_final_buffered.groupby('tenor_yrs')['ts'].diff().dt.total_seconds() / 3600.0
     df_final_buffered['hours_elapsed'] = df_final_buffered['hours_elapsed'].fillna(1.0)
     
+    # FIX in Section 8-D
     for d_col in ['carry_bps_day', 'roll_bps_day', 'total_drift_day']:
         if d_col in df_final_buffered.columns:
             accrued_col = d_col.replace('_day', '_accrued')
             cumsum_col = d_col.replace('_day', '_cumsum')
             
-            df_final_buffered[accrued_col] = (df_final_buffered[d_col] / 24.0) * df_final_buffered['hours_elapsed']
-            df_final_buffered[cumsum_col] = df_final_buffered.groupby('tenor_yrs')[accrued_col].cumsum().fillna(0.0)
+            # SHIFT THE RATE: Use the rate from the START of the interval
+            prev_rate = df_final_buffered.groupby('tenor_yrs')[d_col].shift(1)
             
-            # Apply Offset from Prev Month
-            if cumsum_col in drift_offsets:
-                offset_series = df_final_buffered['tenor_yrs'].map(drift_offsets[cumsum_col]).fillna(0.0)
-                df_final_buffered[cumsum_col] += offset_series
+            # Calculate Accrual
+            df_final_buffered[accrued_col] = (prev_rate / 24.0) * df_final_buffered['hours_elapsed']
+            
+            # Handle the first row (NaN due to shift)
+            df_final_buffered[accrued_col] = df_final_buffered[accrued_col].fillna(0.0)
+            
+            # CumSum
+            df_final_buffered[cumsum_col] = df_final_buffered.groupby('tenor_yrs')[accrued_col].cumsum().fillna(0.0)
+
 
     # E. SLICE TO CURRENT MONTH
     min_ts_current = df_instant['ts'].min()
