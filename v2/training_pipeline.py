@@ -88,7 +88,7 @@ def load_dask_data(files, purge_mode):
     return ddf_clean
 
 # ==============================================================================
-# 2. WALK-FORWARD ENGINE
+# 2. WALK-FORWARD ENGINE (Fixed DMatrix Call)
 # ==============================================================================
 def run_walk_forward(client, strategy_type, purge_mode):
     files = get_file_list(strategy_type)
@@ -113,15 +113,23 @@ def run_walk_forward(client, strategy_type, purge_mode):
         print(f"[{mode_name}] Round {i}: Train {train_start}-{train_end} -> Test {test_month}")
         
         # --- UNIFIED LOADING ---
-        # We get a single dataframe containing features AND 'target_binary'
+        # ddf_train contains BOTH features and 'target_binary'
         ddf_train = load_dask_data(train_files, purge_mode)
         ddf_test = load_dask_data([test_file], purge_mode)
         
-        # --- ROBUST DMatrix CREATION ---
-        # We pass the WHOLE dataframe and tell Dask which column is the label.
-        # This prevents the 'partitions inconsistent' error.
-        dtrain = xgb.dask.DaskDMatrix(client, data=ddf_train, label='target_binary')
-        dtest = xgb.dask.DaskDMatrix(client, data=ddf_test, label='target_binary')
+        # --- SPLIT X/y (Preserving Alignment) ---
+        # By deriving X and y from the SAME ddf object, Dask guarantees 
+        # the partitions match, avoiding the "partitions inconsistent" error.
+        y_train = ddf_train['target_binary']
+        X_train = ddf_train.drop(columns=['target_binary'])
+        
+        y_test_series = ddf_test['target_binary']
+        X_test = ddf_test.drop(columns=['target_binary'])
+
+        # --- DMatrix CREATION ---
+        # Now we pass Dask objects (DataFrame and Series), not strings.
+        dtrain = xgb.dask.DaskDMatrix(client, data=X_train, label=y_train)
+        dtest = xgb.dask.DaskDMatrix(client, data=X_test, label=y_test_series)
         
         # --- TRAINING ---
         output = xgb.dask.train(
@@ -140,8 +148,8 @@ def run_walk_forward(client, strategy_type, purge_mode):
         y_prob_dask = xgb.dask.predict(client, model, dtest)
         y_prob = y_prob_dask.compute()
         
-        # Get Truth (Slice column locally)
-        y_true = ddf_test['target_binary'].compute()
+        # Get Truth (Compute to CPU)
+        y_true = y_test_series.compute()
         
         y_pred = (y_prob > 0.52).astype(int)
         
@@ -168,7 +176,7 @@ def run_walk_forward(client, strategy_type, purge_mode):
         })
         
         # Explicit cleanup
-        del dtrain, dtest, output, model, ddf_train, ddf_test
+        del dtrain, dtest, output, model, ddf_train, ddf_test, X_train, y_train, X_test, y_test_series
         gc.collect()
 
     out_csv = f"audit_{strategy_type}_{mode_suffix}.csv"
