@@ -1,22 +1,20 @@
 """
-training_pipeline_dask.py (v17.0 - Dask Industrial Grade)
+training_pipeline_dask.py (v17.1 - Bulletproof Alignment)
 
 Role:
-1. Replaces manual iterators with Dask Distributed (Parallel Loading).
-2. Manages Memory automatically (Spills to disk if RAM fills up).
-3. Feeds XGBoost efficiently for Multi-GPU or Single-GPU training.
+1. Solves 'AssertionError' by keeping X and y in the same Dask DataFrame.
+2. Solves 'CancelledError' by lowering worker count to prevent OOM.
+3. Uses Native DaskDMatrix column specification.
 
 Usage:
     python training_pipeline_dask.py
 """
 
-# ==============================================================================
-# IMPORTS
-# ==============================================================================
 import gc
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import xgboost.dask # CRITICAL IMPORT
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster
 from pathlib import Path
@@ -27,13 +25,13 @@ import config as cr
 # CONFIGURATION
 # ==============================================================================
 
-# v16.2 Params (Aggressive / Alpha Hunting)
+# v16.2 Params
 XGB_PARAMS = {
     'booster': 'gbtree',
     'objective': 'binary:logistic',
     'eval_metric': 'logloss',
-    'tree_method': 'hist',       # Dask works best with 'hist'
-    'device': 'cuda',            # GPU Acceleration
+    'tree_method': 'hist',
+    'device': 'cuda',
     'max_bin': 256,
     'learning_rate': 0.01,
     'max_depth': 6,
@@ -50,48 +48,47 @@ NUM_ROUNDS = 5000
 EARLY_STOPPING = 200
 
 # ==============================================================================
-# 1. DASK DATA LOADER
+# 1. DASK DATA LOADER (Unified)
 # ==============================================================================
 def get_file_list(strategy_type):
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
     pattern = f"training_{strategy_type}_*.parquet"
     files = sorted(list(path_enh.glob(pattern)))
-    return [str(f) for f in files] # Dask prefers string paths
+    return [str(f) for f in files]
 
 def load_dask_data(files, purge_mode):
     """
-    Lazy loads data using Dask. No memory is consumed until compute() or train().
+    Loads data but KEEPS X and y together to prevent partition misalignment.
     """
-    # 1. Read Parquet (Lazy)
-    # Dask reads the metadata first, so this is instant.
+    # 1. Read Parquet
     ddf = dd.read_parquet(files)
     
-    # 2. Filter (Lazy)
+    # 2. Filter Rows (Purge Logic)
     if purge_mode:
         ddf = ddf[ddf['target_multiclass'] != 1]
         
-    # 3. Define Target (Lazy)
-    # Convert 2 -> 1.0, else 0.0
-    y = (ddf['target_multiclass'] == 2).astype('float32')
+    # 3. Create Binary Target Column IN PLACE
+    # We add this column to the dataframe so it stays aligned
+    ddf['target_binary'] = (ddf['target_multiclass'] == 2).astype('float32')
     
-    # 4. Drop Columns (Lazy)
-    # Identify columns to drop based on naming convention
-    # Note: Dask needs to know columns upfront, so we check the meta
+    # 4. Drop Unused Columns
+    # We KEEP 'target_binary' for the label, and DROP everything else we don't need
     all_cols = ddf.columns
     cols_to_drop = [
         c for c in all_cols 
-        if c.endswith('_drop') or c.startswith('target_') or c in ['ts', 'trade_id']
+        if c.endswith('_drop') or c.startswith('target_multiclass') or c in ['ts', 'trade_id']
     ]
     
-    X = ddf.drop(columns=cols_to_drop)
+    # Drop columns but keep the unified dataframe
+    ddf_clean = ddf.drop(columns=cols_to_drop)
     
-    # Cast to float32 for GPU efficiency
-    X = X.astype('float32')
+    # Cast features to float32 (Label is already float32)
+    ddf_clean = ddf_clean.astype('float32')
     
-    return X, y
+    return ddf_clean
 
 # ==============================================================================
-# 2. WALK-FORWARD ENGINE (DASK)
+# 2. WALK-FORWARD ENGINE
 # ==============================================================================
 def run_walk_forward(client, strategy_type, purge_mode):
     files = get_file_list(strategy_type)
@@ -109,24 +106,24 @@ def run_walk_forward(client, strategy_type, purge_mode):
         test_file = files[i]
         train_files = files[i - TRAIN_WINDOW_MONTHS : i]
         
-        # Extract Month string for logging
         test_month = Path(test_file).stem.split('_')[-1]
         train_start = Path(train_files[0]).stem.split('_')[-1]
         train_end = Path(train_files[-1]).stem.split('_')[-1]
         
         print(f"[{mode_name}] Round {i}: Train {train_start}-{train_end} -> Test {test_month}")
         
-        # --- DASK LOADING ---
-        # This creates the Computation Graph, it doesn't load RAM yet.
-        X_train, y_train = load_dask_data(train_files, purge_mode)
-        X_test, y_test = load_dask_data([test_file], purge_mode)
+        # --- UNIFIED LOADING ---
+        # We get a single dataframe containing features AND 'target_binary'
+        ddf_train = load_dask_data(train_files, purge_mode)
+        ddf_test = load_dask_data([test_file], purge_mode)
         
-        # --- DASK TRAINING ---
-        # dask_xgboost handles the transfer to GPU automatically
-        # It will chunk the data on CPU and feed it to the GPU Device
-        dtrain = xgb.dask.DaskDMatrix(client, X_train, y_train)
-        dtest = xgb.dask.DaskDMatrix(client, X_test, y_test)
+        # --- ROBUST DMatrix CREATION ---
+        # We pass the WHOLE dataframe and tell Dask which column is the label.
+        # This prevents the 'partitions inconsistent' error.
+        dtrain = xgb.dask.DaskDMatrix(client, data=ddf_train, label='target_binary')
+        dtest = xgb.dask.DaskDMatrix(client, data=ddf_test, label='target_binary')
         
+        # --- TRAINING ---
         output = xgb.dask.train(
             client,
             XGB_PARAMS,
@@ -139,25 +136,18 @@ def run_walk_forward(client, strategy_type, purge_mode):
         
         model = output['booster']
         
-        # --- PREDICTION ---
-        # We use the model to predict on the dtest matrix
-        # Dask returns a Dask Series/Array, we compute() to bring it to local RAM for scoring
-        y_prob_dask = xgb.dask.predict(client, model, dtest)
-        y_prob = y_prob_dask.compute() # Bring to CPU RAM
-        
-        # Get Truth (Compute validation set labels to CPU RAM)
-        y_true = y_test.compute()
-        
         # --- SCORING ---
+        y_prob_dask = xgb.dask.predict(client, model, dtest)
+        y_prob = y_prob_dask.compute()
+        
+        # Get Truth (Slice column locally)
+        y_true = ddf_test['target_binary'].compute()
+        
         y_pred = (y_prob > 0.52).astype(int)
         
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec = recall_score(y_true, y_pred, zero_division=0)
-        
-        if len(np.unique(y_true)) > 1:
-            auc = roc_auc_score(y_true, y_prob)
-        else:
-            auc = 0.5
+        auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.5
             
         print(f"   -> AUC: {auc:.3f} | Prec: {prec:.2%} | Rec: {rec:.2%} | Trees: {model.best_iteration}")
         
@@ -177,11 +167,10 @@ def run_walk_forward(client, strategy_type, purge_mode):
             'best_iter': model.best_iteration
         })
         
-        # Explicit cleanup to help Dask scheduler
-        del dtrain, dtest, output, model, X_train, y_train
+        # Explicit cleanup
+        del dtrain, dtest, output, model, ddf_train, ddf_test
         gc.collect()
 
-    # Save CSV
     out_csv = f"audit_{strategy_type}_{mode_suffix}.csv"
     pd.DataFrame(results).to_csv(out_csv, index=False)
 
@@ -189,25 +178,22 @@ def run_walk_forward(client, strategy_type, purge_mode):
 # 3. ORCHESTRATOR
 # ==============================================================================
 def run_both_modes():
-    print("Initializing Dask Local Cluster...")
-    # This sets up the 'Virtual Cluster' on your machine.
-    # n_workers: How many parallel processes (Recommended: # Physical Cores - 2)
-    # threads_per_worker: Keep low for XGBoost interactions
-    # memory_limit: Limits per worker to prevent OOM
+    print("Initializing Dask Cluster...")
+    
+    # SAFE CONFIG FOR 64GB RAM:
+    # Reduced to 3 Workers (leaves ~20GB headroom for OS/Client)
+    # This prevents the 'CancelledError' OOM crash.
     cluster = LocalCluster(
-        n_workers=4,          # Adjust based on your CPU cores (e.g., 4 or 6)
+        n_workers=3,          
         threads_per_worker=1, 
-        memory_limit='12GB'   # 12GB * 4 = 48GB Total (Leaves room for OS)
+        memory_limit='14GB'   
     )
     client = Client(cluster)
-    print(f"Dask Dashboard available at: {client.dashboard_link}")
+    print(f"Dashboard: {client.dashboard_link}")
     
     try:
-        # Run Curves
         run_walk_forward(client, "curves", purge_mode=True)
         run_walk_forward(client, "curves", purge_mode=False)
-        
-        # Run Flys
         run_walk_forward(client, "flys", purge_mode=True)
         run_walk_forward(client, "flys", purge_mode=False)
     finally:
@@ -215,5 +201,4 @@ def run_both_modes():
         cluster.close()
 
 if __name__ == "__main__":
-    # Dask MUST be run inside main block on Windows
     run_both_modes()
