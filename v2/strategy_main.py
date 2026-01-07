@@ -226,47 +226,50 @@ def calc_modified_carry(z_arr, drift_arr):
 
 def make_inverse(df):
     """
-    Creates Inverse trades.
-    Only flips signs for: NET_, L1_, L2_ on SIGNAL columns.
-    Does NOT flip: MACRO_, EVENT_, BASKET_, audit_.
+    Creates Inverse trades (Shorts).
+    
+    CORRECTED LOGIC:
+    1. FLIP: NET_ features (Trade properties: Drift, Spread Z) and Audit PnL.
+       Why? "High Drift" is good. For Short, positive drift becomes negative carry.
+       We want the model to learn 'High Feature = Win' universally.
+       
+    2. KEEP: L1_, L2_, MACRO_, EVENT_ (Asset/Market properties).
+       Why? The 5Y rate is 4.0% regardless of whether we buy or sell it.
+       Flipping this creates fake data (e.g., -4.0% rates).
+       We rely on 'meta_direction' to tell the model the orientation.
     """
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
     df_inv['meta_direction'] = -1.0
     
-    # Identify Directional Columns
-    # We look for columns that started as 'SIGNAL' or 'RAW' (NET_rate)
-    # Simpler heuristic: If it starts with NET_ or L1_/L2_ and isn't a regime keyword
-    
-    FLIP_PREFIXES = ['NET_', 'L1_', 'L2_', 'L3_']
-    IGNORE_SUBSTRINGS = ['halflife', 'scale', 'vol_', 'curvature', 'dv01', 'audit_']
-    
     cols_to_flip = []
+    
+    # 1. Flip Trade-Level Directional Features (NET_)
+    # We only flip NET columns that are strictly directional (Drift, Z, etc.)
+    # We PROTECT Regime columns (Vol, Scale) even if they are NET
+    
+    FLIP_PREFIX = 'NET_'
+    PROTECTED_SUBSTRINGS = ['halflife', 'scale', 'vol_', 'curvature', 'dv01', 'stress', 'dist']
     
     for c in df_inv.columns:
         if not pd.api.types.is_numeric_dtype(df_inv[c]): continue
         
-        # Check prefix
-        if not any(c.startswith(p) for p in FLIP_PREFIXES): continue
-        
-        # Check ignore list (Regime features inside L1/L2)
-        if any(s in c for s in IGNORE_SUBSTRINGS): continue
-        
-        # Check if it's the raw rate (audit) - usually starts with audit_, handled above, but check NET_rate
-        if c == 'NET_rate': 
-            cols_to_flip.append(c)
-            continue
+        # Logic: Must be NET_ AND not a Regime feature
+        if c.startswith(FLIP_PREFIX):
+            if not any(p in c for p in PROTECTED_SUBSTRINGS):
+                cols_to_flip.append(c)
 
-        cols_to_flip.append(c)
-        
-    # Also flip PnL columns for the target calculation
+    # 2. Flip PnL Targets (Audit columns)
     for c in df_inv.columns:
-        if 'pnl_drop' in c: cols_to_flip.append(c)
+        if 'pnl_drop' in c: 
+            cols_to_flip.append(c)
             
+    # Apply the Flip
     for c in cols_to_flip:
         df_inv[c] *= -1
     
     # --- RE-CALCULATE LABELS ---
+    # (Same logic as before, just on the new flipped PnL)
     pnl   = df_inv['audit_total_pnl_drop']
     price = df_inv['audit_price_pnl_drop']
     roll  = df_inv['audit_roll_pnl_drop']
