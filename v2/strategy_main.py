@@ -514,17 +514,32 @@ def process_full_history():
     df_full = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values(['ts', 'tenor_yrs'])
     print(f"Full History Loaded: {len(df_full)} rows. Pivoting...")
     
-    dfs = None
+    # 1. Pivot All Data
+    pivots_all = get_pivots(df_full)
+    all_tenors = sorted(pivots_all['rate'].columns)
+    
+    # 2. FILTER TENORS (The Constraint)
+    # Rule: Allow 0.5 (6M) OR anything >= 1.0. 
+    # This strips out 1M, 3M, 9M etc.
+    valid_tenors = [t for t in all_tenors if (abs(t - 0.5) < 1e-4) or (t >= 1.0 - 1e-4)]
+    
+    print(f"   Filtering Tenors: Keeping {valid_tenors}")
+    
+    # 3. Slice Pivots to Strict Subset
+    # We must slice the dataframes so that Column 0 in the matrix corresponds to valid_tenors[0]
+    pivots_filtered = {}
+    for k, df in pivots_all.items():
+        # Select only valid columns. 
+        # Note: df.columns are floats, list comprehension ensures strict matching
+        pivots_filtered[k] = df[valid_tenors].copy()
+    
+    # Clean up memory
+    del df_full, pivots_all
     gc.collect()
     
-    pivots = get_pivots(df_full)
-    tenors = sorted(pivots['rate'].columns)
-    
-    del df_full
-    gc.collect()
-    
-    build_curves(pivots, tenors)
-    build_flys(pivots, tenors)
+    # 4. Build Trades
+    build_curves(pivots_filtered, valid_tenors)
+    build_flys(pivots_filtered, valid_tenors)
     
     print("Done.")
 
