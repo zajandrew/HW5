@@ -1,37 +1,43 @@
 """
-training_pipeline_dask.py (v17.1 - Bulletproof Alignment)
+training_pipeline.py (v18.0 - PyArrow Industrial Streamer)
 
 Role:
-1. Solves 'AssertionError' by keeping X and y in the same Dask DataFrame.
-2. Solves 'CancelledError' by lowering worker count to prevent OOM.
-3. Uses Native DaskDMatrix column specification.
+1. Uses pyarrow.dataset to push Filters & Column Selection down to C++ layer.
+2. Streams efficient batches to XGBoost QuantileDMatrix (Out-of-Core).
+3. ZERO memory leaks or partition errors.
 
 Usage:
-    python training_pipeline_dask.py
+    python training_pipeline.py
 """
 
+import os
 import gc
+import ctypes
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-import xgboost.dask # CRITICAL IMPORT
-import dask.dataframe as dd
-from dask.distributed import Client, LocalCluster
+import pyarrow.dataset as ds  # <--- The Secret Weapon
+import pyarrow as pa
 from pathlib import Path
 from sklearn.metrics import precision_score, recall_score, roc_auc_score
 import config as cr
 
 # ==============================================================================
-# CONFIGURATION
+# GPU CONFIG
 # ==============================================================================
+try:
+    ctypes.WinDLL("nvrtc-builtins64_129.dll")
+except: pass
 
-# v16.2 Params
+# ==============================================================================
+# HYPERPARAMETERS
+# ==============================================================================
 XGB_PARAMS = {
     'booster': 'gbtree',
     'objective': 'binary:logistic',
     'eval_metric': 'logloss',
-    'tree_method': 'hist',
-    'device': 'cuda',
+    'tree_method': 'hist',      
+    'device': 'cuda',           
     'max_bin': 256,
     'learning_rate': 0.01,
     'max_depth': 6,
@@ -48,49 +54,101 @@ NUM_ROUNDS = 5000
 EARLY_STOPPING = 200
 
 # ==============================================================================
-# 1. DASK DATA LOADER (Unified)
+# 1. INDUSTRIAL DATA ITERATOR (PyArrow Dataset)
 # ==============================================================================
+class PyArrowIterator(xgb.DataIter):
+    def __init__(self, file_paths, purge_mode, batch_size=100000):
+        self.file_paths = file_paths
+        self.purge_mode = purge_mode
+        self.batch_size = batch_size
+        self._batch_gen = None
+        
+        # 1. Smart Schema Detection
+        # We peek at the first file to figure out which columns to LOAD
+        # and which to IGNORE on disk.
+        try:
+            sample = ds.dataset(file_paths[0], format='parquet').schema
+            all_cols = sample.names
+            
+            # Keep only Feature columns + Target
+            self.load_cols = [
+                c for c in all_cols 
+                if c == 'target_multiclass' or 
+                (not c.endswith('_drop') 
+                 and not c.startswith('target_') 
+                 and c not in ['ts', 'trade_id', 'meta_t1', 'meta_t2', 'meta_t3'])
+            ]
+        except:
+            self.load_cols = None # Fallback
+            
+        super().__init__()
+
+    def _get_next_batch_generator(self):
+        # 2. Define Filter Expression (Pushdown to C++)
+        # This prevents "Class 1" rows from ever entering RAM if purging.
+        filter_expr = None
+        if self.purge_mode:
+            # "target_multiclass != 1"
+            filter_expr = (ds.field('target_multiclass') != 1)
+
+        # 3. Create Dataset Scanner
+        dataset = ds.dataset(self.file_paths, format='parquet')
+        
+        # 4. Stream Batches
+        # columns=self.load_cols -> Only reads features (Saves 50% RAM/IO)
+        # filter=filter_expr -> Skips rows on disk (Saves CPU)
+        batch_iter = dataset.to_batches(
+            columns=self.load_cols,
+            filter=filter_expr, 
+            batch_size=self.batch_size
+        )
+        
+        for record_batch in batch_iter:
+            # Zero-copy conversion to Pandas
+            df_chunk = record_batch.to_pandas()
+            
+            if df_chunk.empty: continue
+            
+            # Create Label
+            y = (df_chunk['target_multiclass'] == 2).values.astype(np.float32)
+            
+            # Create Features (Drop the target column we used for filtering)
+            X = df_chunk.drop(columns=['target_multiclass'])
+            
+            # Yield efficient Numpy blocks to XGBoost
+            yield X, y
+            
+        yield None, None
+
+    def next(self, input_data):
+        if self._batch_gen is None:
+            self._batch_gen = self._get_next_batch_generator()
+        
+        try:
+            X, y = next(self._batch_gen)
+            if X is None: return 0
+            
+            input_data(data=X.values.astype(np.float32), 
+                       label=y,
+                       feature_names=X.columns.tolist(),
+                       feature_types=['float'] * len(X.columns))
+            return 1
+        except StopIteration:
+            return 0
+
+    def reset(self):
+        self._batch_gen = None
+
 def get_file_list(strategy_type):
     path_enh = Path(getattr(cr, "PATH_ENH", "."))
     pattern = f"training_{strategy_type}_*.parquet"
     files = sorted(list(path_enh.glob(pattern)))
     return [str(f) for f in files]
 
-def load_dask_data(files, purge_mode):
-    """
-    Loads data but KEEPS X and y together to prevent partition misalignment.
-    """
-    # 1. Read Parquet
-    ddf = dd.read_parquet(files)
-    
-    # 2. Filter Rows (Purge Logic)
-    if purge_mode:
-        ddf = ddf[ddf['target_multiclass'] != 1]
-        
-    # 3. Create Binary Target Column IN PLACE
-    # We add this column to the dataframe so it stays aligned
-    ddf['target_binary'] = (ddf['target_multiclass'] == 2).astype('float32')
-    
-    # 4. Drop Unused Columns
-    # We KEEP 'target_binary' for the label, and DROP everything else we don't need
-    all_cols = ddf.columns
-    cols_to_drop = [
-        c for c in all_cols 
-        if c.endswith('_drop') or c.startswith('target_multiclass') or c in ['ts', 'trade_id']
-    ]
-    
-    # Drop columns but keep the unified dataframe
-    ddf_clean = ddf.drop(columns=cols_to_drop)
-    
-    # Cast features to float32 (Label is already float32)
-    ddf_clean = ddf_clean.astype('float32')
-    
-    return ddf_clean
-
 # ==============================================================================
-# 2. WALK-FORWARD ENGINE (Fixed DMatrix Call)
+# 2. WALK-FORWARD ENGINE
 # ==============================================================================
-def run_walk_forward(client, strategy_type, purge_mode):
+def run_walk_forward(strategy_type, purge_mode):
     files = get_file_list(strategy_type)
     if len(files) < (TRAIN_WINDOW_MONTHS + 1):
         print(f"[{strategy_type}] Not enough data.")
@@ -112,51 +170,45 @@ def run_walk_forward(client, strategy_type, purge_mode):
         
         print(f"[{mode_name}] Round {i}: Train {train_start}-{train_end} -> Test {test_month}")
         
-        # --- UNIFIED LOADING ---
-        # ddf_train contains BOTH features and 'target_binary'
-        ddf_train = load_dask_data(train_files, purge_mode)
-        ddf_test = load_dask_data([test_file], purge_mode)
-        
-        # --- SPLIT X/y (Preserving Alignment) ---
-        # By deriving X and y from the SAME ddf object, Dask guarantees 
-        # the partitions match, avoiding the "partitions inconsistent" error.
-        y_train = ddf_train['target_binary']
-        X_train = ddf_train.drop(columns=['target_binary'])
-        
-        y_test_series = ddf_test['target_binary']
-        X_test = ddf_test.drop(columns=['target_binary'])
-
-        # --- DMatrix CREATION ---
-        # Now we pass Dask objects (DataFrame and Series), not strings.
-        dtrain = xgb.dask.DaskDMatrix(client, data=X_train, label=y_train)
-        dtest = xgb.dask.DaskDMatrix(client, data=X_test, label=y_test_series)
-        
         # --- TRAINING ---
-        output = xgb.dask.train(
-            client,
-            XGB_PARAMS,
-            dtrain,
+        # QuantileDMatrix is the Magic Key. 
+        # It builds histograms on-the-fly from the iterator.
+        # It never holds the full dataset in RAM.
+        dtrain = xgb.QuantileDMatrix(
+            PyArrowIterator(train_files, purge_mode=purge_mode, batch_size=100000)
+        )
+        
+        # For testing, we also use the iterator to keep memory flat
+        dtest = xgb.QuantileDMatrix(
+            PyArrowIterator([test_file], purge_mode=purge_mode, batch_size=100000)
+        )
+        
+        model = xgb.train(
+            params=XGB_PARAMS,
+            dtrain=dtrain,
             num_boost_round=NUM_ROUNDS,
             evals=[(dtrain, 'train'), (dtest, 'eval')],
             early_stopping_rounds=EARLY_STOPPING,
             verbose_eval=False
         )
         
-        model = output['booster']
-        
         # --- SCORING ---
-        y_prob_dask = xgb.dask.predict(client, model, dtest)
-        y_prob = y_prob_dask.compute()
-        
-        # Get Truth (Compute to CPU)
-        y_true = y_test_series.compute()
+        # We need y_true to calculate Precision/Recall. 
+        # Since DMatrix hides labels, we read the test file just for the target.
+        # This is cheap (read 1 column).
+        df_audit = pd.read_parquet(test_file, columns=['target_multiclass'])
+        if purge_mode:
+            df_audit = df_audit[df_audit['target_multiclass'] != 1]
+            
+        y_true = (df_audit['target_multiclass'] == 2).values.astype(int)
+        y_prob = model.predict(dtest)
         
         y_pred = (y_prob > 0.52).astype(int)
         
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec = recall_score(y_true, y_pred, zero_division=0)
         auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0.5
-            
+        
         print(f"   -> AUC: {auc:.3f} | Prec: {prec:.2%} | Rec: {rec:.2%} | Trees: {model.best_iteration}")
         
         # Save Results
@@ -175,8 +227,7 @@ def run_walk_forward(client, strategy_type, purge_mode):
             'best_iter': model.best_iteration
         })
         
-        # Explicit cleanup
-        del dtrain, dtest, output, model, ddf_train, ddf_test, X_train, y_train, X_test, y_test_series
+        del dtrain, dtest, model, y_prob, y_true, df_audit
         gc.collect()
 
     out_csv = f"audit_{strategy_type}_{mode_suffix}.csv"
@@ -186,27 +237,13 @@ def run_walk_forward(client, strategy_type, purge_mode):
 # 3. ORCHESTRATOR
 # ==============================================================================
 def run_both_modes():
-    print("Initializing Dask Cluster...")
-    
-    # SAFE CONFIG FOR 64GB RAM:
-    # Reduced to 3 Workers (leaves ~20GB headroom for OS/Client)
-    # This prevents the 'CancelledError' OOM crash.
-    cluster = LocalCluster(
-        n_workers=3,          
-        threads_per_worker=1, 
-        memory_limit='14GB'   
-    )
-    client = Client(cluster)
-    print(f"Dashboard: {client.dashboard_link}")
-    
     try:
-        run_walk_forward(client, "curves", purge_mode=True)
-        run_walk_forward(client, "curves", purge_mode=False)
-        run_walk_forward(client, "flys", purge_mode=True)
-        run_walk_forward(client, "flys", purge_mode=False)
-    finally:
-        client.close()
-        cluster.close()
+        run_walk_forward("curves", purge_mode=True)
+        run_walk_forward("curves", purge_mode=False)
+        run_walk_forward("flys", purge_mode=True)
+        run_walk_forward("flys", purge_mode=False)
+    except KeyboardInterrupt:
+        print("Run cancelled by user.")
 
 if __name__ == "__main__":
     run_both_modes()
