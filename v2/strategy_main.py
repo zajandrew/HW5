@@ -150,14 +150,22 @@ def classify_feature(col_name):
 
 def project_smart_features(pivots, W, W_abs, trade_names, leg_indices, is_fly=False):
     """
-    Intelligent projection.
+    Intelligent projection with Aggressive Pruning.
     
-    FLY OPTIMIZATION: 
-    If is_fly=True, we DROP the middle leg (L2/Belly) features.
-    We only keep NET, L1 (Wing), and L3 (Wing).
-    This significantly reduces column count.
+    PHILOSOPHY: "Rich Net, Lean Legs"
+    - NET: Keep everything. The nuance of the spread matters.
+    - LEGS: Drop variations. Only keep the 'Consensus' (z_comb) and 'Total' (drift).
     """
     data = {}
+    
+    # Features strictly NOT needed at the Leg Level (L1/L2/L3)
+    # We only want the NET versions of these.
+    LEG_BLOCKLIST = [
+        'z_pca', 'z_spline',        # Redundant with z_comb
+        'carry_bps', 'roll_bps',    # Redundant with total_drift
+        'slope', 'accel',           # Velocity: We only care about Net Velocity
+        'z_local', 'rng_pos'        # Redundant with z_comb (Z-Score)
+    ]
     
     for col_name, mat in pivots.items():
         ftype = classify_feature(col_name)
@@ -180,9 +188,6 @@ def project_smart_features(pivots, W, W_abs, trade_names, leg_indices, is_fly=Fa
         # --- C. RAW LEVELS (Rate) ---
         elif ftype == 'RAW':
             data[f"NET_{col_name}"] = (vals @ W).ravel()
-            # Raw rates are strictly for audit/pnl, so we check "audit" later
-            # But we must generate them here if we want them as features (we usually don't)
-            # We will generate L1/L2/L3 purely for audit later manually.
             pass 
 
         # --- D. REGIME (Basket Average) ---
@@ -190,10 +195,8 @@ def project_smart_features(pivots, W, W_abs, trade_names, leg_indices, is_fly=Fa
             norm = np.sum(W_abs, axis=0); norm[norm == 0] = 1.0
             data[f"BASKET_{col_name}"] = ((vals @ W_abs) / norm).ravel()
             
-            # Keep Leg Context
-            # For Flys: Only L1 and L3 (Wings). Drop L2.
+            # Keep Leg Context (Vol is useful per leg)
             legs_to_keep = [0, 2] if is_fly else range(len(leg_indices[0]))
-            
             for i in legs_to_keep:
                 leg_num = i + 1
                 leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
@@ -203,20 +206,26 @@ def project_smart_features(pivots, W, W_abs, trade_names, leg_indices, is_fly=Fa
 
         # --- E. SIGNAL (Standard Net + Legs) ---
         else:
+            # 1. Always keep NET
             data[f"NET_{col_name}"] = (vals @ W).ravel()
             
-            # For Flys: Only L1 and L3. Drop L2.
-            legs_to_keep = [0, 2] if is_fly else range(len(leg_indices[0]))
+            # 2. Check if this feature is on the Blocklist for Legs
+            is_blocked = any(b in col_name for b in LEG_BLOCKLIST)
             
-            for i in legs_to_keep:
-                leg_num = i + 1
-                leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
-                for t_idx in range(len(trade_names)):
-                    leg_vals[:, t_idx] = vals[:, leg_indices[t_idx][i]]
-                data[f"L{leg_num}_{col_name}"] = leg_vals.ravel()
-
+            # Exception: We MUST keep z_comb and total_drift for legs (The Anchors)
+            # (The blocklist logic above handles this, assuming z_comb is not in the list, but 'z_pca' is)
+            
+            if not is_blocked:
+                legs_to_keep = [0, 2] if is_fly else range(len(leg_indices[0]))
+                
+                for i in legs_to_keep:
+                    leg_num = i + 1
+                    leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
+                    for t_idx in range(len(trade_names)):
+                        leg_vals[:, t_idx] = vals[:, leg_indices[t_idx][i]]
+                    data[f"L{leg_num}_{col_name}"] = leg_vals.ravel()
     return data
-
+    
 def calc_modified_carry(z_arr, drift_arr):
     # Sigmoid(Drift) * Z
     safe_drift = np.clip(drift_arr * 2.0, -20, 20)
