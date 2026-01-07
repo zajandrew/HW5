@@ -1,16 +1,3 @@
-"""
-strategy_generator.py (v15.0 - Multiclass & Binary Targets)
-
-Role:
-1. Ingests full history.
-2. Constructs synthetic instruments.
-3. Implements strict naming convention (Features vs. _drop).
-4. Simulates execution via Triple Barrier with Dual Targets:
-   - target_binary: 1 (Alpha) vs 0 (Else)
-   - target_multiclass: 2 (Alpha), 1 (Weak/Carry), 0 (Loss)
-5. Slices output to monthly files.
-"""
-
 import pandas as pd
 import numpy as np
 import numba
@@ -21,13 +8,13 @@ import gc
 import config as cr
 
 # ==============================================================================
-# 1. NUMBA SCANNER (Multiclass Logic)
+# 1. NUMBA SCANNER (Unchanged)
 # ==============================================================================
 @numba.njit(parallel=True)
 def scan_pnl_audit(
     entry_rates, 
-    drift_cumsums,    # Total Drift (Carry + Roll)
-    roll_cumsums,     # Rolldown Component
+    drift_cumsums,    
+    roll_cumsums,     
     halflife_idxs, 
     price_hurdle, 
     total_hurdle, 
@@ -37,16 +24,11 @@ def scan_pnl_audit(
 ):
     """
     Triple Barrier Method with 50% Quality Ratio Logic.
-    
-    Classes:
-    2 = Alpha Win (Total >= Hurdle AND Quality Ratio >= 50%)
-    1 = Weak Win  (Total >= Hurdle but Quality Ratio < 50% OR Drifted Positive)
-    0 = Loss      (Stop Loss or Time Exit <= 0)
     """
     n_time, n_trades = entry_rates.shape
     
     # Outputs
-    out_multi = np.zeros((n_time, n_trades), dtype=np.int8) # 0, 1, 2
+    out_multi = np.zeros((n_time, n_trades), dtype=np.int8) 
     out_price = np.zeros((n_time, n_trades), dtype=np.float32)
     out_roll  = np.zeros((n_time, n_trades), dtype=np.float32) 
     out_carry = np.zeros((n_time, n_trades), dtype=np.float32) 
@@ -89,7 +71,7 @@ def scan_pnl_audit(
                 else:
                     curr_quality = curr_price 
                 
-                # 1. Stop Loss (Class 0)
+                # 1. Stop Loss
                 if curr_total <= stop_loss:
                     out_multi[i, j] = 0
                     out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
@@ -97,17 +79,11 @@ def scan_pnl_audit(
                     final_idx = k; stopped = True
                     break
                 
-                # 2. Profit Target Hit (Viability Floor)
+                # 2. Profit Target Hit
                 if curr_total >= total_hurdle:
-                    # Calculate Ratio (Avoid Div/0)
                     ratio = curr_quality / curr_total if curr_total > 0 else 0.0
-                    
-                    if ratio >= 0.50:
-                        # Alpha Win (Class 2)
-                        out_multi[i, j] = 2
-                    else:
-                        # Weak/Carry Win (Class 1)
-                        out_multi[i, j] = 1
+                    if ratio >= 0.50: out_multi[i, j] = 2 # Alpha
+                    else:             out_multi[i, j] = 1 # Weak
                         
                     out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
                     out_carry[i, j] = curr_carry; out_total[i, j] = curr_total
@@ -120,21 +96,16 @@ def scan_pnl_audit(
             if not won and not stopped:
                 out_price[i, j] = best_price; out_roll[i, j] = best_roll
                 out_carry[i, j] = best_carry; out_total[i, j] = best_total
-                
-                # If drifted positive at exit, mark as Weak Win (Class 1)
-                # This ensures we don't accidentally train on these as 'Alpha'
-                if best_total > 0.0:
-                    out_multi[i, j] = 1 
-                else:
-                    out_multi[i, j] = 0 # Loss
+                if best_total > 0.0: out_multi[i, j] = 1 
+                else:                out_multi[i, j] = 0
                 
             out_exit_idx[i, j] = final_idx
             out_exit_rate[i, j] = entry_rates[final_idx, j]
 
     return out_multi, out_price, out_roll, out_carry, out_total, out_exit_idx, out_exit_rate
-   
+
 # ==============================================================================
-# 2. HELPER FUNCTIONS
+# 2. FEATURE INTELLIGENCE
 # ==============================================================================
 def get_pivots(df):
     pivots = {}
@@ -146,108 +117,174 @@ def get_pivots(df):
         except ValueError: continue
     return pivots
 
+def classify_feature(col_name):
+    """
+    Smart classification of features to determine netting strategy.
+    """
+    # 1. GLOBAL / MACRO (Single instance, no netting)
+    # These are identical across tenors.
+    if any(k in col_name for k in ['pca_factor', 'hours_to_econ', 'pca_evr', 'pca_error']):
+        return 'GLOBAL'
+
+    # 2. EVENT (Min aggregation)
+    if 'hours_to_' in col_name:
+        return 'EVENT'
+
+    # 3. RAW LEVELS (Non-stationary)
+    # We want the Spread (NET), but L1/L2 must be dropped/audit only.
+    if col_name == 'rate':
+        return 'RAW'
+
+    # 4. REGIME (Weighted Average)
+    # Properties like Vol, Curvature, Halflife. 
+    # Netting (L1-L2) is less useful than "System Vol" (Avg).
+    if any(k in col_name for k in ['vol_', 'halflife', 'scale', 'curvature', 'dv01']):
+        return 'REGIME'
+
+    # 5. SIGNAL / PHYSICS (Standard Netting)
+    # Drift, Z-Scores, Carry, Slope.
+    # We want NET (Spread) + L1 + L2 (Components).
+    return 'SIGNAL'
+
+def project_smart_features(pivots, W, W_abs, trade_names, leg_indices):
+    """
+    Intelligent projection based on feature type.
+    """
+    data = {}
+    
+    for col_name, mat in pivots.items():
+        ftype = classify_feature(col_name)
+        vals = mat.values
+        
+        # --- A. GLOBAL (Macro) ---
+        if ftype == 'GLOBAL':
+            # Take the first column (tenor) since all are identical
+            # Naming: MACRO_pca_factor_0
+            data[f"MACRO_{col_name}"] = np.repeat(vals[:, 0], len(trade_names))
+            
+        # --- B. EVENT (Min) ---
+        elif ftype == 'EVENT':
+            # Find min across legs for each trade
+            # leg_indices is a list of lists: [[i1, i2], [i1, i2]...]
+            # We construct a matrix of shape (Time, Trades)
+            n_time = vals.shape[0]
+            n_trades = len(trade_names)
+            res = np.zeros((n_time, n_trades), dtype=np.float32)
+            
+            for t_idx in range(n_trades):
+                # Get columns for this trade
+                cols = vals[:, leg_indices[t_idx]] 
+                # Row-wise min
+                res[:, t_idx] = np.min(cols, axis=1)
+            
+            data[f"EVENT_{col_name}_min"] = res.ravel()
+            
+        # --- C. RAW LEVELS (Rate) ---
+        elif ftype == 'RAW':
+            # NET: The Spread (Valid Price)
+            data[f"NET_{col_name}"] = (vals @ W).ravel()
+            # L1/L2: Audit/Drop (Pollutes Model)
+            for i, leg_name in enumerate([f"L{k+1}" for k in range(len(leg_indices[0]))]):
+                # Create a specialized gather for each leg
+                # This is a bit slow in python loop, but safe
+                leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
+                for t_idx in range(len(trade_names)):
+                    leg_vals[:, t_idx] = vals[:, leg_indices[t_idx][i]]
+                data[f"audit_{leg_name}_{col_name}_drop"] = leg_vals.ravel()
+
+        # --- D. REGIME (Basket Average) ---
+        elif ftype == 'REGIME':
+            # BASKET: Weighted Average (Using W_abs)
+            norm = np.sum(W_abs, axis=0); norm[norm == 0] = 1.0
+            data[f"BASKET_{col_name}"] = ((vals @ W_abs) / norm).ravel()
+            
+            # Keep L1/L2 for context (e.g. skew difference)
+            for i, leg_name in enumerate([f"L{k+1}" for k in range(len(leg_indices[0]))]):
+                leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
+                for t_idx in range(len(trade_names)):
+                    leg_vals[:, t_idx] = vals[:, leg_indices[t_idx][i]]
+                data[f"{leg_name}_{col_name}"] = leg_vals.ravel()
+
+        # --- E. SIGNAL (Standard Net + Legs) ---
+        else:
+            # NET: Spread (L1 - L2)
+            data[f"NET_{col_name}"] = (vals @ W).ravel()
+            
+            # L1/L2: Drivers
+            for i, leg_name in enumerate([f"L{k+1}" for k in range(len(leg_indices[0]))]):
+                leg_vals = np.zeros((vals.shape[0], len(trade_names)), dtype=np.float32)
+                for t_idx in range(len(trade_names)):
+                    leg_vals[:, t_idx] = vals[:, leg_indices[t_idx][i]]
+                data[f"{leg_name}_{col_name}"] = leg_vals.ravel()
+
+    return data
+
 def calc_modified_carry(z_arr, drift_arr):
     safe_drift = np.clip(drift_arr * 2.0, -20, 20)
     sigmoid = 2.0 / (1.0 + np.exp(-safe_drift))
     return z_arr * sigmoid
 
-def project_standard_features(pivots, W, W_abs, trade_names):
-    data = {}
-    REGIME_KEYS = ['halflife', 'scale', 'dv01', 'exog_', 'pca_error_norm']
-    DROP_KEYWORDS = ['cumsum', 'hours_to_', 'hours_elapsed', 'accrued'] 
-
-    for name, mat in pivots.items():
-        if any(x in name for x in DROP_KEYWORDS): continue
-        is_regime = any(k in name for k in REGIME_KEYS)
-        vals = mat.values
-        
-        clean = name.replace("z_comb", "z").replace("total_drift_day", "drift").replace("rate", "rate")
-        clean = clean.replace("exog_", "").replace("signal_sharpe", "signal_sharpe")
-
-        if is_regime:
-            norm = np.sum(W_abs, axis=0); norm[norm == 0] = 1.0
-            data[f"NET_{clean}"] = (vals @ W_abs) / norm
-        else:
-            data[f"NET_{clean}"] = vals @ W
-    for k in data: data[k] = data[k].ravel()
-    return data
-
 def make_inverse(df):
     """
-    Creates Inverse trades (Shorts).
-    
-    Logic Update:
-    1. Flips signs of directional features and Audit PnL columns.
-    2. Re-calculates 'target_multiclass' and 'target_binary' using the 
-       new 50% Quality Ratio logic on the FLIPPED PnL.
-       
-    Quality Definition:
-    - Flys: Quality = Price PnL + Roll PnL
-    - Curves: Quality = Price PnL only
+    Creates Inverse trades.
+    Only flips signs for: NET_, L1_, L2_ on SIGNAL columns.
+    Does NOT flip: MACRO_, EVENT_, BASKET_, audit_.
     """
     df_inv = df.copy()
     df_inv['trade_id'] += "_INV"
     df_inv['meta_direction'] = -1.0
     
+    # Identify Directional Columns
+    # We look for columns that started as 'SIGNAL' or 'RAW' (NET_rate)
+    # Simpler heuristic: If it starts with NET_ or L1_/L2_ and isn't a regime keyword
+    
+    FLIP_PREFIXES = ['NET_', 'L1_', 'L2_', 'L3_']
+    IGNORE_SUBSTRINGS = ['halflife', 'scale', 'vol_', 'curvature', 'dv01', 'audit_']
+    
     cols_to_flip = []
     
-    # 1. Flip Directional Features
-    directional_keywords = [
-        'z', 'drift', 'rate', 'slope', 'accel', 'divergence', 'ratio', 
-        'modified', 'leakage', 'stress', 'sharpe', 'roll', 'carry'
-    ]
     for c in df_inv.columns:
-        if c.startswith('NET_') and any(x in c for x in directional_keywords):
+        if not pd.api.types.is_numeric_dtype(df_inv[c]): continue
+        
+        # Check prefix
+        if not any(c.startswith(p) for p in FLIP_PREFIXES): continue
+        
+        # Check ignore list (Regime features inside L1/L2)
+        if any(s in c for s in IGNORE_SUBSTRINGS): continue
+        
+        # Check if it's the raw rate (audit) - usually starts with audit_, handled above, but check NET_rate
+        if c == 'NET_rate': 
             cols_to_flip.append(c)
-            
-    # 2. Flip Audit PnL (Future Data)
-    for c in df_inv.columns:
-        if c.endswith('_drop') and any(x in c for x in ['pnl', 'drift', 'roll', 'carry']):
-            cols_to_flip.append(c)
+            continue
 
+        cols_to_flip.append(c)
+        
+    # Also flip PnL columns for the target calculation
+    for c in df_inv.columns:
+        if 'pnl_drop' in c: cols_to_flip.append(c)
+            
     for c in cols_to_flip:
-        if c in df_inv.columns: df_inv[c] *= -1
+        df_inv[c] *= -1
     
-    # --- RE-CALCULATE LABELS (Ratio Logic) ---
-    
-    # A. Define Components
+    # --- RE-CALCULATE LABELS ---
     pnl   = df_inv['audit_total_pnl_drop']
     price = df_inv['audit_price_pnl_drop']
     roll  = df_inv['audit_roll_pnl_drop']
     
-    # B. Define Quality based on Instrument Type
-    # We check for 'meta_fly_width' which is only present in Flys.
-    if 'meta_fly_width' in df_inv.columns:
-        # Fly Logic: Quality includes Roll
-        quality = price + roll
-    else:
-        # Curve Logic: Quality is Price only
-        quality = price
+    if 'meta_fly_width' in df_inv.columns: quality = price + roll
+    else: quality = price
     
-    # C. Vectorized Classification
     new_labels = np.zeros(len(df_inv), dtype=np.int8)
-    
-    # Viability Floor (Must clear 2.0 bps)
     is_viable = (pnl >= 2.0)
     
-    # Ratio Check (Quality must be >= 50% of Total)
-    # Handle Division by Zero safely (if pnl is 0, ratio is 0)
     ratio = np.zeros_like(pnl)
     nonzero = (pnl != 0)
     ratio[nonzero] = quality[nonzero] / pnl[nonzero]
     
-    is_quality = (ratio >= 0.50)
-    
-    # Class 2 (Alpha): Viable AND Quality
-    mask_2 = is_viable & is_quality
+    mask_2 = is_viable & (ratio >= 0.50)
     new_labels[mask_2] = 2
-    
-    # Class 1 (Weak): Positive PnL but failed Class 2 requirements
-    # (Either < 2.0bps profit OR < 50% Quality)
     mask_1 = (pnl > 0) & (~mask_2)
     new_labels[mask_1] = 1
-    
-    # Class 0 is default (0 or negative PnL)
     
     df_inv['target_multiclass'] = new_labels
     df_inv['target_binary'] = (new_labels == 2).astype(np.int8)
@@ -289,7 +326,12 @@ def build_curves(pivots, tenors):
     idx_time = np.repeat(pivots['rate'].index, n_trades)
     
     ids, dist_arr = [], []
-    for t1, t2 in combos: ids.append(f"C_{t1:g}_{t2:g}"); dist_arr.append(abs(t2 - t1))
+    leg_indices = [] # Stores [i1, i2] for every trade
+    
+    for t1, t2 in combos: 
+        ids.append(f"C_{t1:g}_{t2:g}")
+        dist_arr.append(abs(t2 - t1))
+        leg_indices.append([tenors.index(t1), tenors.index(t2)])
         
     W = np.zeros((len(tenors), n_trades), dtype=np.float32)
     for j, (t1, t2) in enumerate(combos):
@@ -297,53 +339,36 @@ def build_curves(pivots, tenors):
         W[i1, j] = 1.0; W[i2, j] = -1.0
     W_abs = np.abs(W)
     
-    data = project_standard_features(pivots, W, W_abs, ids)
+    # 1. SMART PROJECTION
+    data = project_smart_features(pivots, W, W_abs, ids, leg_indices)
+    
     data['meta_direction'] = np.ones(n_time * n_trades, dtype=np.float32)
-    
-    idx_map_1 = [tenors.index(c[0]) for c in combos]
-    idx_map_2 = [tenors.index(c[1]) for c in combos]
-    rate_vals = pivots['rate'].values
-    L1_rate_mat = rate_vals[:, idx_map_1]; L2_rate_mat = rate_vals[:, idx_map_2]
-    
-    target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
-    L1_drift, L2_drift = None, None
-    for feat in pivots.keys():
-        is_target = any(t in feat for t in target_legs)
-        is_event = 'hours_to_' in feat
-        if not (is_target or is_event): continue
-        vals = pivots[feat].values
-        l1 = vals[:, idx_map_1].ravel(); l2 = vals[:, idx_map_2].ravel()
-        clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        
-        if is_event: data[f"NET_{clean}_min"] = np.minimum(l1, l2)
-        else:
-            if feat == 'rate':
-                data[f"L1_{clean}_raw_drop"] = l1; data[f"L2_{clean}_raw_drop"] = l2
-            else:
-                data[f"L1_{clean}"] = l1; data[f"L2_{clean}"] = l2
-            if feat == 'total_drift_day': L1_drift, L2_drift = l1, l2
-            if feat == 'z_comb': data['NET_leg_stress'] = np.maximum(np.abs(l1), np.abs(l2))
-
-    if 'NET_drift' in data:
-        for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
-            if z_name in data: data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
-    if L1_drift is not None:
-         if 'L1_z' in data: data['L1_z_modified'] = calc_modified_carry(data['L1_z'], L1_drift)
-         if 'L2_z' in data: data['L2_z_modified'] = calc_modified_carry(data['L2_z'], L2_drift)
-
     data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_dist'] = np.tile(dist_arr, n_time)
+
+    # 2. Modified Drift Checks
+    if 'NET_total_drift_day' in data:
+        net_drift = data['NET_total_drift_day']
+        for k in list(data.keys()):
+            if k.startswith('NET_z') and 'modified' not in k:
+                data[f"{k}_modified"] = calc_modified_carry(data[k], net_drift)
+                
+    # 3. Stress Meta
+    if 'L1_z_comb' in data and 'L2_z_comb' in data:
+        data['NET_leg_stress'] = np.maximum(np.abs(data['L1_z_comb']), np.abs(data['L2_z_comb']))
+
+    # 4. Scanner
+    drift_key = 'total_drift_day_cumsum' 
+    roll_key  = 'roll_bps_day_cumsum' 
+    if drift_key not in pivots: drift_key = 'total_drift_cumsum'
+    if roll_key not in pivots: roll_key = 'roll_bps_cumsum'
     
-    drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
-    roll_key = 'roll_bps_day_cumsum' if 'roll_bps_day_cumsum' in pivots else 'roll_bps_cumsum'
-    
+    net_rates = pivots['rate'].values @ W
+    net_drift = pivots[drift_key].values @ W
     if roll_key in pivots: net_roll = pivots[roll_key].values @ W
     else: net_roll = np.zeros((n_time, n_trades), dtype=np.float32)
 
-    net_rates = rate_vals @ W
-    net_drift = pivots[drift_key].values @ W
-    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
+    hl_buckets = data.get('BASKET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0
     
-    # SCANNER (Curve Logic: use_roll_in_quality=False)
     multiclass, prices, rolls, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, net_roll,
         hl_buckets.reshape(n_time, n_trades), 
@@ -351,9 +376,19 @@ def build_curves(pivots, tenors):
         use_roll_in_quality=False
     )
     
-    # Audit Columns
-    data['audit_L1_entry_rate_drop'] = L1_rate_mat.ravel()
-    data['audit_L2_entry_rate_drop'] = L2_rate_mat.ravel()
+    # 5. Audit
+    rate_vals = pivots['rate'].values
+    # Get exit rates efficiently
+    # We already have audit_L1_entry_rate_drop from project_smart
+    # We need exit rates.
+    
+    # Map back indices
+    idx_map_1 = [x[0] for x in leg_indices]
+    idx_map_2 = [x[1] for x in leg_indices]
+    
+    L1_rate_mat = rate_vals[:, idx_map_1]
+    L2_rate_mat = rate_vals[:, idx_map_2]
+    
     data['audit_L1_exit_rate_drop'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
     data['audit_L2_exit_rate_drop'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
     data['audit_exit_ts_drop'] = pivots['rate'].index.values[ex_idx.ravel()]
@@ -366,12 +401,11 @@ def build_curves(pivots, tenors):
     data['audit_exit_rate_drop'] = ex_rate.ravel()
     data['audit_exit_idx_drop'] = ex_idx.ravel()
     
-    # TARGETS
     data['target_multiclass'] = multiclass.ravel()
     data['target_binary'] = (multiclass.ravel() == 2).astype(np.int8)
     
     save_by_month_incremental(data, idx_time, "curves")
-    del data, net_rates, net_drift, net_roll, multiclass, prices, rolls, carries, totals
+    del data, net_rates, net_drift, net_roll
     gc.collect()
 
 # ==============================================================================
@@ -386,6 +420,7 @@ def build_flys(pivots, tenors):
     
     ids, t1_arr, t2_arr, t3_arr = [], [], [], []
     fly_width_arr, belly_ratio_arr = [], []
+    leg_indices = []
 
     for t1, t2, t3 in combos:
         ids.append(f"F_{t1:g}_{t2:g}_{t3:g}")
@@ -393,6 +428,7 @@ def build_flys(pivots, tenors):
         width = t3 - t1
         ratio = (t2 - t1) / width if width != 0 else 0.5
         fly_width_arr.append(width); belly_ratio_arr.append(ratio)
+        leg_indices.append([tenors.index(t1), tenors.index(t2), tenors.index(t3)])
         
     W = np.zeros((len(tenors), n_trades), dtype=np.float32)
     for j, (t1, t2, t3) in enumerate(combos):
@@ -400,60 +436,40 @@ def build_flys(pivots, tenors):
         W[i1, j] = 0.5; W[i2, j] = -1.0; W[i3, j] = 0.5
     W_abs = np.abs(W)
     
-    data = project_standard_features(pivots, W, W_abs, ids)
+    # 1. Smart Projection
+    data = project_smart_features(pivots, W, W_abs, ids, leg_indices)
+    
     data['meta_direction'] = np.ones(n_time * n_trades, dtype=np.float32)
     data['meta_fly_width']  = np.tile(fly_width_arr, n_time)
     data['meta_belly_ratio'] = np.tile(belly_ratio_arr, n_time)
-
-    idx_map_1 = [tenors.index(c[0]) for c in combos]
-    idx_map_2 = [tenors.index(c[1]) for c in combos]
-    idx_map_3 = [tenors.index(c[2]) for c in combos]
-    rate_vals = pivots['rate'].values
-    L1_rate_mat = rate_vals[:, idx_map_1]; L2_rate_mat = rate_vals[:, idx_map_2]; L3_rate_mat = rate_vals[:, idx_map_3]
+    data['meta_t2'] = np.tile(t2_arr, n_time)
     
-    target_legs = ['rate', 'total_drift_day', 'z_comb_slope_5b', 'z_comb', 'z_pca', 'z_spline', 'signal_sharpe', 'z_pca_vol_adj']
-    L1_drift, L2_drift, L3_drift = None, None, None
-    for feat in pivots.keys():
-        is_target = any(t in feat for t in target_legs)
-        is_event = 'hours_to_' in feat
-        if not (is_target or is_event): continue
-        vals = pivots[feat].values
-        l1 = vals[:, idx_map_1].ravel(); l2 = vals[:, idx_map_2].ravel(); l3 = vals[:, idx_map_3].ravel()
-        clean = feat.replace("z_comb", "z").replace("total_drift_day", "drift").replace("exog_", "").replace("hours_to_", "h_")
-        
-        if is_event: data[f"NET_{clean}_min"] = np.minimum(np.minimum(l1, l2), l3)
-        else:
-            if feat == 'rate':
-                data[f"L1_{clean}_raw_drop"] = l1; data[f"L2_{clean}_raw_drop"] = l2; data[f"L3_{clean}_raw_drop"] = l3
-            else:
-                data[f"L1_{clean}"] = l1; data[f"L2_{clean}"] = l2; data[f"L3_{clean}"] = l3
-            if feat == 'total_drift_day': L1_drift, L2_drift, L3_drift = l1, l2, l3
-
-    t1 = np.tile(t1_arr, n_time); t2 = np.tile(t2_arr, n_time); t3 = np.tile(t3_arr, n_time)
+    t1 = np.tile(t1_arr, n_time); t3 = np.tile(t3_arr, n_time); t2 = np.tile(t2_arr, n_time)
     dist = t3 - t1; dist[dist==0]=1.0
     data['NET_slope_leakage'] = 0.5 - ((t3 - t2) / dist)
-    
-    if 'NET_drift' in data:
-        for z_name in ['NET_z', 'NET_z_pca', 'NET_z_spline']:
-            if z_name in data: data[f"{z_name}_modified"] = calc_modified_carry(data[z_name], data['NET_drift'])
-    if L1_drift is not None:
-         if 'L1_z' in data: data['L1_z_modified'] = calc_modified_carry(data['L1_z'], L1_drift)
-         if 'L2_z' in data: data['L2_z_modified'] = calc_modified_carry(data['L2_z'], L2_drift)
-         if 'L3_z' in data: data['L3_z_modified'] = calc_modified_carry(data['L3_z'], L3_drift)
 
-    data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time); data['meta_t2'] = t2
+    # 2. Modified Drift
+    if 'NET_total_drift_day' in data:
+        net_drift = data['NET_total_drift_day']
+        for k in list(data.keys()):
+            if k.startswith('NET_z') and 'modified' not in k:
+                data[f"{k}_modified"] = calc_modified_carry(data[k], net_drift)
+
+    data['ts'] = idx_time; data['trade_id'] = np.tile(ids, n_time)
     
-    drift_key = 'total_drift_day_cumsum' if 'total_drift_day_cumsum' in pivots else 'total_drift_cumsum'
-    roll_key = 'roll_bps_day_cumsum' if 'roll_bps_day_cumsum' in pivots else 'roll_bps_cumsum'
-    
+    # 3. Scanner
+    drift_key = 'total_drift_day_cumsum' 
+    roll_key  = 'roll_bps_day_cumsum' 
+    if drift_key not in pivots: drift_key = 'total_drift_cumsum'
+    if roll_key not in pivots: roll_key = 'roll_bps_cumsum'
+
+    net_rates = pivots['rate'].values @ W
+    net_drift = pivots[drift_key].values @ W
     if roll_key in pivots: net_roll = pivots[roll_key].values @ W
     else: net_roll = np.zeros((n_time, n_trades), dtype=np.float32)
 
-    net_rates = rate_vals @ W
-    net_drift = pivots[drift_key].values @ W
-    hl_buckets = data.get('NET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 
+    hl_buckets = data.get('BASKET_halflife', np.full(n_time*n_trades, 100.0)) * 24.0 
     
-    # SCANNER (Fly Logic: use_roll_in_quality=True)
     multiclass, prices, rolls, carries, totals, ex_idx, ex_rate = scan_pnl_audit(
         net_rates, net_drift, net_roll,
         hl_buckets.reshape(n_time, n_trades), 
@@ -461,9 +477,16 @@ def build_flys(pivots, tenors):
         use_roll_in_quality=True
     )
     
-    data['audit_L1_entry_rate_drop'] = L1_rate_mat.ravel()
-    data['audit_L2_entry_rate_drop'] = L2_rate_mat.ravel()
-    data['audit_L3_entry_rate_drop'] = L3_rate_mat.ravel()
+    # 4. Audit
+    rate_vals = pivots['rate'].values
+    idx_map_1 = [x[0] for x in leg_indices]
+    idx_map_2 = [x[1] for x in leg_indices]
+    idx_map_3 = [x[2] for x in leg_indices]
+    
+    L1_rate_mat = rate_vals[:, idx_map_1]
+    L2_rate_mat = rate_vals[:, idx_map_2]
+    L3_rate_mat = rate_vals[:, idx_map_3]
+    
     data['audit_L1_exit_rate_drop'] = np.take_along_axis(L1_rate_mat, ex_idx, axis=0).ravel()
     data['audit_L2_exit_rate_drop'] = np.take_along_axis(L2_rate_mat, ex_idx, axis=0).ravel()
     data['audit_L3_exit_rate_drop'] = np.take_along_axis(L3_rate_mat, ex_idx, axis=0).ravel()
@@ -477,12 +500,11 @@ def build_flys(pivots, tenors):
     data['audit_exit_rate_drop'] = ex_rate.ravel()
     data['audit_exit_idx_drop'] = ex_idx.ravel()
     
-    # TARGETS
     data['target_multiclass'] = multiclass.ravel()
     data['target_binary'] = (multiclass.ravel() == 2).astype(np.int8)
     
     save_by_month_incremental(data, idx_time, "flys")
-    del data, net_rates, net_drift, net_roll, multiclass, prices, rolls, carries, totals
+    del data, net_rates, net_drift, net_roll
     gc.collect()
 
 # ==============================================================================
@@ -506,8 +528,14 @@ def process_full_history():
     df_full = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=['ts', 'tenor_yrs']).sort_values(['ts', 'tenor_yrs'])
     print(f"Full History Loaded: {len(df_full)} rows. Pivoting...")
     
+    dfs = None
+    gc.collect()
+    
     pivots = get_pivots(df_full)
     tenors = sorted(pivots['rate'].columns)
+    
+    del df_full
+    gc.collect()
     
     build_curves(pivots, tenors)
     build_flys(pivots, tenors)
