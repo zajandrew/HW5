@@ -11,7 +11,128 @@ import config as cr
 # 1. NUMBA SCANNER (Unit Risk Receiver Logic)
 # ==============================================================================
 @numba.njit(parallel=True)
-def scan_pnl_audit(
+def scan_pnl_audit_new(
+    entry_rates, 
+    drift_cumsums,    
+    roll_cumsums,     
+    halflife_idxs, 
+    price_hurdle, 
+    total_hurdle, 
+    stop_loss, # NOTE: This arg is kept for signature compatibility but we override it internally or you can pass -4.0
+    use_roll_in_quality, 
+    min_hold_steps=120
+):
+    """
+    Ratchet / Trailing Stop Logic.
+    Survives noise, locks in drift.
+    """
+    n_time, n_trades = entry_rates.shape
+    
+    # HARDCODED RATCHET SETTINGS (Adjust here if needed)
+    HARD_STOP = -4.0         # Survival buffer (was -1.5)
+    RATCHET_TRIGGER = 1.5    # Must reach this profit to activate trail
+    RATCHET_DIST = 1.0       # Trail distance (e.g. at +2.0, stop is +1.0)
+    
+    # Outputs
+    out_multi = np.zeros((n_time, n_trades), dtype=np.int8) 
+    out_price = np.zeros((n_time, n_trades), dtype=np.float32)
+    out_roll  = np.zeros((n_time, n_trades), dtype=np.float32) 
+    out_carry = np.zeros((n_time, n_trades), dtype=np.float32) 
+    out_total = np.zeros((n_time, n_trades), dtype=np.float32)
+    out_exit_idx  = np.zeros((n_time, n_trades), dtype=np.int32)
+    out_exit_rate = np.zeros((n_time, n_trades), dtype=np.float32)
+    
+    for j in numba.prange(n_trades):
+        for i in range(n_time):
+            # Dynamic Vertical Barrier
+            hl_val = halflife_idxs[i, j]
+            if hl_val > 500: steps = 120 
+            else:
+                steps = int(hl_val * 2.0)
+                if steps < 5: steps = 5
+            
+            end_idx = min(i + steps, n_time)
+            if end_idx <= i + 1: continue
+
+            # Entry
+            rate_in  = entry_rates[i, j]
+            drift_in = drift_cumsums[i, j]
+            roll_in  = roll_cumsums[i, j]
+            
+            best_price, best_roll, best_carry, best_total = 0.0, 0.0, 0.0, -999.0
+            final_idx = end_idx - 1
+            won, stopped = False, False
+            
+            # State for Ratchet
+            active_stop = HARD_STOP
+            max_pnl_seen = -999.0
+            
+            # Forward Scan
+            for k in range(i + 1, end_idx):
+                curr_price = (rate_in - entry_rates[k, j]) * 100.0
+                total_drift_pnl = drift_cumsums[k, j] - drift_in
+                curr_roll       = roll_cumsums[k, j] - roll_in
+                curr_carry      = total_drift_pnl - curr_roll
+                curr_total      = curr_price + total_drift_pnl
+                
+                # --- RATCHET LOGIC ---
+                if curr_total > max_pnl_seen:
+                    max_pnl_seen = curr_total
+                    # Trigger: If we are above trigger, pull stop up
+                    if max_pnl_seen >= RATCHET_TRIGGER:
+                        new_stop = max_pnl_seen - RATCHET_DIST
+                        # Ratchet only moves UP
+                        if new_stop > active_stop:
+                            active_stop = new_stop
+                
+                # 1. Check Stop
+                if curr_total <= active_stop:
+                    # STOPPED
+                    final_idx = k; stopped = True
+                    out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
+                    out_carry[i, j] = curr_carry; out_total[i, j] = curr_total
+                    
+                    # CLASSIFICATION ON STOP
+                    # If we locked in profit (e.g. stopped at +0.8), it's a Weak Win (1)
+                    if curr_total >= 0.5:
+                        out_multi[i, j] = 1
+                    else:
+                        out_multi[i, j] = 0
+                    break
+                
+                # 2. Check Alpha Target (Class 2)
+                # We still require the big hurdle (2.0) for the "Alpha" label
+                if curr_total >= total_hurdle:
+                    if use_roll_in_quality: curr_quality = curr_price + curr_roll 
+                    else:                   curr_quality = curr_price 
+                    
+                    ratio = curr_quality / curr_total if curr_total > 0 else 0.0
+                    
+                    if ratio >= 0.50: out_multi[i, j] = 2 # Alpha Win
+                    else:             out_multi[i, j] = 1 # Weak Win
+                        
+                    out_price[i, j] = curr_price; out_roll[i, j] = curr_roll
+                    out_carry[i, j] = curr_carry; out_total[i, j] = curr_total
+                    final_idx = k; won = True
+                    break
+                
+                best_price, best_roll, best_carry, best_total = curr_price, curr_roll, curr_carry, curr_total
+            
+            # 3. Time Exit
+            if not won and not stopped:
+                out_price[i, j] = best_price; out_roll[i, j] = best_roll
+                out_carry[i, j] = best_carry; out_total[i, j] = best_total
+                
+                if best_total > 0.5: out_multi[i, j] = 1 # Weak Win
+                else:                out_multi[i, j] = 0
+                
+            out_exit_idx[i, j] = final_idx
+            out_exit_rate[i, j] = entry_rates[final_idx, j]
+
+    return out_multi, out_price, out_roll, out_carry, out_total, out_exit_idx, out_exit_rate
+
+@numba.njit(parallel=True)
+def scan_pnl_audit_orig(
     entry_rates, 
     drift_cumsums,    
     roll_cumsums,     
